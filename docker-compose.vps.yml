@@ -1,0 +1,16 @@
+# VPS-only override. Use together with docker-compose.yml; it is isolated from
+# other compose projects and mounts a single root-owned signing secret.
+services:
+  brain:
+    environment:
+      WALLET_PRIVATE_KEY_FILE: /run/secrets/wallet_private_key
+      MINIMAX_API_KEY_FILE: /run/secrets/minimax_api_key
+    secrets:
+      - wallet_private_key
+      - minimax_api_key
+
+secrets:
+  wallet_private_key:
+    file: /opt/bera-bot/secrets/wallet_private_key
+  minimax_api_key:
+    file: /opt/bera-bot/secrets/minimax_api_key
