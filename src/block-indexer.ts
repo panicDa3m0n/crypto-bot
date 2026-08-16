@@ -36,6 +36,8 @@ const MORPHO_LIQUIDATE = "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783
 const MORPHO_TOPICS = new Set([MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE]);
 const MORPHO_MARKET_ABI = parseAbi(["function idToMarketParams(bytes32 id) view returns (address loanToken, address collateralToken, address oracle, address irm, uint256 lltv)"]);
 const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)"]);
+const ERC20_META_ABI = parseAbi(["function symbol() view returns (string)", "function name() view returns (string)", "function decimals() view returns (uint8)"]);
+const IDENTITY_CAP = 8; // max token-identity resolutions per call (bounds first-run RPC burst)
 const BOOTSTRAP_CAP = 20; // max unknown pools to bootstrap per block (self-limits any first-run burst)
 const TOPIC0S = [V3_SWAP, V2_SYNC, PAIR_CREATED, POOL_CREATED, MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE];
 const CHUNK = 10;            // public getLogs range cap
@@ -56,6 +58,7 @@ export class BlockIndexer {
   private readonly usdc: string;
   private readonly morpho: string | null;
   private readonly marketCache = new Map<string, { loanToken: string; collateralToken: string; oracle: string; irm: string; lltv: bigint }>();
+  private readonly resolvedTokens = new Set<string>(); // tokens whose identity we've read one-shot (dedup)
 
   constructor(
     private readonly config: Config,
@@ -124,6 +127,7 @@ export class BlockIndexer {
   private async processBlock(block: number, logs: RawLog[]): Promise<{ swaps: number; discovered: number; lending: number }> {
     // 1) Discovery: new pools/tokens from factory events.
     let discovered = 0;
+    const newTokens = new Set<string>();
     for (const l of logs) {
       const t0 = (l.topics[0] ?? "").toLowerCase();
       if (t0 === PAIR_CREATED || t0 === POOL_CREATED) {
@@ -139,10 +143,14 @@ export class BlockIndexer {
           await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token1, kind: "token", source: "indexer" }).catch(() => undefined);
           // The emitting factory is a DEX — parity with the scanner's opportunistic dex discovery.
           await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: l.address.toLowerCase(), kind: "dex", meta: { role: "factory", discoveredBy: "indexer" }, source: "indexer" }).catch(() => undefined);
+          newTokens.add(token0); newTokens.add(token1);
           discovered += 1;
         }
       }
     }
+    // Identity one-shot: give freshly-created tokens symbol/name/decimals immediately (chain-sourced),
+    // rather than waiting for the enricher to rotate to them.
+    if (newTokens.size) await this.resolveIdentity([...newTokens]);
 
     // 1b) Lending (Morpho): discover borrowers on Borrow, close on Liquidate, learn params on
     // CreateMarket — the inventory becomes chain-sourced (API drops to seed + cross-check). Same
@@ -173,8 +181,12 @@ export class BlockIndexer {
     for (const u of unknown.slice(0, BOOTSTRAP_CAP)) { const info = await this.bootstrapPool(u.addr, u.archetype); if (info) pools.set(u.addr, info); }
     const tokenSet = new Set<string>();
     for (const p of pools.values()) { if (p.token0) tokenSet.add(p.token0.toLowerCase()); if (p.token1) tokenSet.add(p.token1.toLowerCase()); }
-    const meta = await this.db.tokenMeta(this.config.CHAIN_ID, [...tokenSet]).catch(() => new Map());
-    const dec = (a: string): number | null => { if (a === this.weth) return 18; if (a === this.usdc) return 6; return (meta as Map<string, { decimals: number | null }>).get(a)?.decimals ?? null; };
+    const meta = await this.db.tokenMeta(this.config.CHAIN_ID, [...tokenSet]).catch(() => new Map()) as Map<string, { symbol: string | null; decimals: number | null }>;
+    // Ensure decimals for tokens we're about to price: a fresh launch the enricher hasn't reached yet would
+    // otherwise be unpriceable during its most active window. Resolve one-shot (cached), then price this block.
+    const missingDec = [...tokenSet].filter((a) => a !== this.weth && a !== this.usdc && meta.get(a)?.decimals == null);
+    if (missingDec.length) for (const [a, v] of await this.resolveIdentity(missingDec)) if (v.decimals != null) meta.set(a, { symbol: v.symbol ?? null, decimals: v.decimals });
+    const dec = (a: string): number | null => { if (a === this.weth) return 18; if (a === this.usdc) return 6; return meta.get(a)?.decimals ?? null; };
 
     // 2a) Pool state — from the SAME logs, independent of token metadata. V2 Sync = (r0,r1);
     // V3 Swap = (sqrtPriceX96, liquidity). Last log in the block wins (= latest state). This is the
@@ -272,6 +284,36 @@ export class BlockIndexer {
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token1, kind: "token", source: "indexer" }).catch(() => undefined);
       return { token0, token1, archetype };
     } catch (e) { this.logger.debug({ err: e, pool: addr }, "pool bootstrap failed"); return null; }
+  }
+
+  /** Identity one-shot: read symbol/name/decimals for tokens the system doesn't yet know, persist to
+   * entities (COALESCE — never clobbers a good value), and cache so each token is read at most once.
+   * This makes the indexer the chain-source for token identity (drops the Blockscout dependency for it)
+   * and, crucially, lets a fresh launch be priced the instant it trades instead of waiting for enrichment. */
+  private async resolveIdentity(addrs: string[], cap = IDENTITY_CAP): Promise<Map<string, { symbol?: string; name?: string; decimals?: number }>> {
+    const out = new Map<string, { symbol?: string; name?: string; decimals?: number }>();
+    let done = 0;
+    for (const a0 of addrs) {
+      const a = a0.toLowerCase();
+      if (this.resolvedTokens.has(a) || a === this.weth || a === this.usdc) continue;
+      if (done >= cap) break;
+      this.resolvedTokens.add(a); done += 1;
+      try {
+        const [sym, nm, dc] = await Promise.all([
+          this.chain.fallback.readContract({ address: a as Address, abi: ERC20_META_ABI, functionName: "symbol" }).catch(() => undefined) as Promise<string | undefined>,
+          this.chain.fallback.readContract({ address: a as Address, abi: ERC20_META_ABI, functionName: "name" }).catch(() => undefined) as Promise<string | undefined>,
+          this.chain.fallback.readContract({ address: a as Address, abi: ERC20_META_ABI, functionName: "decimals" }).catch(() => undefined) as Promise<number | undefined>
+        ]);
+        const decimals = dc != null && Number.isFinite(Number(dc)) && Number(dc) >= 0 && Number(dc) <= 36 ? Number(dc) : undefined;
+        const symbol = typeof sym === "string" && sym.length > 0 ? sym.slice(0, 32) : undefined;
+        const name = typeof nm === "string" && nm.length > 0 ? nm.slice(0, 96) : undefined;
+        if (symbol || name || decimals != null) {
+          await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: a, kind: "token", symbol, name, decimals, source: "indexer" }).catch(() => undefined);
+          out.set(a, { symbol, name, decimals });
+        }
+      } catch (e) { this.logger.debug({ err: e, token: a }, "identity resolve failed"); }
+    }
+    return out;
   }
 
   /** USD value of one unit of a QUOTE token (WETH via Chainlink, USDC = $1). null if not a quote. */
