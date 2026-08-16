@@ -104,6 +104,19 @@ export class PriceOracle {
 
   private async readReserves(pool: PoolRef, atBlock?: bigint): Promise<{ r0: bigint; r1: bigint } | null> {
     const address = pool.address as Address;
+    // SINGLE SOURCE OF TRUTH: the block-indexer persists latest pool state (V2 reserves / V3
+    // sqrtP+liquidity) from Swap/Sync logs into pool_state. The unpinned "current" read — which is the
+    // whole valuation firehose (usdPrice/spot/sellValueUsd across every classified position) — is served
+    // from the DB, NEVER the chain. Only two paths still touch RPC: a specific-block pinned simulation
+    // (execution-exact arb sizing, `atBlock` set), and a pool the indexer has never seen swap yet
+    // (one-shot bootstrap below, self-healing as its first swap persists the state).
+    if (atBlock == null && pool.archetype !== "solidly") {
+      const st = (await this.db.poolStateBatch(this.config.CHAIN_ID, [address.toLowerCase()]).catch(() => null))?.get(address.toLowerCase());
+      if (st) {
+        if (st.sqrtPrice && st.sqrtPrice > 0n && st.liquidity && st.liquidity > 0n) return { r0: (st.liquidity * Q96) / st.sqrtPrice, r1: (st.liquidity * st.sqrtPrice) / Q96 };
+        if (st.r0 != null && st.r1 != null && st.r0 > 0n && st.r1 > 0n) return { r0: st.r0, r1: st.r1 };
+      }
+    }
     const opts = atBlock != null ? { blockNumber: atBlock } : {};
     try {
       // Precision lane, off the sensor firehose; the two V3 reads are auto-batched (one HTTP call)

@@ -131,17 +131,24 @@ export class BlockIndexer {
     const meta = await this.db.tokenMeta(this.config.CHAIN_ID, [...tokenSet]).catch(() => new Map());
     const dec = (a: string): number | null => { if (a === this.weth) return 18; if (a === this.usdc) return 6; return (meta as Map<string, { decimals: number | null }>).get(a)?.decimals ?? null; };
 
+    // 2a) Pool state — from the SAME logs, independent of token metadata. V2 Sync = (r0,r1);
+    // V3 Swap = (sqrtPriceX96, liquidity). Last log in the block wins (= latest state). This is the
+    // DB source that makes PriceOracle's reserves/amountOut DB-read instead of RPC.
+    const state = new Map<string, { pool: string; archetype: string; r0?: bigint; r1?: bigint; sqrtPrice?: bigint; liquidity?: bigint; block: number }>();
     const rows = new Map<string, number>(); // token → latest USD price this block (last swap wins)
     let swaps = 0;
     for (const l of priced) {
-      const pool = pools.get(l.address.toLowerCase());
-      if (!pool?.token0 || !pool.token1) continue; // unknown pool — discovery will add it; priced next time
-      const t0 = pool.token0.toLowerCase(), t1 = pool.token1.toLowerCase();
+      const pool = l.address.toLowerCase();
+      const isSwap = (l.topics[0] ?? "").toLowerCase() === V3_SWAP;
+      if (isSwap) { const sp = word(l.data, 2), liq = word(l.data, 3); if (sp && sp > 0n) state.set(pool, { pool, archetype: "v3", sqrtPrice: sp, liquidity: liq ?? undefined, block }); }
+      else { const r0 = word(l.data, 0), r1 = word(l.data, 1); if (r0 != null && r1 != null) state.set(pool, { pool, archetype: "v2", r0, r1, block }); }
+
+      const info = pools.get(pool);
+      if (!info?.token0 || !info.token1) continue; // unknown pool — discovery adds it; priced next time
+      const t0 = info.token0.toLowerCase(), t1 = info.token1.toLowerCase();
       const d0 = dec(t0), d1 = dec(t1);
       if (d0 == null || d1 == null) continue; // decimals unknown → defer (enricher fills them)
-      const isSwap = (l.topics[0] ?? "").toLowerCase() === V3_SWAP;
-      // token0 price expressed in token1 units (human).
-      const p0in1 = isSwap ? priceV3(l.data, d0, d1) : priceV2(l.data, d0, d1);
+      const p0in1 = isSwap ? priceV3(l.data, d0, d1) : priceV2(l.data, d0, d1); // token0 price in token1 (human)
       if (p0in1 == null || !(p0in1 > 0) || !Number.isFinite(p0in1)) continue;
       swaps += 1;
       // Anchor to USD: one side must be WETH or USDC (the quote). Price only the NON-quote token.
@@ -152,6 +159,7 @@ export class BlockIndexer {
     }
 
     if (this.config.DEBUG_KEEP_RAW_BLOCKS && logs.length) await this.db.saveRawBlock(this.config.CHAIN_ID, block, logs).catch(() => undefined);
+    if (state.size) await this.db.upsertPoolState(this.config.CHAIN_ID, [...state.values()]).catch((e) => this.logger.debug({ err: e }, "indexer pool_state upsert failed"));
     if (rows.size) {
       await this.db.upsertTokenPrices(this.config.CHAIN_ID, [...rows.entries()].map(([token, priceUsd]) => ({ token, priceUsd, confidence: 0.95, source: "indexer" })), { tauFastSec: this.config.VOL_TAU_FAST_SEC, tauSlowSec: this.config.VOL_TAU_SLOW_SEC }).catch((e) => this.logger.debug({ err: e }, "indexer price upsert failed"));
     }
@@ -192,6 +200,8 @@ export class BlockIndexer {
 // --- decoding helpers -------------------------------------------------------
 
 function hex(n: number): string { return "0x" + n.toString(16); }
+/** The Nth 32-byte word of `data` as a BigInt (null if data too short). */
+function word(data: string, i: number): bigint | null { const s = 2 + i * 64; return data.length >= s + 64 ? BigInt("0x" + data.slice(s, s + 64)) : null; }
 function addrFromTopic(topic: string | undefined): string | null { return topic && topic.length >= 42 ? "0x" + topic.slice(-40).toLowerCase() : null; }
 /** address stored in the Nth 32-byte word of `data` (right-aligned). */
 function wordAddr(data: string, word: number): string | null { const s = 2 + word * 64; return data.length >= s + 64 ? "0x" + data.slice(s + 24, s + 64).toLowerCase() : null; }

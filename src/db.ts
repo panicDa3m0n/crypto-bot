@@ -407,6 +407,22 @@ export class Database {
         PRIMARY KEY (chain_id, block_number)
       );
       CREATE INDEX IF NOT EXISTS raw_blocks_at_idx ON raw_blocks(at);
+      -- Per-pool AMM state, ingested from the SAME Swap/Sync logs the indexer already parses (V2 Sync
+      -- carries the reserves; V3 Swap carries sqrtPriceX96 + liquidity). One latest row per pool. This
+      -- is what makes PriceOracle's sized-exit math (amountOut/sellValueUsd) DB-read instead of RPC:
+      -- reserves stored as NUMERIC (raw wei, up to ~2^160 for V3 virtual reserves) — never floats.
+      CREATE TABLE IF NOT EXISTS pool_state (
+        chain_id INTEGER NOT NULL,
+        pool TEXT NOT NULL,
+        archetype TEXT NOT NULL,
+        r0 NUMERIC,        -- V2: reserve0 (raw)
+        r1 NUMERIC,        -- V2: reserve1 (raw)
+        sqrt_price NUMERIC, -- V3: sqrtPriceX96
+        liquidity NUMERIC,  -- V3: in-range liquidity L
+        block_number BIGINT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (chain_id, pool)
+      );
       -- DISPLAY prices only (Lane A): indicative, slow-refreshed, batch-sourced. NEVER used for
       -- arb/liquidation decisions — those compute fresh execution quotes (Lane B). Kept in its own
       -- table so the fast-changing price never churns the immutable entity metadata.
@@ -1091,6 +1107,44 @@ export class Database {
       `SELECT address, meta->>'token0' AS token0, meta->>'token1' AS token1, meta->>'archetype' AS archetype FROM entities WHERE chain_id=$1 AND kind='pool' AND address = ANY($2::text[])`, [chainId, lower]
     );
     for (const row of r.rows) out.set(row.address, { token0: row.token0, token1: row.token1, archetype: row.archetype });
+    return out;
+  }
+
+  /** Persist latest AMM state for a batch of pools (from Swap/Sync logs). One query via UNNEST; a
+   * newer block always wins so a gap-backfill can never overwrite fresher state. Values are raw wei
+   * strings (BigInt→string) to keep NUMERIC exact — never floats. */
+  async upsertPoolState(chainId: number, rows: Array<{ pool: string; archetype: string; r0?: bigint | null; r1?: bigint | null; sqrtPrice?: bigint | null; liquidity?: bigint | null; block: number }>): Promise<void> {
+    if (!rows.length) return;
+    const s = (v: bigint | null | undefined) => (v == null ? null : v.toString());
+    await this.pool.query(
+      `INSERT INTO pool_state(chain_id, pool, archetype, r0, r1, sqrt_price, liquidity, block_number)
+       SELECT $1, p, a, r0, r1, sp, liq, bn
+       FROM unnest($2::text[], $3::text[], $4::numeric[], $5::numeric[], $6::numeric[], $7::numeric[], $8::bigint[]) AS t(p, a, r0, r1, sp, liq, bn)
+       ON CONFLICT (chain_id, pool) DO UPDATE SET
+         archetype=EXCLUDED.archetype, r0=EXCLUDED.r0, r1=EXCLUDED.r1, sqrt_price=EXCLUDED.sqrt_price,
+         liquidity=EXCLUDED.liquidity, block_number=EXCLUDED.block_number, updated_at=NOW()
+       WHERE pool_state.block_number <= EXCLUDED.block_number`,
+      [chainId,
+        rows.map((x) => x.pool.toLowerCase()),
+        rows.map((x) => x.archetype),
+        rows.map((x) => s(x.r0)), rows.map((x) => s(x.r1)),
+        rows.map((x) => s(x.sqrtPrice)), rows.map((x) => s(x.liquidity)),
+        rows.map((x) => x.block)]
+    );
+  }
+
+  /** Latest AMM state for a batch of pools — the DB source PriceOracle reads instead of RPC. */
+  async poolStateBatch(chainId: number, pools: string[]): Promise<Map<string, { archetype: string; r0: bigint | null; r1: bigint | null; sqrtPrice: bigint | null; liquidity: bigint | null; block: number; ageMs: number }>> {
+    const out = new Map<string, { archetype: string; r0: bigint | null; r1: bigint | null; sqrtPrice: bigint | null; liquidity: bigint | null; block: number; ageMs: number }>();
+    if (!pools.length) return out;
+    const lower = [...new Set(pools.map((a) => a.toLowerCase()))];
+    const r = await this.pool.query<{ pool: string; archetype: string; r0: string | null; r1: string | null; sqrt_price: string | null; liquidity: string | null; block_number: string; age_ms: string }>(
+      `SELECT pool, archetype, r0::text, r1::text, sqrt_price::text, liquidity::text, block_number::text,
+              (EXTRACT(EPOCH FROM (NOW()-updated_at))*1000)::bigint::text AS age_ms
+       FROM pool_state WHERE chain_id=$1 AND pool = ANY($2::text[])`, [chainId, lower]
+    );
+    const b = (v: string | null) => (v == null ? null : BigInt(v.split(".")[0]));
+    for (const row of r.rows) out.set(row.pool, { archetype: row.archetype, r0: b(row.r0), r1: b(row.r1), sqrtPrice: b(row.sqrt_price), liquidity: b(row.liquidity), block: Number(row.block_number), ageMs: Number(row.age_ms) });
     return out;
   }
 
