@@ -29,6 +29,7 @@ services:
     environment:
       SERVICE_ROLE: observer
       EXECUTION_ENABLED: "false"
+      SCANNER_ENABLED: "false" # redundant: the block-indexer discovers pools/tokens/dex from the block stream
     depends_on:
       postgres:
         condition: service_healthy

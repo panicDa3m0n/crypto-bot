@@ -128,11 +128,17 @@ export class BlockIndexer {
       const t0 = (l.topics[0] ?? "").toLowerCase();
       if (t0 === PAIR_CREATED || t0 === POOL_CREATED) {
         const token0 = addrFromTopic(l.topics[1]); const token1 = addrFromTopic(l.topics[2]);
-        const pool = t0 === PAIR_CREATED ? wordAddr(l.data, 0) : wordAddr(l.data, 1);
+        const isV3 = t0 === POOL_CREATED;
+        const pool = isV3 ? wordAddr(l.data, 1) : wordAddr(l.data, 0);
+        // V3 PoolCreated(token0, token1, fee indexed, tickSpacing, pool): fee = topics[3]. Needed for
+        // exact sized amountOut (price-oracle.feePpm) so non-0.3% tiers don't default to 3000ppm.
+        const fee = isV3 && l.topics[3] ? Number(BigInt(l.topics[3])) : undefined;
         if (pool && token0 && token1) {
-          await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: pool, kind: "pool", meta: { token0, token1, archetype: t0 === PAIR_CREATED ? "v2" : "v3", discoveredBy: "indexer" }, source: "indexer" }).catch(() => undefined);
+          await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: pool, kind: "pool", meta: { token0, token1, archetype: isV3 ? "v3" : "v2", fee, discoveredBy: "indexer" }, source: "indexer" }).catch(() => undefined);
           await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token0, kind: "token", source: "indexer" }).catch(() => undefined);
           await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token1, kind: "token", source: "indexer" }).catch(() => undefined);
+          // The emitting factory is a DEX — parity with the scanner's opportunistic dex discovery.
+          await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: l.address.toLowerCase(), kind: "dex", meta: { role: "factory", discoveredBy: "indexer" }, source: "indexer" }).catch(() => undefined);
           discovered += 1;
         }
       }

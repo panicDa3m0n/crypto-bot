@@ -108,7 +108,7 @@ const schema = z.object({
   // Chain scanner: builds the system's OWN address universe (tokens/pools/dexes) by ingesting
   // block-window event logs and classifying emitters mechanically — no curated list. Windowed
   // with a per-tick probe budget to respect public-RPC limits.
-  SCANNER_ENABLED: z.coerce.boolean().default(true),
+  SCANNER_ENABLED: bool.default(true), // bool (not z.coerce.boolean, which reads "false" as truthy)
   SCANNER_INTERVAL_MS: z.coerce.number().int().min(10_000).default(30_000),
   // Public RPCs cap eth_getLogs range (blastapi Base = 10 blocks), so the window is CHUNKED:
   // RANGE_BLOCKS per getLogs call, up to MAX_CHUNKS calls per tick, advancing the cursor only
