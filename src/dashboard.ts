@@ -71,15 +71,36 @@ export function startDashboard(deps: Deps): { close: () => void } | undefined {
         return;
       }
       if (url.pathname.startsWith("/api/scarlet")) {
-        // Scarlet's REASONING stream (trader-v2 journal): thoughts, notes, rests — grouped by cycle,
-        // newest first. Read-only from the DB (the agent persists its chronology there).
-        const rows = await deps.db.recentJournal(160, SCARLET_STREAM).catch(() => []);
-        const byCycle = new Map<string, { cycle: string; at: string; entries: Array<{ kind: string; content: string }> }>();
+        // Scarlet's full timeline (trader-v2 journal): per CYCLE — start (why she woke) → the complete
+        // blocks between: thoughts, emitted text, tool reads, and actions → rest (end). Read-only from DB.
+        const rows = await deps.db.recentJournal(320, SCARLET_STREAM).catch(() => []);
+        const byCycle = new Map<string, { cycle: string; at: string; reason: string | null; entries: Array<{ at: string; kind: string; content: string }> }>();
         const order: string[] = [];
-        for (const r of rows) { const c = r.cycle ?? "—"; if (!byCycle.has(c)) { byCycle.set(c, { cycle: c, at: r.at, entries: [] }); order.push(c); } byCycle.get(c)!.entries.push({ kind: r.kind, content: r.content }); }
-        const cycles = order.map((c) => { const g = byCycle.get(c)!; return { cycle: g.cycle, at: g.at, entries: g.entries.slice().reverse() }; });
+        for (const r of rows) { const c = r.cycle ?? "—"; if (!byCycle.has(c)) { byCycle.set(c, { cycle: c, at: r.at, reason: null, entries: [] }); order.push(c); } const g = byCycle.get(c)!; if (r.kind === "cycle") g.reason = r.content; else g.entries.push({ at: r.at, kind: r.kind, content: r.content }); }
+        // rows are newest-first → reverse entries to chronological; the cycle's `at` is its EARLIEST entry.
+        const cycles = order.map((c) => { const g = byCycle.get(c)!; const entries = g.entries.slice().reverse(); return { cycle: g.cycle, at: entries[0]?.at ?? g.at, reason: g.reason, entries }; });
         res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "access-control-allow-origin": "*" });
         res.end(JSON.stringify({ enabled: deps.config.SCARLET_V2_ENABLED, cycles, now: new Date().toISOString() }));
+        return;
+      }
+      if (url.pathname.startsWith("/api/positions")) {
+        // Scarlet's positions: ACTIVE (with live P&L from the indexer price) + HISTORY (closed/cancelled).
+        const chainId = deps.config.CHAIN_ID;
+        const plans = await deps.db.listPositionPlans(chainId, 120).catch(() => []);
+        const openTokens = plans.filter((p) => p.status === "open").map((p) => p.token);
+        const prices = await deps.db.getTokenPrices(chainId, openTokens).catch(() => new Map<string, { priceUsd: number | null }>());
+        const ACTIVE = new Set(["pending-entry", "entering", "open", "exiting"]);
+        const active = plans.filter((p) => ACTIVE.has(p.status)).map((p) => {
+          const cur = prices.get(p.token)?.priceUsd ?? null;
+          const gainPct = p.filledPrice && cur ? (cur / p.filledPrice - 1) * 100 : null;
+          const valueUsd = p.filledAmountToken && cur ? p.filledAmountToken * (p.remainingPct / 100) * cur : null;
+          return { id: p.id, symbol: p.symbol, token: p.token, status: p.status, sizeUsd: p.entryAmountUsd, entryPrice: p.entryPrice, filledPrice: p.filledPrice, currentPrice: cur, gainPct, valueUsd, remainingPct: p.remainingPct, stopLossPct: p.stopLossPct, takeProfitPct: p.takeProfitPct, lastResult: p.lastResult, filledAt: p.filledAt };
+        });
+        const history = plans.filter((p) => p.status === "closed" || p.status === "cancelled").map((p) => (
+          { id: p.id, symbol: p.symbol, token: p.token, status: p.status, sizeUsd: p.entryAmountUsd, filledPrice: p.filledPrice, remainingPct: p.remainingPct, stopLossPct: p.stopLossPct, takeProfitPct: p.takeProfitPct, lastResult: p.lastResult, filledAt: p.filledAt }
+        ));
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "access-control-allow-origin": "*" });
+        res.end(JSON.stringify({ active, history, now: new Date().toISOString() }));
         return;
       }
       if (url.pathname === "/scarlet") { res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); res.end(SCARLET_PAGE); return; }
@@ -600,35 +621,112 @@ function liq(){return{ d:{}, tf:'all', ef:'all',
 }}
 </script></body></html>`;
 
-const SCARLET_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head><title>Scarlet · Ragionamento</title>` + HEAD + `<script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script></head>
+const SCARLET_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head><title>Scarlet</title>` + HEAD + `<script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script></head>
 <body class="bg-ink text-txt" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
-<div x-data="scar()" x-init="init()" x-cloak class="max-w-[1000px] mx-auto">
-  <header class="sticky top-0 z-20 flex items-center gap-3 flex-wrap px-5 py-3 bg-ink/95 backdrop-blur border-b border-line">` + NAV_BACK + `<h1 class="text-lg font-semibold tracking-wide">Ragionamento di Scarlet</h1>
-    <span class="text-[11px] text-dim"><b class="text-txt" x-text="(d.cycles?.length||0)"></b> cicli · <span :class="d.enabled?'text-pos':'text-dim'" x-text="d.enabled?'core v2 attivo':'core v2 non attivo'"></span></span></header>
+<div x-data="scar()" x-init="init()" x-cloak class="max-w-[1040px] mx-auto">
+  <header class="sticky top-0 z-20 flex items-center gap-3 flex-wrap px-5 py-3 bg-ink/95 backdrop-blur border-b border-line">` + NAV_BACK + `<h1 class="text-lg font-semibold tracking-wide">Scarlet</h1>
+    <div class="flex gap-1.5 ml-2">
+      <button @click="tab='reason'" class="text-[12px] px-3 py-1 rounded-full border transition" :class="tab==='reason'?'border-energy text-energy bg-energy/10':'border-line text-dim hover:text-txt'">Ragionamento <span class="opacity-60" x-text="'('+(d.cycles?.length||0)+')'"></span></button>
+      <button @click="tab='active'" class="text-[12px] px-3 py-1 rounded-full border transition" :class="tab==='active'?'border-energy text-energy bg-energy/10':'border-line text-dim hover:text-txt'">Posizioni attive <span class="opacity-60" x-text="'('+(pos.active?.length||0)+')'"></span></button>
+      <button @click="tab='history'" class="text-[12px] px-3 py-1 rounded-full border transition" :class="tab==='history'?'border-energy text-energy bg-energy/10':'border-line text-dim hover:text-txt'">Storico <span class="opacity-60" x-text="'('+(pos.history?.length||0)+')'"></span></button>
+    </div>
+    <div class="flex-1"></div>
+    <span class="text-[11px]" :class="d.enabled?'text-pos':'text-dim'" x-text="d.enabled?'core v2 attivo':'core v2 non attivo'"></span></header>
   <main class="px-5 py-4 space-y-3">
-    <div class="rounded-2xl bg-panel border border-line p-4 text-[12px] text-dim">Il flusso di pensiero di Scarlet, ciclo per ciclo: cosa osserva, cosa conclude, cosa annota. Solo lettura, dal suo diario (stream dedicato). Si aggiorna da solo.</div>
-    <template x-if="!d.cycles?.length"><div class="rounded-2xl bg-panel border border-line p-6 text-dim text-center">Nessun ragionamento ancora — Scarlet non si è ancora attivata, o riposa.</div></template>
-    <template x-for="(c,i) in (d.cycles||[])" :key="c.cycle">
-      <section class="rounded-2xl bg-panel border border-line overflow-hidden">
-        <div class="flex justify-between items-center px-4 py-2 bg-panel2 text-[11px]"><span class="font-mono text-dim">ciclo <span x-text="c.cycle"></span></span><span class="text-dim" x-text="new Date(c.at).toLocaleString()"></span></div>
-        <div class="p-4 space-y-2.5">
-          <template x-for="(e,j) in c.entries" :key="j">
-            <div class="text-[13px] leading-relaxed">
-              <span class="text-[9px] uppercase tracking-widest mr-2 px-1.5 py-0.5 rounded border border-line align-top" :class="cls(e.kind)" x-text="lbl(e.kind)"></span>
-              <span class="whitespace-pre-wrap align-top" :class="e.kind==='rest'?'text-dim italic':'text-txt'" x-text="e.content"></span>
+
+    <!-- RAGIONAMENTO -->
+    <template x-if="tab==='reason'">
+      <div class="space-y-3">
+        <div class="rounded-2xl bg-panel border border-line p-4 text-[12px] text-dim">Timeline di Scarlet, ciclo per ciclo: <b class="text-txt">inizio</b> (perché si è svegliata) → i blocchi tra i due estremi (pensiero, strumenti, azioni) → <b class="text-txt">fine</b>. Solo lettura, si aggiorna da solo.</div>
+        <template x-if="!d.cycles?.length"><div class="rounded-2xl bg-panel border border-line p-6 text-dim text-center">Nessun ragionamento ancora — Scarlet non si è ancora attivata, o riposa.</div></template>
+        <template x-for="(c,i) in (d.cycles||[])" :key="c.cycle">
+          <section class="rounded-2xl bg-panel border border-line overflow-hidden">
+            <div class="px-4 py-2 bg-panel2 border-b border-line">
+              <div class="flex justify-between items-center text-[11px]"><span class="font-mono text-energy">▶ inizio ciclo</span><span class="text-dim" x-text="new Date(c.at).toLocaleString()"></span></div>
+              <div class="text-[12px] text-dim mt-0.5" x-show="c.reason"><span class="text-txt">perché:</span> <span x-text="c.reason"></span></div>
             </div>
-          </template>
-        </div>
-      </section>
+            <div class="p-4 space-y-2.5">
+              <template x-for="(e,j) in c.entries" :key="j">
+                <div class="text-[13px] leading-relaxed border-l-2 pl-3" :class="bar(e.kind)">
+                  <div class="flex items-center gap-2 mb-0.5">
+                    <span class="text-[9px] uppercase tracking-widest px-1.5 py-0.5 rounded border" :class="cls(e.kind)" x-text="lbl(e.kind)"></span>
+                    <span class="text-[10px] text-dim font-mono" x-text="new Date(e.at).toLocaleTimeString()"></span>
+                  </div>
+                  <div class="whitespace-pre-wrap" :class="e.kind==='rest'?'text-dim italic':(e.kind==='action'?'text-txt font-medium':'text-txt')" x-text="e.content"></div>
+                </div>
+              </template>
+              <div class="text-[10px] text-dim font-mono pt-1 border-t border-line/60">■ fine ciclo</div>
+            </div>
+          </section>
+        </template>
+      </div>
     </template>
+
+    <!-- POSIZIONI ATTIVE -->
+    <template x-if="tab==='active'">
+      <div class="space-y-3">
+        <template x-if="!pos.active?.length"><div class="rounded-2xl bg-panel border border-line p-6 text-dim text-center">Nessuna posizione attiva. Quando Scarlet apre una posizione compare qui con il P&L live.</div></template>
+        <template x-for="p in (pos.active||[])" :key="p.id">
+          <section class="rounded-2xl bg-panel border border-line p-4">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="font-mono text-[10px] text-dim">#<span x-text="p.id"></span></span>
+              <span class="font-semibold text-txt" x-text="p.symbol||short(p.token)"></span>
+              <span class="text-[10px] px-2 py-0.5 rounded-full border" :class="statusCls(p.status)" x-text="p.status"></span>
+              <div class="flex-1"></div>
+              <span class="text-lg font-semibold" :class="p.gainPct>=0?'text-pos':'text-neg'" x-show="p.gainPct!=null" x-text="(p.gainPct>=0?'+':'')+fmt(p.gainPct,1)+'%'"></span>
+            </div>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-3 text-[12px]">
+              <div><div class="text-dim">size</div><div class="text-txt" x-text="usd(p.sizeUsd)"></div></div>
+              <div><div class="text-dim">entry</div><div class="text-txt" x-text="p.filledPrice!=null?('$'+fmt(p.filledPrice,6)):(p.entryPrice!=null?('limit $'+fmt(p.entryPrice,6)):'in attesa')"></div></div>
+              <div><div class="text-dim">prezzo ora</div><div class="text-txt" x-text="p.currentPrice!=null?('$'+fmt(p.currentPrice,6)):'–'"></div></div>
+              <div><div class="text-dim">valore ora</div><div class="text-txt" x-text="usd(p.valueUsd)"></div></div>
+              <div><div class="text-dim">stop / target</div><div class="text-txt"><span x-text="p.stopLossPct!=null?('-'+p.stopLossPct+'%'):'—'"></span> / <span x-text="p.takeProfitPct!=null?('+'+p.takeProfitPct+'%'):'—'"></span></div></div>
+              <div><div class="text-dim">rimane</div><div class="text-txt" x-text="fmt(p.remainingPct,0)+'%'"></div></div>
+              <div class="col-span-2"><div class="text-dim">ultimo esito</div><div class="text-txt text-[11px]" x-text="p.lastResult||'—'"></div></div>
+            </div>
+          </section>
+        </template>
+      </div>
+    </template>
+
+    <!-- STORICO POSIZIONI -->
+    <template x-if="tab==='history'">
+      <div class="rounded-2xl bg-panel border border-line overflow-hidden">
+        <template x-if="!pos.history?.length"><div class="p-6 text-dim text-center">Nessuna posizione chiusa ancora.</div></template>
+        <table class="w-full text-[12px]" x-show="pos.history?.length">
+          <thead class="text-dim text-[10px] uppercase tracking-wider bg-panel2"><tr>
+            <th class="text-left px-3 py-2">#</th><th class="text-left px-3 py-2">token</th><th class="text-left px-3 py-2">stato</th>
+            <th class="text-right px-3 py-2">size</th><th class="text-right px-3 py-2">entry</th><th class="text-right px-3 py-2">stop/tp</th><th class="text-left px-3 py-2">esito</th></tr></thead>
+          <tbody>
+            <template x-for="p in (pos.history||[])" :key="p.id">
+              <tr class="border-t border-line/60">
+                <td class="px-3 py-2 font-mono text-dim" x-text="p.id"></td>
+                <td class="px-3 py-2 text-txt" x-text="p.symbol||short(p.token)"></td>
+                <td class="px-3 py-2"><span class="text-[10px] px-2 py-0.5 rounded-full border" :class="statusCls(p.status)" x-text="p.status"></span></td>
+                <td class="px-3 py-2 text-right" x-text="usd(p.sizeUsd)"></td>
+                <td class="px-3 py-2 text-right" x-text="p.filledPrice!=null?('$'+fmt(p.filledPrice,6)):'–'"></td>
+                <td class="px-3 py-2 text-right text-dim"><span x-text="p.stopLossPct!=null?('-'+p.stopLossPct+'%'):'—'"></span>/<span x-text="p.takeProfitPct!=null?('+'+p.takeProfitPct+'%'):'—'"></span></td>
+                <td class="px-3 py-2 text-dim text-[11px]" x-text="p.lastResult||'—'"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </template>
+
   </main>
 </div>
 <script>
-function scar(){return{ d:{},
+function scar(){return{ tab:'reason', d:{}, pos:{},
   init(){ this.load(); setInterval(()=>this.load(),6000); },
-  async load(){ try{ this.d=await (await fetch('/api/scarlet')).json(); }catch(e){} },
-  lbl(k){ return ({thought:'pensiero',action:'azione',rest:'riposo',note:'nota',memory:'memoria'})[k]||k; },
-  cls(k){ return ({thought:'text-dim border-line',action:'text-energy border-energy/50',rest:'text-dim border-line',note:'text-warn border-warn/50',memory:'text-dim border-line'})[k]||'text-dim border-line'; }
+  async load(){ try{ this.d=await (await fetch('/api/scarlet')).json(); }catch(e){} try{ this.pos=await (await fetch('/api/positions')).json(); }catch(e){} },
+  lbl(k){ return ({cycle:'inizio',thought:'pensiero',text:'testo',tool:'strumento',action:'azione',rest:'riposo',note:'nota',memory:'memoria'})[k]||k; },
+  cls(k){ return ({thought:'text-dim border-line',tool:'text-energy border-energy/40',action:'text-pos border-pos/50',rest:'text-dim border-line',note:'text-warn border-warn/50'})[k]||'text-dim border-line'; },
+  bar(k){ return ({tool:'border-energy/40',action:'border-pos/60',rest:'border-line'})[k]||'border-line/50'; },
+  statusCls(s){ return ({open:'border-pos/60 text-pos','pending-entry':'border-warn/60 text-warn',entering:'border-warn/60 text-warn',closed:'border-line text-dim',cancelled:'border-neg/40 text-neg'})[s]||'border-line text-dim'; },
+  fmt(n,x=2){ return (n==null||isNaN(n))?'–':Number(n).toLocaleString(undefined,{maximumFractionDigits:x}); },
+  usd(n,x=2){ return (n==null||isNaN(n))?'–':'$'+this.fmt(n,x); },
+  short(a){ return a?a.slice(0,6)+'…'+a.slice(-4):'?'; }
 }}
 </script></body></html>`;
 

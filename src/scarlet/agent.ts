@@ -117,6 +117,9 @@ export class ScarletAgent {
         { role: "user", content: JSON.stringify({ reason, now: new Date().toISOString(), executionEnabled: this.config.EXECUTION_ENABLED, briefing: world, instruction: "Parti dal 'reason'. Osserva il briefing, continua dalla tua storia. Se c'è qualcosa di materiale da annotare, usa 'note'; altrimenti riposa (nessuno strumento)." }) }
       ];
 
+      // Cycle-start marker for the dashboard timeline: WHY she woke (the wake reason).
+      await this.db.addJournal("cycle", reason, { idleStreak: this.idleStreak }, cycle, SCARLET_STREAM).catch(() => undefined);
+
       const toolsUsed: string[] = [];
       let rounds = 0;
       for (let round = 0; round < this.config.SCARLET_MAX_ROUNDS; round += 1) {
@@ -138,6 +141,12 @@ export class ScarletAgent {
           toolsUsed.push(call.name);
           const result = await this.dispatch(call.name, call.arguments, cycle);
           this.logger.info({ cycle, round, tool: call.name, args: compact(call.arguments), result: compact(result) }, "Scarlet(v2) tool");
+          // Persist every tool/action to her timeline (the dashboard reads it) — `note` self-journals, so
+          // skip it here to avoid a duplicate. State-changing actions are tagged 'action', reads 'tool'.
+          if (call.name !== "note") {
+            const isAct = isActionTool(call.name);
+            await this.db.addJournal(isAct ? "action" : "tool", toolLine(call.name, call.arguments, result), { round, name: call.name }, cycle, SCARLET_STREAM).catch(() => undefined);
+          }
           messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
         }
         if (rounds >= this.config.SCARLET_MAX_ROUNDS) this.logger.info({ reason, cycle, rounds, toolsUsed, totalMs: Date.now() - t0, outcome: "max-rounds" }, "Scarlet(v2) reached max rounds");
@@ -196,4 +205,19 @@ function loadPrompt(path: string): string {
 function compact(value: unknown): string {
   const text = typeof value === "string" ? value : JSON.stringify(value);
   return text && text.length > 400 ? `${text.slice(0, 400)}…` : (text ?? "");
+}
+
+/** A concise, human-readable one-liner for a tool call + its outcome — for the dashboard timeline. */
+function toolLine(name: string, rawArgs: string, result: unknown): string {
+  let args: Record<string, unknown> = {};
+  try { args = rawArgs ? JSON.parse(rawArgs) : {}; } catch { /* keep empty */ }
+  const arg = Object.entries(args).map(([k, v]) => `${k}=${typeof v === "string" && v.length > 14 ? v.slice(0, 8) + "…" + v.slice(-4) : String(v)}`).join(", ");
+  const r = result as Record<string, unknown> | null;
+  let out = "ok";
+  if (r && typeof r === "object") {
+    if ("error" in r) out = `errore: ${String(r.error).slice(0, 70)}`;
+    else if ("refused" in r) out = `RIFIUTATO: ${String(r.reason ?? "").slice(0, 70)}`;
+    else if ("ok" in r && r.ok) out = "positionId" in r ? `ok → posizione #${r.positionId}` : "ok";
+  }
+  return `${name}(${arg}) → ${out}`;
 }

@@ -1416,7 +1416,7 @@ export class Database {
   }
 
   /** Records one human-readable entry in Scarlet's journal (a note, a thought, or an action). */
-  async addJournal(kind: "note" | "thought" | "action" | "rest" | "memory", content: string, meta: Record<string, unknown> = {}, cycle?: string, stream = "main"): Promise<void> {
+  async addJournal(kind: "note" | "thought" | "action" | "rest" | "memory" | "cycle" | "tool", content: string, meta: Record<string, unknown> = {}, cycle?: string, stream = "main"): Promise<void> {
     await this.pool.query(`INSERT INTO scarlet_journal(cycle, kind, content, meta, stream) VALUES($1,$2,$3,$4,$5)`, [cycle ?? null, kind, content.replace(/\u0000/g, "").slice(0, 4_000), jsonParam(meta), stream]);
   }
 
