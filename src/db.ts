@@ -423,6 +423,21 @@ export class Database {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (chain_id, pool)
       );
+      -- Per-token market stats in 5-min buckets, from V3 swap amounts (the indexer already reads them).
+      -- Gives volume / txns / buy-sell / price-change over any window by summing recent buckets — the
+      -- chain-sourced replacement for the DexScreener market feed. Pruned to a short retention.
+      CREATE TABLE IF NOT EXISTS token_stats (
+        chain_id INTEGER NOT NULL,
+        token TEXT NOT NULL,
+        bucket BIGINT NOT NULL,      -- unix epoch floored to 300s
+        vol_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+        buys INTEGER NOT NULL DEFAULT 0,
+        sells INTEGER NOT NULL DEFAULT 0,
+        last_price DOUBLE PRECISION,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (chain_id, token, bucket)
+      );
+      CREATE INDEX IF NOT EXISTS token_stats_lookup_idx ON token_stats(chain_id, token, bucket DESC);
       -- DISPLAY prices only (Lane A): indicative, slow-refreshed, batch-sourced. NEVER used for
       -- arb/liquidation decisions — those compute fresh execution quotes (Lane B). Kept in its own
       -- table so the fast-changing price never churns the immutable entity metadata.
@@ -1173,6 +1188,88 @@ export class Database {
         rows.map((x) => s(x.sqrtPrice)), rows.map((x) => s(x.liquidity)),
         rows.map((x) => x.block)]
     );
+  }
+
+  /** Increment per-token market stats for the current 5-min bucket (from V3 swap amounts). */
+  async upsertTokenStats(chainId: number, bucket: number, rows: Array<{ token: string; volUsd: number; buys: number; sells: number; lastPrice: number }>): Promise<void> {
+    if (!rows.length) return;
+    await this.pool.query(
+      `INSERT INTO token_stats(chain_id, token, bucket, vol_usd, buys, sells, last_price)
+       SELECT $1, t, $2, v, b, s, lp FROM unnest($3::text[], $4::float8[], $5::int[], $6::int[], $7::float8[]) AS x(t, v, b, s, lp)
+       ON CONFLICT (chain_id, token, bucket) DO UPDATE SET
+         vol_usd = token_stats.vol_usd + EXCLUDED.vol_usd,
+         buys = token_stats.buys + EXCLUDED.buys,
+         sells = token_stats.sells + EXCLUDED.sells,
+         last_price = COALESCE(EXCLUDED.last_price, token_stats.last_price),
+         updated_at = NOW()`,
+      [chainId, bucket, rows.map((r) => r.token.toLowerCase()), rows.map((r) => r.volUsd), rows.map((r) => r.buys), rows.map((r) => r.sells), rows.map((r) => r.lastPrice)]
+    );
+  }
+  async pruneTokenStats(chainId: number, olderThanHours: number): Promise<number> {
+    const cutoff = Math.floor(Date.now() / 1000) - olderThanHours * 3600;
+    const r = await this.pool.query(`DELETE FROM token_stats WHERE chain_id=$1 AND bucket < $2`, [chainId, cutoff]);
+    return r.rowCount ?? 0;
+  }
+  /** Windowed market stats for a token — the chain-sourced replacement for the DexScreener feed. */
+  async tokenStats(chainId: number, token: string): Promise<{ vol5m: number; vol1h: number; vol24h: number; txns24h: number; buys24h: number; sells24h: number; change1h: number | null; change24h: number | null; lastPrice: number | null }> {
+    const now = Math.floor(Date.now() / 1000);
+    const r = await this.pool.query<{ vol5m: string; vol1h: string; vol24h: string; buys24h: string; sells24h: string }>(
+      `SELECT
+         COALESCE(SUM(vol_usd) FILTER (WHERE bucket >= $3),0)::text AS vol5m,
+         COALESCE(SUM(vol_usd) FILTER (WHERE bucket >= $4),0)::text AS vol1h,
+         COALESCE(SUM(vol_usd),0)::text AS vol24h,
+         COALESCE(SUM(buys),0)::text AS buys24h,
+         COALESCE(SUM(sells),0)::text AS sells24h
+       FROM token_stats WHERE chain_id=$1 AND token=$2 AND bucket >= $5`,
+      [chainId, token.toLowerCase(), now - 300, now - 3600, now - 86400]
+    );
+    const row = r.rows[0];
+    // Price change: latest bucket price vs the price ~1h / ~24h ago (nearest bucket at/under the mark).
+    const priceAt = async (secsAgo: number): Promise<number | null> => {
+      const q = await this.pool.query<{ last_price: number | null }>(
+        `SELECT last_price FROM token_stats WHERE chain_id=$1 AND token=$2 AND last_price IS NOT NULL AND bucket <= $3 ORDER BY bucket DESC LIMIT 1`,
+        [chainId, token.toLowerCase(), now - secsAgo]
+      );
+      return q.rows[0]?.last_price ?? null;
+    };
+    const latestQ = await this.pool.query<{ last_price: number | null }>(
+      `SELECT last_price FROM token_stats WHERE chain_id=$1 AND token=$2 AND last_price IS NOT NULL ORDER BY bucket DESC LIMIT 1`, [chainId, token.toLowerCase()]
+    );
+    const latest = latestQ.rows[0]?.last_price ?? null;
+    const chg = (past: number | null): number | null => (latest != null && past != null && past > 0 ? (latest / past - 1) * 100 : null);
+    const [p1h, p24h] = await Promise.all([priceAt(3600), priceAt(86400)]);
+    return {
+      vol5m: Number(row.vol5m), vol1h: Number(row.vol1h), vol24h: Number(row.vol24h),
+      txns24h: Number(row.buys24h) + Number(row.sells24h), buys24h: Number(row.buys24h), sells24h: Number(row.sells24h),
+      change1h: chg(p1h), change24h: chg(p24h), lastPrice: latest
+    };
+  }
+  /** Approximate USD liquidity of a token: summed across its pools, quote-side reserve × quote USD × 2.
+   * V2 reserves are exact; V3 uses virtual reserves (a relative-depth signal, not exact locked TVL). */
+  async tokenLiquidityUsd(chainId: number, token: string, quoteUsd: (t: string) => number | null): Promise<number | null> {
+    const t = token.toLowerCase();
+    const r = await this.pool.query<{ token0: string | null; token1: string | null; r0: string | null; r1: string | null; sqrt_price: string | null; liquidity: string | null }>(
+      `SELECT e.meta->>'token0' token0, e.meta->>'token1' token1, ps.r0::text, ps.r1::text, ps.sqrt_price::text, ps.liquidity::text
+       FROM entities e JOIN pool_state ps ON ps.pool=e.address
+       WHERE e.chain_id=$1 AND e.kind='pool' AND (lower(e.meta->>'token0')=$2 OR lower(e.meta->>'token1')=$2)`, [chainId, t]
+    );
+    if (!r.rows.length) return null;
+    const decMap = await this.tokenMeta(chainId, r.rows.flatMap((x) => [x.token0, x.token1].filter(Boolean) as string[]));
+    let total = 0; let any = false;
+    const Q96 = 2 ** 96;
+    for (const row of r.rows) {
+      const t0 = row.token0?.toLowerCase(), t1 = row.token1?.toLowerCase(); if (!t0 || !t1) continue;
+      const quote = t0 === t ? t1 : t0; const qUsd = quoteUsd(quote); if (qUsd == null || qUsd <= 0) continue;
+      const qDec = quote === t0 ? decMap.get(t0)?.decimals : decMap.get(t1)?.decimals; if (qDec == null) continue;
+      let qReserve: number | null = null;
+      if (row.r0 != null && row.r1 != null) qReserve = Number(quote === t0 ? row.r0 : row.r1) / 10 ** qDec; // V2 exact
+      else if (row.sqrt_price != null && row.liquidity != null) { // V3 virtual reserve of the quote side
+        const sp = Number(BigInt(row.sqrt_price.split(".")[0])) / Q96, L = Number(BigInt(row.liquidity.split(".")[0]));
+        const virt = quote === t0 ? L / sp : L * sp; qReserve = virt / 10 ** qDec;
+      }
+      if (qReserve != null && qReserve > 0) { total += qReserve * qUsd * 2; any = true; }
+    }
+    return any ? total : null;
   }
 
   /** Latest AMM state for a batch of pools — the DB source PriceOracle reads instead of RPC. */

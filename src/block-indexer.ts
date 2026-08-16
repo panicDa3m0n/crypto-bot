@@ -102,7 +102,10 @@ export class BlockIndexer {
         processed += to - from + 1; swaps += r.swaps; discovered += r.discovered; lending += r.lending;
         from = to + 1;
       }
-      if (this.config.DEBUG_KEEP_RAW_BLOCKS && ++this.ticks % 200 === 0) await this.db.pruneRawBlocks(this.config.CHAIN_ID, this.config.INDEXER_RAW_RETENTION_HOURS).catch(() => undefined);
+      if (++this.ticks % 200 === 0) {
+        await this.db.pruneTokenStats(this.config.CHAIN_ID, 48).catch(() => undefined); // 48h retention for market-stat windows
+        if (this.config.DEBUG_KEEP_RAW_BLOCKS) await this.db.pruneRawBlocks(this.config.CHAIN_ID, this.config.INDEXER_RAW_RETENTION_HOURS).catch(() => undefined);
+      }
       if (processed > 0) this.logger.info({ upTo: this.cursor, blocks: processed, swaps, discovered, lending, ethUsd: this.ethUsd, ms: Date.now() - t0, lag: head - this.cursor }, "indexed blocks");
     } finally {
       this.running = false;
@@ -196,6 +199,7 @@ export class BlockIndexer {
     const px = await this.db.getTokenPrices(this.config.CHAIN_ID, [...tokenSet]).catch(() => new Map()) as Map<string, { priceUsd: number | null; source: string }>;
     const state = new Map<string, { pool: string; archetype: string; r0?: bigint; r1?: bigint; sqrtPrice?: bigint; liquidity?: bigint; block: number }>();
     const rows = new Map<string, { price: number; conf: number }>(); // token → USD price this block (last swap wins)
+    const stats = new Map<string, { volUsd: number; buys: number; sells: number; lastPrice: number }>(); // V3 volume/txns per token
     // A token's current USD: a QUOTE (WETH/USDC), a DIRECT price computed this block (conf≥0.95), or the
     // stored DB price. Only direct/quote anchors are used for multi-hop, so hop prices never chain.
     const usdOf = (t: string): number | null => {
@@ -218,20 +222,40 @@ export class BlockIndexer {
       const p0in1 = isSwap ? priceV3(l.data, d0, d1) : priceV2(l.data, d0, d1); // token0 price in token1 (human)
       if (p0in1 == null || !(p0in1 > 0) || !Number.isFinite(p0in1)) continue;
       swaps += 1;
-      // Price the NON-quote token. Direct if one side is WETH/USDC (conf 0.95); else multi-hop via a
-      // side that already has a USD price (conf 0.8 — one hop, marked lower so it never anchors another).
+      // Price the NON-quote token T via anchor side A. Direct if A is WETH/USDC (conf 0.95); else
+      // multi-hop via a side that already has a USD price (conf 0.8 — one hop, never anchors another).
       const q1 = this.quoteUsd(t1), q0 = this.quoteUsd(t0);
-      if (q1 != null) rows.set(t0, { price: p0in1 * q1, conf: 0.95 });
-      else if (q0 != null) rows.set(t1, { price: (1 / p0in1) * q0, conf: 0.95 });
+      let T: string | null = null, A: string | null = null, U = 0, priceT = 0;
+      if (q1 != null) { T = t0; A = t1; U = q1; priceT = p0in1 * q1; rows.set(t0, { price: priceT, conf: 0.95 }); }
+      else if (q0 != null) { T = t1; A = t0; U = q0; priceT = (1 / p0in1) * q0; rows.set(t1, { price: priceT, conf: 0.95 }); }
       else { const u1 = usdOf(t1), u0 = usdOf(t0);
-        if (u1 != null) rows.set(t0, { price: p0in1 * u1, conf: 0.8 });
-        else if (u0 != null) rows.set(t1, { price: (1 / p0in1) * u0, conf: 0.8 }); }
+        if (u1 != null) { T = t0; A = t1; U = u1; priceT = p0in1 * u1; rows.set(t0, { price: priceT, conf: 0.8 }); }
+        else if (u0 != null) { T = t1; A = t0; U = u0; priceT = (1 / p0in1) * u0; rows.set(t1, { price: priceT, conf: 0.8 }); } }
+
+      // V3 volume/txns: swap USD size = |anchor-side amount| × its USD; buy = T flows OUT of the pool
+      // (negative in V3's signed convention). V2 Sync carries no amounts → V2 volume is a follow-up.
+      if (isSwap && T && A) {
+        const aAmt = A === t0 ? sword(l.data, 0) : sword(l.data, 1);
+        const tAmt = A === t0 ? sword(l.data, 1) : sword(l.data, 0);
+        const decA = A === t0 ? d0 : d1;
+        if (aAmt != null && tAmt != null) {
+          const S = Math.abs(Number(aAmt) / 10 ** decA) * U;
+          if (S > 0 && Number.isFinite(S)) {
+            const s = stats.get(T) ?? { volUsd: 0, buys: 0, sells: 0, lastPrice: priceT };
+            s.volUsd += S; if (tAmt < 0n) s.buys += 1; else s.sells += 1; s.lastPrice = priceT; stats.set(T, s);
+          }
+        }
+      }
     }
 
     if (this.config.DEBUG_KEEP_RAW_BLOCKS && logs.length) await this.db.saveRawBlock(this.config.CHAIN_ID, block, logs).catch(() => undefined);
     if (state.size) await this.db.upsertPoolState(this.config.CHAIN_ID, [...state.values()]).catch((e) => this.logger.debug({ err: e }, "indexer pool_state upsert failed"));
     if (rows.size) {
       await this.db.upsertTokenPrices(this.config.CHAIN_ID, [...rows.entries()].map(([token, v]) => ({ token, priceUsd: v.price, confidence: v.conf, source: "indexer" })), { tauFastSec: this.config.VOL_TAU_FAST_SEC, tauSlowSec: this.config.VOL_TAU_SLOW_SEC }).catch((e) => this.logger.debug({ err: e }, "indexer price upsert failed"));
+    }
+    if (stats.size) {
+      const bucket = Math.floor(Date.now() / 1000 / 300) * 300;
+      await this.db.upsertTokenStats(this.config.CHAIN_ID, bucket, [...stats.entries()].map(([token, s]) => ({ token, ...s }))).catch((e) => this.logger.debug({ err: e }, "indexer token_stats upsert failed"));
     }
     return { swaps, discovered, lending };
   }
@@ -365,6 +389,8 @@ export class BlockIndexer {
 function hex(n: number): string { return "0x" + n.toString(16); }
 /** The Nth 32-byte word of `data` as a BigInt (null if data too short). */
 function word(data: string, i: number): bigint | null { const s = 2 + i * 64; return data.length >= s + 64 ? BigInt("0x" + data.slice(s, s + 64)) : null; }
+/** The Nth word as a SIGNED int256 (V3 Swap amount0/amount1 can be negative = out of the pool). */
+function sword(data: string, i: number): bigint | null { const u = word(data, i); return u == null ? null : (u >= (1n << 255n) ? u - (1n << 256n) : u); }
 function addrFromTopic(topic: string | undefined): string | null { return topic && topic.length >= 42 ? "0x" + topic.slice(-40).toLowerCase() : null; }
 /** address stored in the Nth 32-byte word of `data` (right-aligned). */
 function wordAddr(data: string, word: number): string | null { const s = 2 + word * 64; return data.length >= s + 64 ? "0x" + data.slice(s + 24, s + 64).toLowerCase() : null; }

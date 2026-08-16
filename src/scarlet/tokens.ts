@@ -93,14 +93,31 @@ async function compileSecurity(deps: ToolDeps, addr: string): Promise<Record<str
 async function buildDossier(deps: ToolDeps, addr: string): Promise<unknown> {
   const chainId = deps.config.CHAIN_ID;
   const wallet = deps.config.WALLET_ADDRESS as string | undefined;
-  const [entities, prices, vol, annotations, activity, market] = await Promise.all([
+  const weth = (deps.config.WBERA_ADDRESS as string).toLowerCase(), usdc = (deps.config.USDC_E_ADDRESS as string).toLowerCase();
+  const [entities, prices, vol, annotations, activity, stats, wethMap, poolRows] = await Promise.all([
     deps.db.getEntity(chainId, addr).catch(() => []),
     deps.db.getTokenPrices(chainId, [addr]).catch(() => new Map()),
     deps.db.tokenVolatility(chainId, [addr]).catch(() => new Map()),
     deps.db.listTokenAnnotations(chainId, addr, 5).catch(() => []),
     wallet ? deps.db.walletActivityForToken(chainId, wallet, addr, 10).catch(() => []) : Promise.resolve([]),
-    deps.dexscreener.token(addr).catch((e) => ({ error: e instanceof Error ? e.message : String(e) }))
+    deps.db.tokenStats(chainId, addr).catch(() => null),
+    deps.db.getTokenPrices(chainId, [weth]).catch(() => new Map()),
+    deps.db.poolsForToken(chainId, addr).catch(() => [])
   ]);
+  // Market data is now chain-sourced from the indexer (token_stats + pool_state), not DexScreener.
+  const wethUsd = (wethMap as Map<string, { priceUsd: number | null }>).get(weth)?.priceUsd ?? null;
+  const quoteUsd = (t: string): number | null => { const x = t.toLowerCase(); return x === usdc ? 1 : x === weth ? wethUsd : null; };
+  const liquidityUsd = await deps.db.tokenLiquidityUsd(chainId, addr, quoteUsd).catch(() => null);
+  const pools = (poolRows as Array<{ address: string; meta: unknown }>).map((r) => r.address);
+  const market = {
+    source: "indexer",
+    volumeUsd: stats ? { m5: Math.round(stats.vol5m), h1: Math.round(stats.vol1h), h24: Math.round(stats.vol24h) } : null,
+    txns24h: stats?.txns24h ?? null, buys24h: stats?.buys24h ?? null, sells24h: stats?.sells24h ?? null,
+    priceChangePct: stats ? { h1: stats.change1h, h24: stats.change24h } : null,
+    liquidityUsd: liquidityUsd != null ? Math.round(liquidityUsd) : null,
+    pools: pools.slice(0, 8),
+    note: "volume/txns su finestra 24h (V3); liquidità V3 approssimata (riserve virtuali); price-change si riempie man mano"
+  };
   const token = (entities as Array<{ kind: string; symbol: string | null; name: string | null; decimals: number | null; meta: unknown; note: string | null; status: string }>).find((e) => e.kind === "token");
   const meta = (token?.meta ?? {}) as Record<string, unknown>;
   const p = (prices as Map<string, { priceUsd: number | null; source: string; updatedAt: string }>).get(addr);
@@ -117,7 +134,7 @@ async function buildDossier(deps: ToolDeps, addr: string): Promise<unknown> {
   const hints = [
     "annotate_token(address, verdict, note) — registra il tuo giudizio (verdict: avoid|watch|candidate|neutral)",
     "reverify_token(address) — ricontrolla la sicurezza on-chain (aggiorna checkedAt)",
-    "token_chart(pool, timeframe) — storico prezzi/candele del pool (pool da market.pairs[0].pair; timeframe minute|hour|day)",
+    "token_chart(pool, timeframe) — storico prezzi/candele del pool (pool da market.pools[0]; timeframe minute|hour|day)",
     ...(anns.length > 1 ? ["token_annotations(address) — lo storico completo dei tuoi giudizi su questo token"] : []),
     ...(acts.length ? ["token_activity(address) — lo storico completo delle nostre interazioni col token"] : []),
     ...(!chain ? ["sync_address(address) — arricchisci con holders/creator/tag/marketcap da Blockscout (una volta, poi resta salvato)"] : [])
