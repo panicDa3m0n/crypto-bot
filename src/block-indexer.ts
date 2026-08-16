@@ -40,6 +40,12 @@ const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "fun
 const ERC20_META_ABI = parseAbi(["function symbol() view returns (string)", "function name() view returns (string)", "function decimals() view returns (uint8)"]);
 const IDENTITY_CAP = 8; // max token-identity resolutions per call (bounds first-run RPC burst)
 const BOOTSTRAP_CAP = 20; // max unknown pools to bootstrap per block (self-limits any first-run burst)
+// Sanity bounds: a thin pool at an extreme tick can quote an absurd price; unfiltered it poisons the
+// token's price AND (× that price) its volume, and propagates through multi-hop. No real Base token
+// unit exceeds these, so we simply refuse to write out-of-range prices / implausible single-swap volume.
+const MAX_PRICE_USD = 10_000_000;    // ~158× cbBTC — well above any legitimate per-unit price
+const MAX_SWAP_USD = 1_000_000_000;  // reject a single swap valued over $1B as a decode/decimals artifact
+const sanePrice = (p: number | null | undefined): p is number => p != null && Number.isFinite(p) && p > 0 && p < MAX_PRICE_USD;
 const TOPIC0S = [V3_SWAP, V2_SYNC, V2_SWAP, PAIR_CREATED, POOL_CREATED, MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE];
 const CHUNK = 10;            // public getLogs range cap
 const ANCHOR_TTL_MS = 30_000; // refresh ETH/USD at most this often
@@ -205,8 +211,8 @@ export class BlockIndexer {
     // stored DB price. Only direct/quote anchors are used for multi-hop, so hop prices never chain.
     const usdOf = (t: string): number | null => {
       const q = this.quoteUsd(t); if (q != null) return q;
-      const fresh = rows.get(t); if (fresh && fresh.conf >= 0.95 && fresh.price > 0) return fresh.price;
-      const dbp = px.get(t); return dbp?.priceUsd && dbp.priceUsd > 0 ? dbp.priceUsd : null;
+      const fresh = rows.get(t); if (fresh && fresh.conf >= 0.95 && sanePrice(fresh.price)) return fresh.price;
+      const dbp = px.get(t)?.priceUsd; return sanePrice(dbp) ? dbp : null;
     };
     let swaps = 0;
     for (const l of priced) {
@@ -226,22 +232,24 @@ export class BlockIndexer {
       // Price the NON-quote token T via anchor side A. Direct if A is WETH/USDC (conf 0.95); else
       // multi-hop via a side that already has a USD price (conf 0.8 — one hop, never anchors another).
       const q1 = this.quoteUsd(t1), q0 = this.quoteUsd(t0);
-      let T: string | null = null, A: string | null = null, U = 0, priceT = 0;
-      if (q1 != null) { T = t0; A = t1; U = q1; priceT = p0in1 * q1; rows.set(t0, { price: priceT, conf: 0.95 }); }
-      else if (q0 != null) { T = t1; A = t0; U = q0; priceT = (1 / p0in1) * q0; rows.set(t1, { price: priceT, conf: 0.95 }); }
+      let T: string | null = null, A: string | null = null, U = 0, priceT = 0, conf = 0;
+      if (q1 != null) { T = t0; A = t1; U = q1; priceT = p0in1 * q1; conf = 0.95; }
+      else if (q0 != null) { T = t1; A = t0; U = q0; priceT = (1 / p0in1) * q0; conf = 0.95; }
       else { const u1 = usdOf(t1), u0 = usdOf(t0);
-        if (u1 != null) { T = t0; A = t1; U = u1; priceT = p0in1 * u1; rows.set(t0, { price: priceT, conf: 0.8 }); }
-        else if (u0 != null) { T = t1; A = t0; U = u0; priceT = (1 / p0in1) * u0; rows.set(t1, { price: priceT, conf: 0.8 }); } }
+        if (u1 != null) { T = t0; A = t1; U = u1; priceT = p0in1 * u1; conf = 0.8; }
+        else if (u0 != null) { T = t1; A = t0; U = u0; priceT = (1 / p0in1) * u0; conf = 0.8; } }
+      if (!T || !A || !sanePrice(priceT)) continue; // reject thin-pool / extreme-tick garbage
+      rows.set(T, { price: priceT, conf });
 
       // V3 volume/txns: swap USD size = |anchor-side amount| × its USD; buy = T flows OUT of the pool
       // (negative in V3's signed convention).
-      if (isSwap && T && A) {
+      if (isSwap) {
         const aAmt = A === t0 ? sword(l.data, 0) : sword(l.data, 1);
         const tAmt = A === t0 ? sword(l.data, 1) : sword(l.data, 0);
         const decA = A === t0 ? d0 : d1;
         if (aAmt != null && tAmt != null) {
           const S = Math.abs(Number(aAmt) / 10 ** decA) * U;
-          if (S > 0 && Number.isFinite(S)) {
+          if (S > 0 && S < MAX_SWAP_USD && Number.isFinite(S)) {
             const s = stats.get(T) ?? { volUsd: 0, buys: 0, sells: 0, lastPrice: priceT };
             s.volUsd += S; if (tAmt < 0n) s.buys += 1; else s.sells += 1; s.lastPrice = priceT; stats.set(T, s);
           }
@@ -265,7 +273,7 @@ export class BlockIndexer {
       const net1 = (word(l.data, 1) ?? 0n) - (word(l.data, 3) ?? 0n);
       const netA = A === t0 ? net0 : net1, netT = T === t0 ? net0 : net1;
       const S = Math.abs(Number(netA) / 10 ** decA) * U;
-      if (!(S > 0) || !Number.isFinite(S)) continue;
+      if (!(S > 0) || S >= MAX_SWAP_USD || !Number.isFinite(S)) continue;
       const priceT = rows.get(T)?.price ?? px.get(T)?.priceUsd ?? 0;
       const s = stats.get(T) ?? { volUsd: 0, buys: 0, sells: 0, lastPrice: priceT };
       s.volUsd += S; if (netT < 0n) s.buys += 1; else s.sells += 1; if (priceT > 0) s.lastPrice = priceT; stats.set(T, s);
