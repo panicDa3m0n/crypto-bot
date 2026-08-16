@@ -16,6 +16,7 @@ import { selfState } from "../self.js";
 import { buildTradingBriefing } from "./briefing.js";
 import { VISION_TOOLS, dispatchVisionTool, isVisionTool, type ToolDeps } from "./tools.js";
 import { TOKEN_TOOLS, dispatchTokenTool, isTokenTool } from "./tokens.js";
+import { ACTION_TOOLS, dispatchActionTool, isActionTool } from "./actions.js";
 
 const FALLBACK_PROMPT = "Sei Scarlet, un'agente di trading on-chain. Osserva il briefing, ragiona, annota o riposa.";
 const WAKE_DEBOUNCE_MS = 5 * 60_000; // per-key debounce so a flapping position can't spam activations
@@ -162,6 +163,7 @@ export class ScarletAgent {
     }
     if (isTokenTool(name)) return dispatchTokenTool(name, args, this.toolDeps);
     if (isVisionTool(name)) return dispatchVisionTool(name, args, this.toolDeps);
+    if (isActionTool(name)) return dispatchActionTool(name, args, this.toolDeps);
     return { error: `unknown tool '${name}'` };
   }
 
@@ -178,12 +180,13 @@ const SCARLET_TOOLS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "note",
-      description: "Registra una breve osservazione, tesi o piano nel tuo diario. Usalo per ragionare ad alta voce o annotare un'intenzione. (Acquisto/vendita e gestione posizioni arriveranno nei prossimi gradini.)",
+      description: "Registra una breve osservazione, tesi o piano nel tuo diario. Usalo per ragionare ad alta voce o annotare un'intenzione.",
       parameters: { type: "object", properties: { text: { type: "string", description: "il testo della nota" } }, required: ["text"] }
     }
   },
   ...TOKEN_TOOLS,
-  ...VISION_TOOLS
+  ...VISION_TOOLS,
+  ...ACTION_TOOLS
 ];
 
 function loadPrompt(path: string): string {

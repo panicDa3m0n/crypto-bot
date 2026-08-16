@@ -273,6 +273,13 @@ const schema = z.object({
   MIN_OBSERVATION_HEALTH_RATIO: z.coerce.number().min(0.9).max(1).default(0.95),
   MAX_OBSERVATION_GAP_SECONDS: z.coerce.number().int().min(5).max(300).default(15),
   MICRO_TEST_MAX_LOSS_USD: z.coerce.number().positive().max(0.05).default(0.05)
+  // Action layer (Scarlet's position tools). She declares simple intent (token + size + optional
+  // stop/target); the deterministic engine fills routing/slippage/gas/approve/wrap + arms SL/TP. These
+  // bound her per-position size and how many positions can be open at once — safety without over-caution.
+  ,POSITION_MIN_USD: z.coerce.number().positive().default(1)
+  ,POSITION_MAX_USD: z.coerce.number().positive().default(25)
+  ,POSITION_MAX_OPEN: z.coerce.number().int().min(1).max(50).default(6)
+  ,POSITION_SLIPPAGE_PCT: z.coerce.number().min(0.1).max(50).default(8)
   // Capital bands drive which profit engines Scarlet may consider at the current
   // NAV. Micro-cent Berachain gas keeps micro strategies economic; larger bands
   // unlock liquidations and bigger allocations. Thresholds are inclusive upper

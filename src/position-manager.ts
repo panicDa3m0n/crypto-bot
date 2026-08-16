@@ -91,9 +91,14 @@ export class PositionManager {
   private async manageOpen(p: PositionPlan): Promise<void> {
     if (!p.filledAmountToken || !p.filledPrice) return;
     const token = p.token as Address; const base = p.baseToken as Address;
+    const tokenDec = await this.decimals(token);
+    // Manual/tool-requested exit (close_position) — sell now via the SAME deterministic path, then clear.
+    if (p.exitNowPct != null && p.exitNowPct > 0) {
+      await this.db.updatePositionPlan(p.id, { exitNowPct: null }).catch(() => undefined);
+      return this.sell(p, Math.min(100, p.exitNowPct), `CLOSE (manuale) ${Math.min(100, p.exitNowPct)}%`, tokenDec);
+    }
     const baseUsd = await this.chain.tokenPrice(base).catch(() => 0);
     if (!(baseUsd > 0)) return;
-    const tokenDec = await this.decimals(token);
     const heldTokens = p.filledAmountToken * (p.remainingPct / 100);
     if (heldTokens <= 0) { await this.db.updatePositionPlan(p.id, { status: "closed" }); return; }
     const heldWei = BigInt(Math.floor(heldTokens * 10 ** tokenDec));

@@ -72,7 +72,7 @@ const executor = new GuardedExecutor(chain, risk, db, positions, logger, BigInt(
 const reconciler = new ReceiptReconciler(chain, db, positions, logger);
 const wberaAdapter = new WberaAdapter(config, chain);
 const allowanceAdapter = new ExactAllowanceAdapter(chain);
-const health = config.SERVICE_ROLE === "brain" ? new DatabaseNetworkHealth(db) : collector;
+const health = config.SERVICE_ROLE === "brain" ? new DatabaseNetworkHealth(db, config.CHAIN_ID) : collector;
 
 // The sensorium + real-time sensors are the world-model; Scarlet the agentic core reasons on it.
 const venues = new VenueRegistry(db, config);

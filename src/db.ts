@@ -14,7 +14,7 @@ export type PositionPlan = {
   filledAmountToken: number | null; filledPrice: number | null; filledAt: string | null;
   stopLossPct: number | null; takeProfitPct: number | null;
   partials: Array<{ atPct: number; sellPct: number; done?: boolean }>;
-  remainingPct: number; note: string | null; lastResult: string | null;
+  remainingPct: number; note: string | null; lastResult: string | null; exitNowPct: number | null;
 };
 function rowToPlan(r: Record<string, unknown>): PositionPlan {
   const num = (v: unknown): number | null => v === null || v === undefined ? null : Number(v);
@@ -23,7 +23,7 @@ function rowToPlan(r: Record<string, unknown>): PositionPlan {
     status: String(r.status), entryKind: String(r.entry_kind), entryPrice: num(r.entry_price), entryAmountUsd: Number(r.entry_amount_usd),
     filledAmountToken: num(r.filled_amount_token), filledPrice: num(r.filled_price), filledAt: r.filled_at ? new Date(r.filled_at as string).toISOString() : null,
     stopLossPct: num(r.stop_loss_pct), takeProfitPct: num(r.take_profit_pct), partials: (r.partials as PositionPlan["partials"]) ?? [],
-    remainingPct: Number(r.remaining_pct), note: (r.note as string) ?? null, lastResult: (r.last_result as string) ?? null
+    remainingPct: Number(r.remaining_pct), note: (r.note as string) ?? null, lastResult: (r.last_result as string) ?? null, exitNowPct: num(r.exit_now_pct)
   };
 }
 
@@ -532,6 +532,9 @@ export class Database {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS position_plans_active_idx ON position_plans(chain_id, status);
+      -- Manual/tool-requested immediate exit: the engine sells this % of the original fill on its next
+      -- tick, then clears it (so close_position routes through the SAME deterministic execution path).
+      ALTER TABLE position_plans ADD COLUMN IF NOT EXISTS exit_now_pct NUMERIC;
       CREATE TABLE IF NOT EXISTS lending_positions (
         chain_id INTEGER NOT NULL,
         protocol TEXT NOT NULL,          -- family: morpho | aave-v3 | compound | ...
@@ -673,6 +676,10 @@ export class Database {
     const r = await this.pool.query(`SELECT * FROM position_plans WHERE chain_id=$1 AND status IN ('pending-entry','entering','open','exiting') ORDER BY created_at`, [chainId]);
     return r.rows.map(rowToPlan);
   }
+  async countOpenPositionPlans(chainId: number): Promise<number> {
+    const r = await this.pool.query<{ n: string }>(`SELECT count(*)::text n FROM position_plans WHERE chain_id=$1 AND status IN ('pending-entry','entering','open','exiting')`, [chainId]);
+    return Number(r.rows[0].n);
+  }
   async getPositionPlan(id: number): Promise<PositionPlan | undefined> {
     const r = await this.pool.query(`SELECT * FROM position_plans WHERE id=$1`, [id]);
     return r.rows[0] ? rowToPlan(r.rows[0]) : undefined;
@@ -681,9 +688,9 @@ export class Database {
     const r = await this.pool.query(`SELECT * FROM position_plans WHERE chain_id=$1 ORDER BY created_at DESC LIMIT $2`, [chainId, limit]);
     return r.rows.map(rowToPlan);
   }
-  async updatePositionPlan(id: number, fields: Partial<{ status: string; filledAmountToken: number; filledPrice: number; filledAt: string; remainingPct: number; lastResult: string; partials: unknown }>): Promise<void> {
+  async updatePositionPlan(id: number, fields: Partial<{ status: string; filledAmountToken: number; filledPrice: number; filledAt: string; remainingPct: number; lastResult: string; stopLossPct: number | null; takeProfitPct: number | null; exitNowPct: number | null; partials: unknown }>): Promise<void> {
     const sets: string[] = []; const vals: unknown[] = [id]; let i = 2;
-    const map: Record<string, string> = { status: "status", filledAmountToken: "filled_amount_token", filledPrice: "filled_price", filledAt: "filled_at", remainingPct: "remaining_pct", lastResult: "last_result" };
+    const map: Record<string, string> = { status: "status", filledAmountToken: "filled_amount_token", filledPrice: "filled_price", filledAt: "filled_at", remainingPct: "remaining_pct", lastResult: "last_result", stopLossPct: "stop_loss_pct", takeProfitPct: "take_profit_pct", exitNowPct: "exit_now_pct" };
     for (const [k, col] of Object.entries(map)) { const v = (fields as Record<string, unknown>)[k]; if (v !== undefined) { sets.push(`${col}=$${i++}`); vals.push(v); } }
     if (fields.partials !== undefined) { sets.push(`partials=$${i++}`); vals.push(jsonParam(fields.partials)); }
     if (!sets.length) return;
@@ -1147,6 +1154,12 @@ export class Database {
   }
   async setIndexerCursor(chainId: number, block: number): Promise<void> {
     await this.pool.query(`INSERT INTO indexer_state(chain_id, last_block) VALUES($1,$2) ON CONFLICT (chain_id) DO UPDATE SET last_block=$2, updated_at=NOW()`, [chainId, block]);
+  }
+  /** Age (ms) of the indexer cursor's last advance — the true "is our data source live" signal (the
+   * indexer, on base.org, is the single source of truth; the legacy dual-RPC ping is not). null if unseeded. */
+  async indexerCursorAgeMs(chainId: number): Promise<number | null> {
+    const r = await this.pool.query<{ age: string }>(`SELECT (EXTRACT(EPOCH FROM (NOW()-updated_at))*1000)::bigint::text AS age FROM indexer_state WHERE chain_id=$1`, [chainId]);
+    return r.rows[0] ? Number(r.rows[0].age) : null;
   }
   async saveRawBlock(chainId: number, block: number, logs: unknown): Promise<void> {
     await this.pool.query(`INSERT INTO raw_blocks(chain_id, block_number, logs) VALUES($1,$2,$3) ON CONFLICT (chain_id, block_number) DO UPDATE SET logs=$3, at=NOW()`, [chainId, block, jsonParam(logs)]);
