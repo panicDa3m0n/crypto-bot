@@ -191,8 +191,18 @@ export class BlockIndexer {
     // 2a) Pool state — from the SAME logs, independent of token metadata. V2 Sync = (r0,r1);
     // V3 Swap = (sqrtPriceX96, liquidity). Last log in the block wins (= latest state). This is the
     // DB source that makes PriceOracle's reserves/amountOut DB-read instead of RPC.
+    // Multi-hop anchor: USD prices for the pool tokens, so a token/token swap (neither side WETH/USDC)
+    // can still be priced via whichever side already has a USD price.
+    const px = await this.db.getTokenPrices(this.config.CHAIN_ID, [...tokenSet]).catch(() => new Map()) as Map<string, { priceUsd: number | null; source: string }>;
     const state = new Map<string, { pool: string; archetype: string; r0?: bigint; r1?: bigint; sqrtPrice?: bigint; liquidity?: bigint; block: number }>();
-    const rows = new Map<string, number>(); // token → latest USD price this block (last swap wins)
+    const rows = new Map<string, { price: number; conf: number }>(); // token → USD price this block (last swap wins)
+    // A token's current USD: a QUOTE (WETH/USDC), a DIRECT price computed this block (conf≥0.95), or the
+    // stored DB price. Only direct/quote anchors are used for multi-hop, so hop prices never chain.
+    const usdOf = (t: string): number | null => {
+      const q = this.quoteUsd(t); if (q != null) return q;
+      const fresh = rows.get(t); if (fresh && fresh.conf >= 0.95 && fresh.price > 0) return fresh.price;
+      const dbp = px.get(t); return dbp?.priceUsd && dbp.priceUsd > 0 ? dbp.priceUsd : null;
+    };
     let swaps = 0;
     for (const l of priced) {
       const pool = l.address.toLowerCase();
@@ -208,17 +218,20 @@ export class BlockIndexer {
       const p0in1 = isSwap ? priceV3(l.data, d0, d1) : priceV2(l.data, d0, d1); // token0 price in token1 (human)
       if (p0in1 == null || !(p0in1 > 0) || !Number.isFinite(p0in1)) continue;
       swaps += 1;
-      // Anchor to USD: one side must be WETH or USDC (the quote). Price only the NON-quote token.
+      // Price the NON-quote token. Direct if one side is WETH/USDC (conf 0.95); else multi-hop via a
+      // side that already has a USD price (conf 0.8 — one hop, marked lower so it never anchors another).
       const q1 = this.quoteUsd(t1), q0 = this.quoteUsd(t0);
-      if (q1 != null) rows.set(t0, p0in1 * q1);
-      else if (q0 != null) rows.set(t1, (1 / p0in1) * q0);
-      // else: token/token pool with no direct anchor — skip (v1).
+      if (q1 != null) rows.set(t0, { price: p0in1 * q1, conf: 0.95 });
+      else if (q0 != null) rows.set(t1, { price: (1 / p0in1) * q0, conf: 0.95 });
+      else { const u1 = usdOf(t1), u0 = usdOf(t0);
+        if (u1 != null) rows.set(t0, { price: p0in1 * u1, conf: 0.8 });
+        else if (u0 != null) rows.set(t1, { price: (1 / p0in1) * u0, conf: 0.8 }); }
     }
 
     if (this.config.DEBUG_KEEP_RAW_BLOCKS && logs.length) await this.db.saveRawBlock(this.config.CHAIN_ID, block, logs).catch(() => undefined);
     if (state.size) await this.db.upsertPoolState(this.config.CHAIN_ID, [...state.values()]).catch((e) => this.logger.debug({ err: e }, "indexer pool_state upsert failed"));
     if (rows.size) {
-      await this.db.upsertTokenPrices(this.config.CHAIN_ID, [...rows.entries()].map(([token, priceUsd]) => ({ token, priceUsd, confidence: 0.95, source: "indexer" })), { tauFastSec: this.config.VOL_TAU_FAST_SEC, tauSlowSec: this.config.VOL_TAU_SLOW_SEC }).catch((e) => this.logger.debug({ err: e }, "indexer price upsert failed"));
+      await this.db.upsertTokenPrices(this.config.CHAIN_ID, [...rows.entries()].map(([token, v]) => ({ token, priceUsd: v.price, confidence: v.conf, source: "indexer" })), { tauFastSec: this.config.VOL_TAU_FAST_SEC, tauSlowSec: this.config.VOL_TAU_SLOW_SEC }).catch((e) => this.logger.debug({ err: e }, "indexer price upsert failed"));
     }
     return { swaps, discovered, lending };
   }
