@@ -564,6 +564,21 @@ export class Database {
       -- hf_at = when the HF VALUE was actually refreshed (enumerate only) — NOT updated_at (which the
       -- 20s tick touches while reusing the stale HF). This is the TRUE HF-staleness clock for observability.
       ALTER TABLE lending_positions ADD COLUMN IF NOT EXISTS hf_at TIMESTAMPTZ;
+      -- Morpho market params (loan/collateral/oracle/irm/lltv), learned by the block-indexer from
+      -- CreateMarket events (or a one-shot idToMarketParams bootstrap). Chain-sourced: lets the indexer
+      -- attach the right market context when it discovers a borrower live from a Borrow/Supply log.
+      CREATE TABLE IF NOT EXISTS lending_markets (
+        chain_id INTEGER NOT NULL,
+        protocol TEXT NOT NULL,
+        market_id TEXT NOT NULL,
+        loan_token TEXT,
+        collateral_token TEXT,
+        oracle TEXT,
+        irm TEXT,
+        lltv NUMERIC,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (chain_id, protocol, market_id)
+      );
       -- OBSERVABILITY: every liquidation-relevant event — positions found, prey LOST to other
       -- liquidators (missed), our armed watchers that FAILED to fire, and our HITS. Historized for
       -- analysis + dashboard, so we can see what we missed and why.
@@ -924,6 +939,25 @@ export class Database {
          meta=lending_positions.meta || EXCLUDED.meta, updated_at=NOW(), enumerated_at=NOW()`,
       [p.chainId, p.protocol, p.marketId, p.borrower.toLowerCase(), p.collateralToken?.toLowerCase() ?? null, p.collateralSymbol ?? null, p.loanToken?.toLowerCase() ?? null, p.loanSymbol ?? null, p.lltv ?? null, jsonParam(p.meta ?? {})]
     );
+  }
+
+  /** Morpho market params, learned by the indexer (CreateMarket / idToMarketParams bootstrap). */
+  async upsertLendingMarket(m: { chainId: number; protocol: string; marketId: string; loanToken: string; collateralToken: string; oracle: string; irm: string; lltv: bigint }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO lending_markets(chain_id, protocol, market_id, loan_token, collateral_token, oracle, irm, lltv)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (chain_id, protocol, market_id) DO UPDATE SET
+         loan_token=EXCLUDED.loan_token, collateral_token=EXCLUDED.collateral_token,
+         oracle=EXCLUDED.oracle, irm=EXCLUDED.irm, lltv=EXCLUDED.lltv`,
+      [m.chainId, m.protocol, m.marketId, m.loanToken.toLowerCase(), m.collateralToken.toLowerCase(), m.oracle.toLowerCase(), m.irm.toLowerCase(), m.lltv.toString()]
+    );
+  }
+  async getLendingMarket(chainId: number, protocol: string, marketId: string): Promise<{ loanToken: string; collateralToken: string; oracle: string; irm: string; lltv: bigint } | null> {
+    const r = await this.pool.query<{ loan_token: string; collateral_token: string; oracle: string; irm: string; lltv: string }>(
+      `SELECT loan_token, collateral_token, oracle, irm, lltv::text FROM lending_markets WHERE chain_id=$1 AND protocol=$2 AND market_id=$3`, [chainId, protocol, marketId]
+    );
+    const m = r.rows[0];
+    return m ? { loanToken: m.loan_token, collateralToken: m.collateral_token, oracle: m.oracle, irm: m.irm, lltv: BigInt(m.lltv.split(".")[0]) } : null;
   }
 
   /** Positions due for a re-check (next_check_at reached), soonest first. */

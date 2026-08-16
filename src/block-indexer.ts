@@ -1,4 +1,5 @@
 import type { Logger } from "pino";
+import { parseAbi, type Address } from "viem";
 import type { Config } from "./config.js";
 import type { BerachainClients } from "./chain.js";
 import type { Database } from "./db.js";
@@ -23,7 +24,18 @@ const V3_SWAP = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcc
 const V2_SYNC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
 const PAIR_CREATED = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"; // V2 factory
 const POOL_CREATED = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"; // V3 factory
-const TOPIC0S = [V3_SWAP, V2_SYNC, PAIR_CREATED, POOL_CREATED];
+// Morpho Blue — position lifecycle. The indexer discovers/closes borrowers LIVE from these logs (the
+// Morpho API stays as periodic seed + cross-check). Topics verified via toEventSelector; Borrow &
+// Liquidate match the constants already in position-registry.
+// Discovery on Borrow (debt appears → liquidation-relevant), close on Liquidate, params from
+// CreateMarket. SupplyCollateral is intentionally NOT tracked: collateral without debt isn't
+// liquidatable, and exact amounts come from the per-block RPC confirm anyway.
+const MORPHO_CREATE_MARKET = "0xac4b2400f169220b0c0afdde7a0b32e775ba727ea1cb30b35f935cdaab8683ac";
+const MORPHO_BORROW = "0x570954540bed6b1304a87dfe815a5eda4a648f7097a16240dcd85c9b5fd42a43";
+const MORPHO_LIQUIDATE = "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41";
+const MORPHO_TOPICS = new Set([MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE]);
+const MORPHO_MARKET_ABI = parseAbi(["function idToMarketParams(bytes32 id) view returns (address loanToken, address collateralToken, address oracle, address irm, uint256 lltv)"]);
+const TOPIC0S = [V3_SWAP, V2_SYNC, PAIR_CREATED, POOL_CREATED, MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE];
 const CHUNK = 10;            // public getLogs range cap
 const ANCHOR_TTL_MS = 30_000; // refresh ETH/USD at most this often
 
@@ -40,6 +52,8 @@ export class BlockIndexer {
   private unwatch?: () => void;
   private readonly weth: string;
   private readonly usdc: string;
+  private readonly morpho: string | null;
+  private readonly marketCache = new Map<string, { loanToken: string; collateralToken: string; oracle: string; irm: string; lltv: bigint }>();
 
   constructor(
     private readonly config: Config,
@@ -49,6 +63,7 @@ export class BlockIndexer {
   ) {
     this.weth = config.WBERA_ADDRESS.toLowerCase();
     this.usdc = config.USDC_E_ADDRESS.toLowerCase();
+    this.morpho = config.MORPHO_CORE ? config.MORPHO_CORE.toLowerCase() : null;
   }
 
   async start(): Promise<void> {
@@ -74,37 +89,37 @@ export class BlockIndexer {
       if (head <= this.cursor) return;
       const target = Math.min(head, this.cursor + this.config.INDEXER_MAX_CATCHUP); // cap catch-up per tick
       const t0 = Date.now();
-      let processed = 0, swaps = 0, discovered = 0;
+      let processed = 0, swaps = 0, discovered = 0, lending = 0;
       let from = this.cursor + 1;
       while (from <= target) {
         const to = Math.min(from + CHUNK - 1, target);
         const r = await this.processRange(from, to);
-        processed += to - from + 1; swaps += r.swaps; discovered += r.discovered;
+        processed += to - from + 1; swaps += r.swaps; discovered += r.discovered; lending += r.lending;
         from = to + 1;
       }
       if (this.config.DEBUG_KEEP_RAW_BLOCKS && ++this.ticks % 200 === 0) await this.db.pruneRawBlocks(this.config.CHAIN_ID, this.config.INDEXER_RAW_RETENTION_HOURS).catch(() => undefined);
-      if (processed > 0) this.logger.info({ upTo: this.cursor, blocks: processed, swaps, discovered, ethUsd: this.ethUsd, ms: Date.now() - t0, lag: head - this.cursor }, "indexed blocks");
+      if (processed > 0) this.logger.info({ upTo: this.cursor, blocks: processed, swaps, discovered, lending, ethUsd: this.ethUsd, ms: Date.now() - t0, lag: head - this.cursor }, "indexed blocks");
     } finally {
       this.running = false;
     }
   }
 
-  private async processRange(from: number, to: number): Promise<{ swaps: number; discovered: number }> {
+  private async processRange(from: number, to: number): Promise<{ swaps: number; discovered: number; lending: number }> {
     const logs = await this.getLogs(from, to);
     const byBlock = new Map<number, RawLog[]>();
     for (const l of logs) { const b = Number(BigInt(l.blockNumber)); const arr = byBlock.get(b) ?? []; arr.push(l); byBlock.set(b, arr); }
-    let swaps = 0, discovered = 0;
+    let swaps = 0, discovered = 0, lending = 0;
     for (let b = from; b <= to; b++) {
       const bl = byBlock.get(b) ?? [];
       const r = await this.processBlock(b, bl);
-      swaps += r.swaps; discovered += r.discovered;
+      swaps += r.swaps; discovered += r.discovered; lending += r.lending;
       this.cursor = b;
     }
     await this.db.setIndexerCursor(this.config.CHAIN_ID, this.cursor).catch(() => undefined);
-    return { swaps, discovered };
+    return { swaps, discovered, lending };
   }
 
-  private async processBlock(block: number, logs: RawLog[]): Promise<{ swaps: number; discovered: number }> {
+  private async processBlock(block: number, logs: RawLog[]): Promise<{ swaps: number; discovered: number; lending: number }> {
     // 1) Discovery: new pools/tokens from factory events.
     let discovered = 0;
     for (const l of logs) {
@@ -121,9 +136,21 @@ export class BlockIndexer {
       }
     }
 
+    // 1b) Lending (Morpho): discover borrowers on Borrow, close on Liquidate, learn params on
+    // CreateMarket — the inventory becomes chain-sourced (API drops to seed + cross-check). Same
+    // getLogs call: Morpho topics ride the global topic0 filter; we keep only logs from the Morpho core.
+    let lending = 0;
+    if (this.morpho) {
+      for (const l of logs) {
+        if (l.address.toLowerCase() !== this.morpho) continue;
+        const t0 = (l.topics[0] ?? "").toLowerCase();
+        if (MORPHO_TOPICS.has(t0) && await this.handleMorpho(t0, l)) lending += 1;
+      }
+    }
+
     // 2) Prices: swaps (V3) + syncs (V2) → the pool's price → USD via anchor.
     const priced = logs.filter((l) => { const t = (l.topics[0] ?? "").toLowerCase(); return t === V3_SWAP || t === V2_SYNC; });
-    if (!priced.length) return { swaps: 0, discovered };
+    if (!priced.length) return { swaps: 0, discovered, lending };
     const poolAddrs = [...new Set(priced.map((l) => l.address.toLowerCase()))];
     const pools = await this.db.poolInfoBatch(this.config.CHAIN_ID, poolAddrs);
     const tokenSet = new Set<string>();
@@ -163,7 +190,53 @@ export class BlockIndexer {
     if (rows.size) {
       await this.db.upsertTokenPrices(this.config.CHAIN_ID, [...rows.entries()].map(([token, priceUsd]) => ({ token, priceUsd, confidence: 0.95, source: "indexer" })), { tauFastSec: this.config.VOL_TAU_FAST_SEC, tauSlowSec: this.config.VOL_TAU_SLOW_SEC }).catch((e) => this.logger.debug({ err: e }, "indexer price upsert failed"));
     }
-    return { swaps, discovered };
+    return { swaps, discovered, lending };
+  }
+
+  /** Morpho position lifecycle → chain-sourced inventory. Returns true if the log was actioned. */
+  private async handleMorpho(t0: string, l: RawLog): Promise<boolean> {
+    const id = l.topics[1]?.toLowerCase(); if (!id) return false;
+    if (t0 === MORPHO_CREATE_MARKET) {
+      const loanToken = wordAddr(l.data, 0), collateralToken = wordAddr(l.data, 1), oracle = wordAddr(l.data, 2), irm = wordAddr(l.data, 3), lltv = word(l.data, 4);
+      if (loanToken && collateralToken && oracle && irm && lltv != null) {
+        const m = { loanToken, collateralToken, oracle, irm, lltv };
+        this.marketCache.set(id, m);
+        await this.db.upsertLendingMarket({ chainId: this.config.CHAIN_ID, protocol: "morpho", marketId: id, ...m }).catch(() => undefined);
+      }
+      return true;
+    }
+    if (t0 === MORPHO_LIQUIDATE) {
+      const borrower = addrFromTopic(l.topics[3]); if (!borrower) return false;
+      await this.db.closeLendingPosition(this.config.CHAIN_ID, "morpho", id, borrower, "Liquidate event (indexer)").catch(() => undefined);
+      return true;
+    }
+    // Borrow: onBehalf = topics[2] is the borrower. Debt just appeared → track it (tier 'pending';
+    // the registry classifies + the per-block monitor confirms exact HF on the near band).
+    const borrower = addrFromTopic(l.topics[2]); if (!borrower) return false;
+    const m = await this.marketParams(id); if (!m) return false;
+    await this.db.upsertLendingPosition({
+      chainId: this.config.CHAIN_ID, protocol: "morpho", marketId: id, borrower,
+      collateralToken: m.collateralToken, loanToken: m.loanToken, lltv: Number(m.lltv) / 1e18,
+      meta: { oracle: m.oracle, irm: m.irm, lltv: m.lltv.toString(), discoveredBy: "indexer" }
+    }).catch(() => undefined);
+    return true;
+  }
+
+  /** Morpho market params: memory cache → DB → one-shot idToMarketParams bootstrap (market created
+   * before the indexer started), then persist + cache. Few markets, so bootstrap is not a storm. */
+  private async marketParams(id: string): Promise<{ loanToken: string; collateralToken: string; oracle: string; irm: string; lltv: bigint } | null> {
+    const c = this.marketCache.get(id); if (c) return c;
+    const db = await this.db.getLendingMarket(this.config.CHAIN_ID, "morpho", id).catch(() => null);
+    if (db) { this.marketCache.set(id, db); return db; }
+    if (!this.morpho) return null;
+    try {
+      const r = await this.chain.fallback.readContract({ address: this.morpho as Address, abi: MORPHO_MARKET_ABI, functionName: "idToMarketParams", args: [id as `0x${string}`] }) as readonly [string, string, string, string, bigint];
+      const m = { loanToken: r[0].toLowerCase(), collateralToken: r[1].toLowerCase(), oracle: r[2].toLowerCase(), irm: r[3].toLowerCase(), lltv: r[4] };
+      if (m.collateralToken === "0x0000000000000000000000000000000000000000") return null;
+      this.marketCache.set(id, m);
+      await this.db.upsertLendingMarket({ chainId: this.config.CHAIN_ID, protocol: "morpho", marketId: id, ...m }).catch(() => undefined);
+      return m;
+    } catch (e) { this.logger.debug({ err: e, id }, "idToMarketParams bootstrap failed"); return null; }
   }
 
   /** USD value of one unit of a QUOTE token (WETH via Chainlink, USDC = $1). null if not a quote. */
