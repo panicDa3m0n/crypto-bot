@@ -1,5 +1,6 @@
 import { encodeFunctionData, parseAbi, type Address, type Hex } from "viem";
 import { erc20Abi, type BerachainClients } from "./chain.js";
+import type { Config } from "./config.js";
 
 const wberaAbi = parseAbi([
   "function deposit() payable",
@@ -52,8 +53,9 @@ export class ExactAllowanceAdapter {
 }
 
 export class WberaAdapter {
-  readonly address = "0x6969696969696969696969696969696969696969" as Address;
-  constructor(private readonly chain: BerachainClients) {}
+  /** The wrapped-native token (WMON on Monad); WETH9-compatible deposit/withdraw. */
+  readonly address: Address;
+  constructor(config: Config, private readonly chain: BerachainClients) { this.address = config.WBERA_ADDRESS as Address; }
 
   async prepareWrap(amountWei: bigint, maxSlippageBps = 1): Promise<ProposedCall> {
     if (amountWei <= 0n) throw new Error("wrap amount must be positive");

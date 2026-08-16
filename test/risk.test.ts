@@ -119,4 +119,26 @@ describe("risk engine", () => {
     const result = risk.validateExecution({ decisionId: "d", kind: "micro_test", protocolId: "approval", to: token, data, value: 0n, gas: 100_000n, gasPriceWei: 1_000_000_000n, quoteObservedAt: new Date(), maxSlippageBps: 1, expectedNetProfitUsd: 0, maxEconomicLossUsd: 0, preflightBlock: 10n, deadline: new Date(Date.now() + 60_000), approval: { token, spender, amount: 123n } }, 10n, snapshot);
     expect(result).toEqual({ allowed: false, reason: "ERC-20 approval calldata is not the exact finite approved amount" });
   });
+
+  const batchSwapSelectors = new Map([[target, new Set(["0x52bbbe29"])]]);
+
+  it("permits an arbitrage cycle on positive net without the gas x3 profit floor", () => {
+    const risk = new RiskEngine(loadConfig({ ...env, EXECUTION_ENABLED: "true" }), batchSwapSelectors);
+    // Net well below gas x3 and below $0.03: rejected for a generic profit call,
+    // allowed for arbitrage because principal is protected by minAmountOut.
+    const result = risk.validateExecution({ decisionId: "d", kind: "arbitrage", protocolId: "bex-arb", to: target, data: "0x52bbbe29", value: 0n, gas: 100_000n, gasPriceWei: 1_000_000_000n, quoteObservedAt: new Date(), maxSlippageBps: 1, expectedNetProfitUsd: 0.001, maxEconomicLossUsd: 0, preflightBlock: 10n, deadline: new Date(Date.now() + 60_000) }, 10n, snapshot);
+    expect(result).toEqual({ allowed: true });
+  });
+
+  it("rejects an arbitrage cycle whose net profit is not strictly positive", () => {
+    const risk = new RiskEngine(loadConfig({ ...env, EXECUTION_ENABLED: "true" }), batchSwapSelectors);
+    const result = risk.validateExecution({ decisionId: "d", kind: "arbitrage", protocolId: "bex-arb", to: target, data: "0x52bbbe29", value: 0n, gas: 100_000n, gasPriceWei: 1_000_000_000n, quoteObservedAt: new Date(), maxSlippageBps: 1, expectedNetProfitUsd: 0, maxEconomicLossUsd: 0, preflightBlock: 10n, deadline: new Date(Date.now() + 60_000) }, 10n, snapshot);
+    expect(result).toEqual({ allowed: false, reason: "arbitrage expected net profit is not strictly positive" });
+  });
+
+  it("rejects an arbitrage cycle that exposes principal beyond gas", () => {
+    const risk = new RiskEngine(loadConfig({ ...env, EXECUTION_ENABLED: "true" }), batchSwapSelectors);
+    const result = risk.validateExecution({ decisionId: "d", kind: "arbitrage", protocolId: "bex-arb", to: target, data: "0x52bbbe29", value: 0n, gas: 100_000n, gasPriceWei: 1_000_000_000n, quoteObservedAt: new Date(), maxSlippageBps: 1, expectedNetProfitUsd: 0.10, maxEconomicLossUsd: 5, preflightBlock: 10n, deadline: new Date(Date.now() + 60_000) }, 10n, snapshot);
+    expect(result).toEqual({ allowed: false, reason: "arbitrage principal is not protected: worst-case loss exceeds gas" });
+  });
 });

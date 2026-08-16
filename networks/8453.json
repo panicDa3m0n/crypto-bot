@@ -1,0 +1,151 @@
+{
+  "chainId": 8453,
+  "name": "Base",
+  "nativeSymbol": "ETH",
+  "wrapped": {
+    "address": "0x4200000000000000000000000000000000000006",
+    "symbol": "WETH",
+    "decimals": 18
+  },
+  "explorer": {
+    "name": "Basescan",
+    "url": "https://basescan.org",
+    "blockscout": "https://base.blockscout.com/api"
+  },
+  "rpc": {
+    "primary": "https://base-mainnet.public.blastapi.io",
+    "secondary": "https://1rpc.io/base",
+    "ws": "wss://base-rpc.publicnode.com",
+    "precision": "https://base-rpc.publicnode.com",
+    "fallback": "https://mainnet.base.org"
+  },
+  "data": {
+    "gtNetwork": "base",
+    "llamaChain": "base",
+    "etherscanChainId": 8453
+  },
+  "infra": {
+    "aggregator1inch": "0x111111125421cA6dc452d289314280a0f8842A65",
+    "balancerVault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
+    "morpho": "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb",
+    "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+  },
+  "dexes": [
+    {
+      "id": "uniswap-v3",
+      "name": "Uniswap V3",
+      "type": "uni-v3",
+      "factory": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
+      "router": "0x2626664c2603336E57B271c5C0b26F421741e481",
+      "quoter": "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
+      "note": "primary readable V3 AMM; deepest liquidity + where clanker launches graduate"
+    },
+    {
+      "id": "pancakeswap-v3",
+      "name": "PancakeSwap V3",
+      "type": "uni-v3",
+      "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+      "router": "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
+      "quoter": "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
+      "note": "second readable V3 DEX \u2192 enables cross-venue arbHints vs Uniswap V3"
+    }
+  ],
+  "tokens": [
+    {
+      "address": "0x4200000000000000000000000000000000000006",
+      "symbol": "WETH",
+      "decimals": 18,
+      "kind": "wrapped-native",
+      "note": "wrapped ETH \u2014 the DEX trading unit; wrap ETH first"
+    },
+    {
+      "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "symbol": "USDC",
+      "decimals": 6,
+      "kind": "stable",
+      "note": "primary stable + unit of account"
+    },
+    {
+      "address": "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",
+      "symbol": "USDT",
+      "decimals": 6,
+      "kind": "stable",
+      "note": "secondary stable"
+    },
+    {
+      "address": "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA",
+      "symbol": "USDbC",
+      "decimals": 6,
+      "kind": "stable",
+      "note": "bridged USD Coin (legacy)"
+    },
+    {
+      "address": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+      "symbol": "cbBTC",
+      "decimals": 8,
+      "kind": "major",
+      "note": "Coinbase wrapped BTC"
+    }
+  ],
+  "protocols": [
+    {
+      "id": "morpho-blue",
+      "name": "Morpho Blue",
+      "category": "lending",
+      "family": "morpho",
+      "address": "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb",
+      "role": "core",
+      "tvlUsd": 3255000000,
+      "note": "86% del lending Base; mercati isolati, position(id,user)"
+    },
+    {
+      "id": "aave-v3-pool",
+      "name": "Aave V3 Pool",
+      "category": "lending",
+      "family": "aave-v3",
+      "address": "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+      "role": "pool",
+      "tvlUsd": 408000000,
+      "note": "pooled; getUserAccountData espone l'HF"
+    },
+    {
+      "id": "aave-v3-provider",
+      "name": "Aave V3 PoolAddressesProvider",
+      "category": "lending",
+      "family": "aave-v3",
+      "address": "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D",
+      "role": "provider",
+      "note": "provider Aave (oracle/dataProvider)"
+    },
+    {
+      "id": "moonwell",
+      "name": "Moonwell Comptroller",
+      "category": "lending",
+      "family": "compound",
+      "address": "0xfBb21d0380beE3312B33c4353c8936a0F13EF26C",
+      "role": "comptroller",
+      "tvlUsd": 38500000,
+      "note": "fork Compound; Unitroller + getAccountLiquidity"
+    },
+    {
+      "id": "compound-v3-usdc",
+      "name": "Compound V3 Comet USDC",
+      "category": "lending",
+      "family": "compound-v3",
+      "address": "0xb125E6687d4313864e53df431d5425969c15Eb2F",
+      "role": "comet",
+      "tvlUsd": 20000000,
+      "note": "Comet USDC base"
+    },
+    {
+      "id": "avantis",
+      "name": "Avantis Trading",
+      "category": "perp",
+      "family": "avantis",
+      "address": "0x5FF292d70bA9cD9e7CCb313782811b3D7120535f",
+      "role": "trading",
+      "tvlUsd": 20000000,
+      "note": "principale perp Base"
+    }
+  ]
+}

@@ -7,7 +7,7 @@ import type { RiskEngine } from "./risk.js";
 import type { PositionService } from "./positions.js";
 
 export class GuardedExecutor {
-  constructor(private readonly chain: BerachainClients, private readonly risk: RiskEngine, private readonly db: Database, private readonly positions: PositionService, private readonly logger: Logger) {}
+  constructor(private readonly chain: BerachainClients, private readonly risk: RiskEngine, private readonly db: Database, private readonly positions: PositionService, private readonly logger: Logger, private readonly maxBlockLag: bigint = 8n) {}
 
   async execute(request: ExecutionRequest, snapshot: PortfolioSnapshot, currentBlock: bigint): Promise<Hex> {
     const verdict = this.risk.validateExecution(request, currentBlock, snapshot);
@@ -25,11 +25,11 @@ export class GuardedExecutor {
       this.chain.preflight({ to: request.to as Address, data: request.data, value: request.value, account }),
       this.chain.preflightSecondary({ to: request.to as Address, data: request.data, value: request.value, account })
     ]);
-    if (preflight.blockNumber >= independentPreflight.blockNumber ? preflight.blockNumber - independentPreflight.blockNumber > 1n : independentPreflight.blockNumber - preflight.blockNumber > 1n) {
+    if (preflight.blockNumber >= independentPreflight.blockNumber ? preflight.blockNumber - independentPreflight.blockNumber > this.maxBlockLag : independentPreflight.blockNumber - preflight.blockNumber > this.maxBlockLag) {
       await this.db.updateDecision(request.decisionId, "blocked", { reason: "independent preflight block divergence", primaryBlock: preflight.blockNumber.toString(), secondaryBlock: independentPreflight.blockNumber.toString() });
       throw new Error("Execution blocked: independent preflight block divergence");
     }
-    if (preflight.blockNumber < currentBlock - 1n || preflight.blockNumber > currentBlock + 1n) {
+    if (preflight.blockNumber < currentBlock - this.maxBlockLag || preflight.blockNumber > currentBlock + this.maxBlockLag) {
       await this.db.updateDecision(request.decisionId, "blocked", { reason: "preflight block drifted", preflightBlock: preflight.blockNumber.toString(), currentBlock: currentBlock.toString() });
       throw new Error("Execution blocked: preflight block drifted");
     }

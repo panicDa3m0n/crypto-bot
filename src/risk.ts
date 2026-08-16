@@ -90,6 +90,30 @@ export class RiskEngine {
       return { allowed: true };
     }
     if (request.kind === "exit") return { allowed: true };
+    if (request.kind === "agent_action") {
+      // Scarlet composes plans freely; the body does not demand that each single
+      // action be profitable (the profit lives in the whole sequence, which she
+      // judges and simulation confirms). The reflex here bounds only the DOWNSIDE
+      // of this one action, so a mistaken leg can never drain more than the cap.
+      // Everything else — allowlist, exact approval, dual-RPC preflight, code-hash
+      // binding, deadline, freshness, slippage, the daily loss budget, and the
+      // native-BERA energy floor — has already been enforced above.
+      if (!Number.isFinite(request.maxEconomicLossUsd) || request.maxEconomicLossUsd < 0) return { allowed: false, reason: "agent action downside bound is invalid" };
+      if (gasUsd + request.maxEconomicLossUsd > this.config.AGENT_MAX_ACTION_LOSS_HONEY) return { allowed: false, reason: `agent action worst-case loss exceeds the per-action cap of ${this.config.AGENT_MAX_ACTION_LOSS_HONEY} HONEY` };
+      return { allowed: true };
+    }
+    if (request.kind === "arbitrage" || request.kind === "liquidation") {
+      // For a same-block arbitrage cycle the on-chain minAmountOut (>= amountIn),
+      // and for a liquidation the atomic flash-loan repay, guarantee the principal
+      // cannot be lost: only gas is ever at risk, and it either reverts or profits.
+      // expectedNetProfitUsd is already net of gas and swap fees. Berachain's
+      // micro-cent gas must therefore not disqualify a genuinely positive micro
+      // profit through a gas x3 or $0.03 floor. We still require a strictly
+      // positive net and that no principal beyond gas is exposed.
+      if (!Number.isFinite(request.expectedNetProfitUsd) || request.expectedNetProfitUsd <= 0) return { allowed: false, reason: `${request.kind} expected net profit is not strictly positive` };
+      if (!Number.isFinite(request.maxEconomicLossUsd) || request.maxEconomicLossUsd > gasUsd) return { allowed: false, reason: `${request.kind} principal is not protected: worst-case loss exceeds gas` };
+      return { allowed: true };
+    }
     if (request.kind === "allocation") {
       const allocationCap = snapshot.estimatedNavUsd * this.config.ACTIVE_STRATEGY_MAX_ALLOCATION_PCT;
       if (request.maxEconomicLossUsd > allocationCap) return { allowed: false, reason: `allocation $${request.maxEconomicLossUsd.toFixed(4)} exceeds ${Math.round(this.config.ACTIVE_STRATEGY_MAX_ALLOCATION_PCT * 100)}% NAV cap` };

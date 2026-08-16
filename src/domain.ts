@@ -57,7 +57,7 @@ export type PortfolioSnapshot = {
 
 export type ExecutionRequest = {
   decisionId: string;
-  kind: "micro_test" | "profit" | "allocation" | "exit";
+  kind: "micro_test" | "profit" | "allocation" | "exit" | "arbitrage" | "liquidation" | "agent_action";
   protocolId: string;
   to: `0x${string}`;
   data: `0x${string}`;
