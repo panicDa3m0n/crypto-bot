@@ -4,24 +4,23 @@ import type { Config } from "../config.js";
 import type { Database } from "../db.js";
 import type { MarketData } from "../market-data.js";
 import type { Primitives } from "../primitives.js";
-import type { DexScreener } from "../dexscreener.js";
 import type { Blockscout } from "../blockscout.js";
 
 /**
  * Scarlet's VISION tools (read-only) — the senses she uses to explore, pull economic data, read price
  * movement, and verify a token before ever touching it. NOTHING here spends funds or writes on-chain;
  * buying/selling and position management arrive in the next gradino. Sources: the token DB (knowledge +
- * display price), DexScreener (snapshot + movement, high rate limit), GeckoTerminal (detailed OHLCV
+ * display price), indexer DB market stats (volume/txns/liquidity/price-change), GeckoTerminal (OHLCV
  * candles + discovery), and the on-chain honeypot check.
  */
-export type ToolDeps = { config: Config; db: Database; marketData: MarketData; dexscreener: DexScreener; primitives: Primitives; blockscout: Blockscout };
+export type ToolDeps = { config: Config; db: Database; marketData: MarketData; primitives: Primitives; blockscout: Blockscout };
 
 export const VISION_TOOLS: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
       name: "token_chart",
-      description: "Grafico dei movimenti di prezzo come candele OHLCV di un POOL (prendi l'indirizzo del pool da search_token.market.pairs[0].pair o da discover). Ritorna fino a 48 candele [timestamp, open, high, low, close, volume] dalla più recente. Leggile per capire trend, momentum, breakout, supporti/resistenze.",
+      description: "Grafico dei movimenti di prezzo come candele OHLCV di un POOL (prendi l'indirizzo del pool da search_token.market.pools[0] o da discover). Ritorna fino a 48 candele [timestamp, open, high, low, close, volume] dalla più recente. Leggile per capire trend, momentum, breakout, supporti/resistenze.",
       parameters: { type: "object", properties: { pool: { type: "string", description: "indirizzo del pool (0x…)" }, timeframe: { type: "string", enum: ["minute", "hour", "day"], description: "granularità candele (default hour)" } }, required: ["pool"] }
     }
   },
@@ -61,14 +60,16 @@ export async function dispatchVisionTool(name: string, args: Record<string, unkn
   switch (name) {
     case "token_chart": {
       const pool = normalizeAddr(args.pool);
-      if (!pool) return { error: "indirizzo pool non valido — prendilo da search_token.market.pairs[0].pair o da discover" };
+      if (!pool) return { error: "indirizzo pool non valido — prendilo da search_token.market.pools[0] o da discover" };
       const timeframe = typeof args.timeframe === "string" ? args.timeframe : "hour";
       return deps.marketData.query("ohlcv", { pool, timeframe }).catch((e) => ({ error: e instanceof Error ? e.message : String(e) }));
     }
     case "discover": {
-      const kind = args.kind === "trending" ? "trending" : "new_pools";
-      const limit = typeof args.limit === "number" ? args.limit : undefined;
-      return deps.marketData.query(kind, { limit }).catch((e) => ({ error: e instanceof Error ? e.message : String(e) }));
+      // Indexer-sourced discovery: trending = top by 1h chain volume; new_pools = newest discoveries.
+      const chainId = deps.config.CHAIN_ID;
+      const limit = typeof args.limit === "number" ? Math.min(50, Math.max(1, args.limit)) : 15;
+      if (args.kind === "trending") return { source: "indexer", trending: await deps.db.trendingTokens(chainId, limit).catch(() => []) };
+      return { source: "indexer", new_pools: await deps.db.recentPools(chainId, limit).catch(() => []) };
     }
     case "remember": {
       const key = String(args.key ?? "").trim().slice(0, 80);

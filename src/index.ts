@@ -17,7 +17,6 @@ import { Primitives } from "./primitives.js";
 import { Scarlet } from "./scarlet.js";
 import { ScarletAgent, SCARLET_STREAM } from "./scarlet/agent.js";
 import { Llm } from "./llm.js";
-import { DexScreener } from "./dexscreener.js";
 import { BlockIndexer } from "./block-indexer.js";
 import { Etherscan } from "./etherscan.js";
 import { MonadSignals } from "./monad-signals.js";
@@ -100,8 +99,7 @@ const llm = new Llm(config, logger);
 // The v2 core runs on its OWN chronology stream — detached from the legacy agent's diary (same
 // compaction machinery, fresh history). The legacy 'main' journal/summary is not inherited.
 const chronicleV2 = new Chronicle(config, db, logger, SCARLET_STREAM);
-const dexscreener = new DexScreener(config, logger);
-const scarletV2 = new ScarletAgent(config, chain, db, health, positions, chronicleV2, llm, marketData, dexscreener, primitives, blockscout, logger);
+const scarletV2 = new ScarletAgent(config, chain, db, health, positions, chronicleV2, llm, marketData, primitives, blockscout, logger);
 // The agent actually in charge this run — v2 when flagged, else the legacy Scarlet.
 const activeAgent = config.SCARLET_V2_ENABLED ? scarletV2 : scarlet;
 

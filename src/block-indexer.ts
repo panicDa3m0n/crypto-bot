@@ -22,6 +22,7 @@ import type { Database } from "./db.js";
 
 const V3_SWAP = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
 const V2_SYNC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
+const V2_SWAP = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"; // UniV2 Swap (amounts, for volume)
 const PAIR_CREATED = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"; // V2 factory
 const POOL_CREATED = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"; // V3 factory
 // Morpho Blue — position lifecycle. The indexer discovers/closes borrowers LIVE from these logs (the
@@ -39,7 +40,7 @@ const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "fun
 const ERC20_META_ABI = parseAbi(["function symbol() view returns (string)", "function name() view returns (string)", "function decimals() view returns (uint8)"]);
 const IDENTITY_CAP = 8; // max token-identity resolutions per call (bounds first-run RPC burst)
 const BOOTSTRAP_CAP = 20; // max unknown pools to bootstrap per block (self-limits any first-run burst)
-const TOPIC0S = [V3_SWAP, V2_SYNC, PAIR_CREATED, POOL_CREATED, MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE];
+const TOPIC0S = [V3_SWAP, V2_SYNC, V2_SWAP, PAIR_CREATED, POOL_CREATED, MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE];
 const CHUNK = 10;            // public getLogs range cap
 const ANCHOR_TTL_MS = 30_000; // refresh ETH/USD at most this often
 
@@ -233,7 +234,7 @@ export class BlockIndexer {
         else if (u0 != null) { T = t1; A = t0; U = u0; priceT = (1 / p0in1) * u0; rows.set(t1, { price: priceT, conf: 0.8 }); } }
 
       // V3 volume/txns: swap USD size = |anchor-side amount| × its USD; buy = T flows OUT of the pool
-      // (negative in V3's signed convention). V2 Sync carries no amounts → V2 volume is a follow-up.
+      // (negative in V3's signed convention).
       if (isSwap && T && A) {
         const aAmt = A === t0 ? sword(l.data, 0) : sword(l.data, 1);
         const tAmt = A === t0 ? sword(l.data, 1) : sword(l.data, 0);
@@ -246,6 +247,28 @@ export class BlockIndexer {
           }
         }
       }
+    }
+
+    // 2b) V2 volume/txns — the UniV2 Swap event carries the amounts the Sync doesn't. Price comes from
+    // the Sync (above); here we only attribute volume, using the priced side as the USD anchor.
+    for (const l of logs) {
+      if ((l.topics[0] ?? "").toLowerCase() !== V2_SWAP) continue;
+      const info = pools.get(l.address.toLowerCase());
+      if (!info?.token0 || !info.token1) continue;
+      const t0 = info.token0.toLowerCase(), t1 = info.token1.toLowerCase();
+      const d0 = dec(t0), d1 = dec(t1); if (d0 == null || d1 == null) continue;
+      const u1 = usdOf(t1), u0 = usdOf(t0);
+      let T: string, A: string, U: number, decA: number;
+      if (u1 != null) { T = t0; A = t1; U = u1; decA = d1; } else if (u0 != null) { T = t1; A = t0; U = u0; decA = d0; } else continue;
+      // Swap(amount0In, amount1In, amount0Out, amount1Out): net = In − Out (into pool positive).
+      const net0 = (word(l.data, 0) ?? 0n) - (word(l.data, 2) ?? 0n);
+      const net1 = (word(l.data, 1) ?? 0n) - (word(l.data, 3) ?? 0n);
+      const netA = A === t0 ? net0 : net1, netT = T === t0 ? net0 : net1;
+      const S = Math.abs(Number(netA) / 10 ** decA) * U;
+      if (!(S > 0) || !Number.isFinite(S)) continue;
+      const priceT = rows.get(T)?.price ?? px.get(T)?.priceUsd ?? 0;
+      const s = stats.get(T) ?? { volUsd: 0, buys: 0, sells: 0, lastPrice: priceT };
+      s.volUsd += S; if (netT < 0n) s.buys += 1; else s.sells += 1; if (priceT > 0) s.lastPrice = priceT; stats.set(T, s);
     }
 
     if (this.config.DEBUG_KEEP_RAW_BLOCKS && logs.length) await this.db.saveRawBlock(this.config.CHAIN_ID, block, logs).catch(() => undefined);

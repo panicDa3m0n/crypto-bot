@@ -8,7 +8,6 @@ import type { Database } from "../db.js";
 import type { NetworkHealthSource } from "../health.js";
 import type { PositionService } from "../positions.js";
 import type { MarketData } from "../market-data.js";
-import type { DexScreener } from "../dexscreener.js";
 import type { Primitives } from "../primitives.js";
 import type { Blockscout } from "../blockscout.js";
 import { COMPACTION_SYSTEM, type Chronicle } from "../chronicle.js";
@@ -53,13 +52,12 @@ export class ScarletAgent {
     private readonly chronicle: Chronicle,
     private readonly llm: Llm,
     private readonly marketData: MarketData,
-    private readonly dexscreener: DexScreener,
     private readonly primitives: Primitives,
     private readonly blockscout: Blockscout,
     private readonly logger: Logger
   ) {
     this.systemPrompt = loadPrompt(config.SCARLET_CORE_PROMPT_PATH);
-    this.toolDeps = { config, db, marketData, dexscreener, primitives, blockscout };
+    this.toolDeps = { config, db, marketData, primitives, blockscout };
   }
 
   private readonly toolDeps: ToolDeps;

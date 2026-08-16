@@ -1244,6 +1244,34 @@ export class Database {
       change1h: chg(p1h), change24h: chg(p24h), lastPrice: latest
     };
   }
+  /** Trending tokens = top by 1h chain volume (from token_stats), with identity + price. Indexer-sourced
+   * replacement for the GeckoTerminal "trending" discovery. */
+  async trendingTokens(chainId: number, limit = 15): Promise<Array<{ address: string; symbol: string | null; priceUsd: number | null; vol1h: number; buys: number; sells: number }>> {
+    const since = Math.floor(Date.now() / 1000) - 3600;
+    const r = await this.pool.query<{ token: string; symbol: string | null; price_usd: number | null; vol1h: string; buys: string; sells: string }>(
+      `SELECT ts.token, e.symbol, tp.price_usd,
+              SUM(ts.vol_usd)::text AS vol1h, SUM(ts.buys)::text AS buys, SUM(ts.sells)::text AS sells
+       FROM token_stats ts
+       LEFT JOIN entities e ON e.chain_id=ts.chain_id AND e.address=ts.token AND e.kind='token'
+       LEFT JOIN token_prices tp ON tp.chain_id=ts.chain_id AND tp.token=ts.token
+       WHERE ts.chain_id=$1 AND ts.bucket >= $2
+       GROUP BY ts.token, e.symbol, tp.price_usd ORDER BY SUM(ts.vol_usd) DESC LIMIT $3`, [chainId, since, limit]
+    );
+    return r.rows.map((x) => ({ address: x.token, symbol: x.symbol, priceUsd: x.price_usd, vol1h: Math.round(Number(x.vol1h)), buys: Number(x.buys), sells: Number(x.sells) }));
+  }
+  /** Freshly-discovered pools (newest first), with token identity. Indexer-sourced "new_pools". */
+  async recentPools(chainId: number, limit = 15): Promise<Array<{ pool: string; token0: string | null; token1: string | null; symbol0: string | null; symbol1: string | null; archetype: string | null; createdAt: string }>> {
+    const r = await this.pool.query<{ pool: string; t0: string | null; t1: string | null; s0: string | null; s1: string | null; arch: string | null; created_at: Date }>(
+      `SELECT p.address AS pool, p.meta->>'token0' AS t0, p.meta->>'token1' AS t1, p.meta->>'archetype' AS arch, p.created_at,
+              e0.symbol AS s0, e1.symbol AS s1
+       FROM entities p
+       LEFT JOIN entities e0 ON e0.chain_id=p.chain_id AND e0.address=lower(p.meta->>'token0') AND e0.kind='token'
+       LEFT JOIN entities e1 ON e1.chain_id=p.chain_id AND e1.address=lower(p.meta->>'token1') AND e1.kind='token'
+       WHERE p.chain_id=$1 AND p.kind='pool' ORDER BY p.created_at DESC LIMIT $2`, [chainId, limit]
+    );
+    return r.rows.map((x) => ({ pool: x.pool, token0: x.t0, token1: x.t1, symbol0: x.s0, symbol1: x.s1, archetype: x.arch, createdAt: x.created_at.toISOString() }));
+  }
+
   /** Approximate USD liquidity of a token: summed across its pools, quote-side reserve × quote USD × 2.
    * V2 reserves are exact; V3 uses virtual reserves (a relative-depth signal, not exact locked TVL). */
   async tokenLiquidityUsd(chainId: number, token: string, quoteUsd: (t: string) => number | null): Promise<number | null> {
