@@ -56,10 +56,10 @@ const schema = z.object({
   // API key raises the rate limit. Default from the network profile.
   BLOCKSCOUT_API_URL: z.string().url().default("https://base.blockscout.com/api"),
   BLOCKSCOUT_API_KEY: z.string().min(1).optional(),
-  BLOCKSCOUT_ENABLED: z.coerce.boolean().default(true),
+  BLOCKSCOUT_ENABLED: bool.default(true),
   // DISPLAY price cache (Lane A): batch-refresh discovered tokens' indicative prices into token_prices
   // so the dashboard reads DB only (never saturates APIs). NOT used for arb/liquidation decisions.
-  DISPLAY_PRICE_ENABLED: z.coerce.boolean().default(true),
+  DISPLAY_PRICE_ENABLED: bool.default(true),
   DISPLAY_PRICE_INTERVAL_MS: z.coerce.number().int().min(10_000).default(30_000),
   DISPLAY_PRICE_STALE_MS: z.coerce.number().int().min(10_000).default(25_000), // re-price a token only once it's this stale
   DISPLAY_PRICE_BATCH: z.coerce.number().int().min(10).max(200).default(120),   // tokens per DefiLlama batch call
@@ -83,7 +83,7 @@ const schema = z.object({
   AGGREGATOR_CHAIN: z.string().min(1).default("base"),
   // Arbitrage engine: the SYSTEM discovers cross-venue/triangular cycles, re-quotes them at real
   // size via the aggregator (net of gas), and surfaces/executes only the truly profitable ones.
-  ARB_ENABLED: z.coerce.boolean().default(true),
+  ARB_ENABLED: bool.default(true),
   ARB_INTERVAL_MS: z.coerce.number().int().min(15_000).default(60_000),
   // Size sweep: profit is size-dependent (gas dominates when too small, slippage when too big),
   // so each candidate is re-quoted at several sizes and the best net is kept. First a cheap
@@ -95,7 +95,7 @@ const schema = z.object({
   ARB_PROBE_SIZES_USD: z.string().default("20,80,250,1000,5000"),
   ARB_MIN_PROFIT_USD: z.coerce.number().min(0).default(0.05),
   ARB_MAX_CANDIDATES: z.coerce.number().int().min(1).max(60).default(16),
-  ARB_TRIANGULAR: z.coerce.boolean().default(true),
+  ARB_TRIANGULAR: bool.default(true),
   ARB_WATCHLIST_MAX: z.coerce.number().int().min(0).max(30).default(10),
   // Execution realism: net is decided on the slippage-adjusted FLOOR (guaranteed min-out), not
   // the optimistic mid; gas is the ATOMIC bundle (2 swaps + organ/flashloan overhead) priced at
@@ -119,13 +119,13 @@ const schema = z.object({
   // Registry enrichment: the Etherscan contract module (works on Base free) marks each token/dex/
   // contract with verified/name/proxy — a deterministic scam signal — throttled to respect the
   // free-tier rate limit (5 req/s, 100k/day) and cached (done once per address in its meta).
-  ENRICH_ENABLED: z.coerce.boolean().default(true),
+  ENRICH_ENABLED: bool.default(true),
   ENRICH_INTERVAL_MS: z.coerce.number().int().min(10_000).default(30_000),
   ENRICH_BATCH: z.coerce.number().int().min(1).max(50).default(12),
   // Lending position registry: enumerate ALL borrowers (old + new), classify into tiers, poll
   // adaptively — watch (near HF threshold, fast) / profitable (healthy, slow) / low_collateral /
   // blacklist / closed. Watch-tier feeds the existing flash-kill.
-  LIQ_REGISTRY_ENABLED: z.coerce.boolean().default(true),
+  LIQ_REGISTRY_ENABLED: bool.default(true),
   LIQ_ENUM_INTERVAL_MS: z.coerce.number().int().min(60_000).default(180_000),
   LIQ_TICK_INTERVAL_MS: z.coerce.number().int().min(10_000).default(20_000),
   LIQ_WATCH_HF: z.coerce.number().min(1).default(1.05),  // HF at/below which a position is "watch"
@@ -162,7 +162,7 @@ const schema = z.object({
   WALLET_TRANSFER_PAGES: z.coerce.number().int().min(1).max(10).default(3), // Blockscout token-transfer pages to discover the wallet's touched tokens
   // Auto-fire is OFF until the atomic executor's balance-aware leg-chaining is validated on-chain;
   // until then the engine discovers + verifies + notifies, and firing is a deliberate step.
-  ARB_AUTOFIRE: z.coerce.boolean().default(false),
+  ARB_AUTOFIRE: bool.default(false),
   // Cross-cycle history: Scarlet carries her past cycles as running context. When the
   // estimated history reaches COMPACT_AT of the model's context, older cycles are
   // LLM-summarized down to KEEP_FRESH, so continuity survives without unbounded cost.
@@ -205,7 +205,7 @@ const schema = z.object({
   AUTOARM_MIN_IMMINENCE: z.coerce.number().min(0).default(0.15),        // include in the arm band iff σ(T) ≥ this × distance-to-cross
   // On-chain HF monitor: watch ALL near-threshold positions (no cap) by reading each market's oracle
   // price per tick and comparing to the precomputed liquidation price. Fire is built FRESH at the cross.
-  LIQ_MONITOR_ENABLED: z.coerce.boolean().default(true),
+  LIQ_MONITOR_ENABLED: bool.default(true),
   LIQ_MONITOR_INTERVAL_MS: z.coerce.number().int().min(1500).default(3000),
   LIQ_MONITOR_MAX_FIRES: z.coerce.number().int().min(1).default(3),      // max fires attempted per tick (sequential)
   LIQ_NEAR_MARGIN: z.coerce.number().min(0).default(0.05),               // "near" = oracle price within this % of the (stale) liq_price → refresh its SIZE on-chain for a fresh HF
