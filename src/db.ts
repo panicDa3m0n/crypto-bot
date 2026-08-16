@@ -785,7 +785,15 @@ export class Database {
          vol_fast = CASE WHEN ${canUpdate} THEN ${ewma(pTf, "vol_fast")} ELSE token_prices.vol_fast END,
          vol_slow = CASE WHEN ${canUpdate} THEN ${ewma(pTs, "vol_slow")} ELSE token_prices.vol_slow END,
          vol_sample_price = CASE WHEN EXCLUDED.price_usd > 0 THEN EXCLUDED.price_usd ELSE token_prices.vol_sample_price END,
-         vol_at = CASE WHEN EXCLUDED.price_usd > 0 THEN NOW() ELSE token_prices.vol_at END`,
+         vol_at = CASE WHEN EXCLUDED.price_usd > 0 THEN NOW() ELSE token_prices.vol_at END
+       -- SOURCE-PRIORITY + FRESHNESS guard: the indexer (exact, on-swap) is authoritative and must not be
+       -- clobbered by a lower-quality lane (DefiLlama/none) while it is fresh. Accept a write only if it is
+       -- (a) not zeroing a real price, AND (b) an equal/higher-priority source OR the stored price is stale
+       -- enough (>120s, e.g. the token stopped trading so a slower lane may refresh it).
+       WHERE (EXCLUDED.price_usd > 0 OR token_prices.price_usd IS NULL OR token_prices.price_usd = 0)
+         AND ((CASE EXCLUDED.source WHEN 'indexer' THEN 3 WHEN 'aggregator' THEN 2 WHEN 'defillama' THEN 1 ELSE 0 END)
+              >= (CASE token_prices.source WHEN 'indexer' THEN 3 WHEN 'aggregator' THEN 2 WHEN 'defillama' THEN 1 ELSE 0 END)
+              OR token_prices.updated_at < NOW() - interval '120 seconds')`,
       values
     );
   }
