@@ -35,6 +35,8 @@ const MORPHO_BORROW = "0x570954540bed6b1304a87dfe815a5eda4a648f7097a16240dcd85c9
 const MORPHO_LIQUIDATE = "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41";
 const MORPHO_TOPICS = new Set([MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE]);
 const MORPHO_MARKET_ABI = parseAbi(["function idToMarketParams(bytes32 id) view returns (address loanToken, address collateralToken, address oracle, address irm, uint256 lltv)"]);
+const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)"]);
+const BOOTSTRAP_CAP = 20; // max unknown pools to bootstrap per block (self-limits any first-run burst)
 const TOPIC0S = [V3_SWAP, V2_SYNC, PAIR_CREATED, POOL_CREATED, MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE];
 const CHUNK = 10;            // public getLogs range cap
 const ANCHOR_TTL_MS = 30_000; // refresh ETH/USD at most this often
@@ -153,6 +155,16 @@ export class BlockIndexer {
     if (!priced.length) return { swaps: 0, discovered, lending };
     const poolAddrs = [...new Set(priced.map((l) => l.address.toLowerCase()))];
     const pools = await this.db.poolInfoBatch(this.config.CHAIN_ID, poolAddrs);
+    // Self-sufficient discovery: a pool that swapped but isn't in entities (its Create predates the
+    // indexer and no scanner classified it) — bootstrap it ONCE (token0/token1/archetype) so the indexer
+    // discovers + prices it with no dependence on any other scanner. Capped/block to bound a first-run burst.
+    const unknown: Array<{ addr: string; archetype: string }> = [];
+    for (const l of priced) {
+      const a = l.address.toLowerCase();
+      if (pools.has(a) || unknown.some((u) => u.addr === a)) continue;
+      unknown.push({ addr: a, archetype: (l.topics[0] ?? "").toLowerCase() === V3_SWAP ? "v3" : "v2" });
+    }
+    for (const u of unknown.slice(0, BOOTSTRAP_CAP)) { const info = await this.bootstrapPool(u.addr, u.archetype); if (info) pools.set(u.addr, info); }
     const tokenSet = new Set<string>();
     for (const p of pools.values()) { if (p.token0) tokenSet.add(p.token0.toLowerCase()); if (p.token1) tokenSet.add(p.token1.toLowerCase()); }
     const meta = await this.db.tokenMeta(this.config.CHAIN_ID, [...tokenSet]).catch(() => new Map());
@@ -237,6 +249,23 @@ export class BlockIndexer {
       await this.db.upsertLendingMarket({ chainId: this.config.CHAIN_ID, protocol: "morpho", marketId: id, ...m }).catch(() => undefined);
       return m;
     } catch (e) { this.logger.debug({ err: e, id }, "idToMarketParams bootstrap failed"); return null; }
+  }
+
+  /** One-shot discovery of a pool seen swapping but absent from entities: read token0/token1(/fee),
+   * upsert the pool + its tokens, and return its meta so THIS block can already price it. */
+  private async bootstrapPool(addr: string, archetype: string): Promise<{ token0: string; token1: string; archetype: string } | null> {
+    try {
+      const [t0, t1] = await Promise.all([
+        this.chain.fallback.readContract({ address: addr as Address, abi: POOL_META_ABI, functionName: "token0" }) as Promise<string>,
+        this.chain.fallback.readContract({ address: addr as Address, abi: POOL_META_ABI, functionName: "token1" }) as Promise<string>
+      ]);
+      const token0 = t0.toLowerCase(), token1 = t1.toLowerCase();
+      const fee = archetype === "v3" ? await this.chain.fallback.readContract({ address: addr as Address, abi: POOL_META_ABI, functionName: "fee" }).then(Number).catch(() => undefined) : undefined;
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: addr, kind: "pool", meta: { token0, token1, archetype, fee, discoveredBy: "indexer-swap" }, source: "indexer" }).catch(() => undefined);
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token0, kind: "token", source: "indexer" }).catch(() => undefined);
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token1, kind: "token", source: "indexer" }).catch(() => undefined);
+      return { token0, token1, archetype };
+    } catch (e) { this.logger.debug({ err: e, pool: addr }, "pool bootstrap failed"); return null; }
   }
 
   /** USD value of one unit of a QUOTE token (WETH via Chainlink, USDC = $1). null if not a quote. */

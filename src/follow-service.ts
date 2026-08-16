@@ -85,6 +85,10 @@ export class FollowService {
   private async meta(token: Address): Promise<{ symbol: string; decimals: number } | undefined> {
     const key = token.toLowerCase();
     if (this.tokenMeta.has(key)) return this.tokenMeta.get(key);
+    // Token registry (indexer/scanner-maintained) FIRST — chain-sourced metadata already lives in the DB.
+    // RPC only as a one-shot bootstrap for a token the system has genuinely never seen.
+    const reg = (await this.db.tokenMeta(this.config.CHAIN_ID, [key]).catch(() => new Map())).get(key);
+    if (reg && reg.symbol && reg.decimals != null) { const m = { symbol: reg.symbol, decimals: reg.decimals }; this.tokenMeta.set(key, m); return m; }
     try {
       const [symbol, decimals] = await Promise.all([
         this.chain.secondary.readContract({ address: token, abi: SYM, functionName: "symbol" }).catch(() => "?") as Promise<string>,
