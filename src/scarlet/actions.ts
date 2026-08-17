@@ -76,11 +76,11 @@ export async function dispatchActionTool(name: string, args: Record<string, unkn
       const open = await deps.db.countOpenPositionPlans(chainId).catch(() => 0);
       if (open >= deps.config.POSITION_MAX_OPEN) return { error: `hai già ${open} posizioni aperte (max ${deps.config.POSITION_MAX_OPEN}). Chiudine una prima.` };
 
-      // HONEYPOT GATE — the only hard refusal: a token we cannot SELL. On-chain sim of buy+sell.
-      const check = await deps.primitives.checkToken(token as Address).catch((e) => ({ error: e instanceof Error ? e.message : String(e) } as { error: string }));
-      if ("error" in check) return { error: `verifica on-chain fallita (nessun pool V3 leggibile?): ${check.error}. Non apro alla cieca.` };
-      if (!check.buyable) return { error: `non comprabile ora (nessuna rotta V3): ${check.reasons.join("; ")}` };
-      if (!check.canSell) return { refused: true, reason: "HONEYPOT — il token non è vendibile (sim di vendita fallita). Non apro.", detail: check.reasons };
+      // HONEYPOT GATE — the only hard refusal: a token we cannot SELL. Cross-venue buy+sell route check.
+      const check = await deps.primitives.checkToken(token as Address).catch((e) => ({ error: (e instanceof Error && e.message) ? e.message : String(e || "errore verifica") } as { error: string }));
+      if ("error" in check) return { error: `verifica rotte fallita: ${check.error}. Non apro alla cieca.` };
+      if (!check.buyable) return { error: `non comprabile ora: ${check.reasons.join("; ") || "nessuna rotta"} — se transitorio, riprova.` };
+      if (!check.canSell) return { refused: true, reason: "HONEYPOT — nessuna rotta di vendita mentre l'acquisto è possibile. Non apro.", detail: check.reasons };
 
       const meta = (await deps.db.tokenMeta(chainId, [token]).catch(() => new Map())).get(token) as { symbol: string | null } | undefined;
       const entryKind = numOrNull(args.limitPrice) ? "limit" : "now";
@@ -88,8 +88,8 @@ export async function dispatchActionTool(name: string, args: Record<string, unkn
         chainId, token, symbol: meta?.symbol ?? null, baseToken: (deps.config.WBERA_ADDRESS as string).toLowerCase(),
         entryKind, entryPrice: numOrNull(args.limitPrice), entryAmountUsd: sizeUsd,
         stopLossPct: numOrNull(args.stopLossPct), takeProfitPct: numOrNull(args.takeProfitPct), partials: [], note: "aperta da Scarlet"
-      }).catch((e) => ({ error: e instanceof Error ? e.message : String(e) }));
-      if (typeof id !== "number") return { error: `creazione posizione fallita: ${(id as { error: string }).error}` };
+      }).catch((e) => ({ error: (e instanceof Error && e.message) ? e.message : String(e || "errore DB sconosciuto") }));
+      if (typeof id !== "number") return { error: `creazione posizione fallita: ${(id as { error: string }).error || "errore sconosciuto"}` };
       return { ok: true, positionId: id, symbol: meta?.symbol ?? null, sizeUsd,
         entry: entryKind === "now" ? "subito" : `limit ≤ $${numOrNull(args.limitPrice)}`,
         stopLossPct: numOrNull(args.stopLossPct), takeProfitPct: numOrNull(args.takeProfitPct),
