@@ -18,14 +18,14 @@ export const ACTION_TOOLS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "open_position",
-      description: "Apri una posizione: COMPRA un token. Dichiari solo l'intento — il sistema sceglie pool/rotta, slippage, gas, approva, wrappa WETH, verifica la vendibilità (anti-honeypot) e poi gestisce da solo stop-loss / take-profit. Usa sizeUsd in dollari. stopLossPct/takeProfitPct opzionali (es. 30 = -30% stop / +30% target). limitPrice opzionale: compra solo se il prezzo scende ≤ limitPrice (altrimenti compra subito). Ritorna l'id posizione; il sistema esegue al prossimo tick e ti sveglia al fill.",
+      description: "Apri una posizione: COMPRA un token. NON scegli la size in dollari — il sistema la DIMENSIONA come un trader umano, in base al RISCHIO: rischia una % del NAV, e la size = rischio / distanza-dello-stop (stop stretto → size maggiore). Poi la limita per concentrazione (qualità/liquidità del token) e per il CALORE totale di portafoglio (quante posizioni-a-rischio hai già aperte). Tu dai: stopLossPct (OBBLIGATORIO — definisce la size), takeProfitPct, e conviction (low|medium|high = quanto osare). Il sistema fa rotta/slippage/gas/approve/wrap, verifica l'anti-honeypot, gestisce stop/target, e ti dice la size calcolata + il perché. limitPrice opzionale.",
       parameters: { type: "object", additionalProperties: false, properties: {
         token: { type: "string", description: "indirizzo del token da comprare (0x…)" },
-        sizeUsd: { type: "number", description: "quanto investire, in USD" },
-        stopLossPct: { type: "number", description: "stop-loss in % sotto l'entry (opzionale, es. 30)" },
-        takeProfitPct: { type: "number", description: "take-profit in % sopra l'entry (opzionale, es. 50)" },
+        stopLossPct: { type: "number", description: "OBBLIGATORIO: stop-loss in % sotto l'entry (es. 30). Definisce la size dal rischio." },
+        takeProfitPct: { type: "number", description: "take-profit in % sopra l'entry (es. 50)" },
+        conviction: { type: "string", enum: ["low", "medium", "high"], description: "quanto rischiare su questa idea (default medium)" },
         limitPrice: { type: "number", description: "prezzo USD limite d'ingresso: compra solo se ≤ questo (opzionale = compra subito)" }
-      }, required: ["token", "sizeUsd"] }
+      }, required: ["token", "stopLossPct"] }
     }
   },
   {
@@ -66,15 +66,19 @@ export async function dispatchActionTool(name: string, args: Record<string, unkn
   const chainId = deps.config.CHAIN_ID;
   switch (name) {
     case "open_position": {
+      const cfg = deps.config;
       const token = normalizeAddr(args.token);
       if (!token) return { error: "indirizzo token non valido" };
-      const sizeUsd = Number(args.sizeUsd);
-      if (!Number.isFinite(sizeUsd) || sizeUsd <= 0) return { error: "sizeUsd deve essere un numero positivo" };
-      const min = deps.config.POSITION_MIN_USD, max = deps.config.POSITION_MAX_USD;
-      if (sizeUsd < min) return { error: `size troppo piccola: minimo $${min}` };
-      if (sizeUsd > max) return { error: `size oltre il limite di sicurezza per posizione ($${max}). Riduci sizeUsd o apri in più tranche.` };
-      const open = await deps.db.countOpenPositionPlans(chainId).catch(() => 0);
-      if (open >= deps.config.POSITION_MAX_OPEN) return { error: `hai già ${open} posizioni aperte (max ${deps.config.POSITION_MAX_OPEN}). Chiudine una prima.` };
+      const stopLossPct = numOrNull(args.stopLossPct);
+      if (stopLossPct == null || stopLossPct < 1 || stopLossPct >= 100) return { error: "stopLossPct obbligatorio (1–99): è ciò che determina la size dal rischio" };
+      const takeProfitPct = numOrNull(args.takeProfitPct);
+      const conviction = ["low", "medium", "high"].includes(String(args.conviction)) ? String(args.conviction) : "medium";
+      const convMult = conviction === "low" ? 0.5 : conviction === "high" ? 1.6 : 1;
+
+      const nav = (await deps.db.latestPortfolio().catch(() => undefined))?.estimatedNavUsd ?? 0;
+      if (!(nav > 0)) return { error: "NAV non disponibile ora — riprova al prossimo ciclo" };
+      const openPlans = await deps.db.activePositionPlans(chainId).catch(() => []);
+      if (openPlans.length >= cfg.POSITION_MAX_OPEN) return { error: `già ${openPlans.length} posizioni aperte (tetto di sanità ${cfg.POSITION_MAX_OPEN}) — chiudine una` };
 
       // HONEYPOT GATE — the only hard refusal: a token we cannot SELL. Cross-venue buy+sell route check.
       const check = await deps.primitives.checkToken(token as Address).catch((e) => ({ error: (e instanceof Error && e.message) ? e.message : String(e || "errore verifica") } as { error: string }));
@@ -82,18 +86,37 @@ export async function dispatchActionTool(name: string, args: Record<string, unkn
       if (!check.buyable) return { error: `non comprabile ora: ${check.reasons.join("; ") || "nessuna rotta"} — se transitorio, riprova.` };
       if (!check.canSell) return { refused: true, reason: "HONEYPOT — nessuna rotta di vendita mentre l'acquisto è possibile. Non apro.", detail: check.reasons };
 
+      // HUMAN-STYLE SIZING. size = risk / stop-distance; then cap by concentration (token quality), by
+      // pool liquidity (clean exit), by absolute ceiling, and by total portfolio HEAT (open risk budget).
+      const stats = await deps.db.tokenStats(chainId, token).catch(() => null);
+      const liq = stats?.liqUsd ?? null;
+      const isFresh = liq == null || liq < 150_000; // thin/low-liq = fresh-launch risk regime; deep = quality
+      const stopFrac = stopLossPct / 100;
+      const riskUsd = nav * (cfg.POSITION_RISK_PCT / 100) * convMult;
+      let size = riskUsd / stopFrac;
+      const caps: string[] = [];
+      const concCap = nav * ((isFresh ? cfg.POSITION_MAX_NAV_PCT_FRESH : cfg.POSITION_MAX_NAV_PCT_QUALITY) / 100);
+      if (size > concCap) { size = concCap; caps.push(`concentrazione ${isFresh ? "fresh 15%" : "quality 30%"} NAV`); }
+      if (liq != null && liq > 0) { const liqCap = liq * (cfg.POSITION_MAX_LIQ_PCT / 100); if (size > liqCap) { size = liqCap; caps.push(`≤${cfg.POSITION_MAX_LIQ_PCT}% liquidità`); } }
+      if (size > cfg.POSITION_MAX_USD) { size = cfg.POSITION_MAX_USD; caps.push(`tetto assoluto $${cfg.POSITION_MAX_USD}`); }
+      const openRisk = openPlans.reduce((s, p) => s + (p.entryAmountUsd || 0) * ((p.stopLossPct ?? 100) / 100), 0);
+      const heatBudget = nav * (cfg.PORTFOLIO_HEAT_PCT / 100);
+      if (openRisk + size * stopFrac > heatBudget) { size = Math.max(0, (heatBudget - openRisk) / stopFrac); caps.push("calore di portafoglio"); }
+      size = Math.round(size * 100) / 100;
+      if (size < cfg.POSITION_MIN_USD) return { error: `budget di rischio quasi esaurito (rischio aperto ~$${openRisk.toFixed(1)} su $${heatBudget.toFixed(1)}). Chiudi una posizione, oppure usa conviction più alta / stop più stretto.` };
+
       const meta = (await deps.db.tokenMeta(chainId, [token]).catch(() => new Map())).get(token) as { symbol: string | null } | undefined;
       const entryKind = numOrNull(args.limitPrice) ? "limit" : "now";
       const id = await deps.db.createPositionPlan({
-        chainId, token, symbol: meta?.symbol ?? null, baseToken: (deps.config.WBERA_ADDRESS as string).toLowerCase(),
-        entryKind, entryPrice: numOrNull(args.limitPrice), entryAmountUsd: sizeUsd,
-        stopLossPct: numOrNull(args.stopLossPct), takeProfitPct: numOrNull(args.takeProfitPct), partials: [], note: "aperta da Scarlet"
+        chainId, token, symbol: meta?.symbol ?? null, baseToken: (cfg.WBERA_ADDRESS as string).toLowerCase(),
+        entryKind, entryPrice: numOrNull(args.limitPrice), entryAmountUsd: size,
+        stopLossPct, takeProfitPct, partials: [], note: `Scarlet (${conviction})`
       }).catch((e) => ({ error: (e instanceof Error && e.message) ? e.message : String(e || "errore DB sconosciuto") }));
       if (typeof id !== "number") return { error: `creazione posizione fallita: ${(id as { error: string }).error || "errore sconosciuto"}` };
-      return { ok: true, positionId: id, symbol: meta?.symbol ?? null, sizeUsd,
-        entry: entryKind === "now" ? "subito" : `limit ≤ $${numOrNull(args.limitPrice)}`,
-        stopLossPct: numOrNull(args.stopLossPct), takeProfitPct: numOrNull(args.takeProfitPct),
-        message: "Intento registrato. Il sistema esegue l'entry al prossimo tick (rotta/slippage/gas/wrap automatici) e gestirà stop/target. Ti sveglierà al fill." };
+      return { ok: true, positionId: id, symbol: meta?.symbol ?? null, sizeUsd: size, conviction,
+        tier: isFresh ? "fresh" : "quality", riskUsd: Math.round(riskUsd * 100) / 100,
+        entry: entryKind === "now" ? "subito" : `limit ≤ $${numOrNull(args.limitPrice)}`, stopLossPct, takeProfitPct,
+        message: `Size $${size} = ${cfg.POSITION_RISK_PCT}%×${conviction} del NAV rischiato / stop ${stopLossPct}%${caps.length ? `, limitata da: ${caps.join(", ")}` : ""}. Il sistema esegue e gestisce stop/target.` };
     }
 
     case "close_position": {

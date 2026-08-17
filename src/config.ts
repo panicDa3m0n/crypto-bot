@@ -277,12 +277,18 @@ const schema = z.object({
   MIN_OBSERVATION_HEALTH_RATIO: z.coerce.number().min(0.9).max(1).default(0.95),
   MAX_OBSERVATION_GAP_SECONDS: z.coerce.number().int().min(5).max(300).default(15),
   MICRO_TEST_MAX_LOSS_USD: z.coerce.number().positive().max(0.05).default(0.05)
-  // Action layer (Scarlet's position tools). She declares simple intent (token + size + optional
-  // stop/target); the deterministic engine fills routing/slippage/gas/approve/wrap + arms SL/TP. These
-  // bound her per-position size and how many positions can be open at once — safety without over-caution.
-  ,POSITION_MIN_USD: z.coerce.number().positive().default(1)
-  ,POSITION_MAX_USD: z.coerce.number().positive().default(25)
-  ,POSITION_MAX_OPEN: z.coerce.number().int().min(1).max(50).default(6)
+  // Action layer. Scarlet declares INTENT (token + stop + conviction); the system SIZES the position
+  // like a human trader: risk-based (size = risk / stop-distance), capped by concentration (per token
+  // quality), by pool liquidity (exit cleanly), and by total portfolio heat (which sets how MANY
+  // positions can be open — not a fixed number). % of NAV so it auto-scales with capital.
+  ,POSITION_RISK_PCT: z.coerce.number().positive().max(20).default(2)          // % of NAV risked per trade (loss if stopped)
+  ,POSITION_MAX_NAV_PCT_FRESH: z.coerce.number().positive().max(100).default(15)   // hard concentration cap, fresh/thin token
+  ,POSITION_MAX_NAV_PCT_QUALITY: z.coerce.number().positive().max(100).default(30) // hard concentration cap, established token
+  ,POSITION_MAX_LIQ_PCT: z.coerce.number().positive().max(20).default(1.5)     // ≤ this % of the token's liquidity (clean exit)
+  ,PORTFOLIO_HEAT_PCT: z.coerce.number().positive().max(100).default(18)       // total open risk cap → emergent position count
+  ,POSITION_MIN_USD: z.coerce.number().positive().default(1)                   // floor: below this, don't bother
+  ,POSITION_MAX_USD: z.coerce.number().positive().default(40)                  // absolute per-position ceiling (safety)
+  ,POSITION_MAX_OPEN: z.coerce.number().int().min(1).max(50).default(20)       // hard sanity cap (heat is the real limiter)
   ,POSITION_SLIPPAGE_PCT: z.coerce.number().min(0.1).max(50).default(8)
   // Capital bands drive which profit engines Scarlet may consider at the current
   // NAV. Micro-cent Berachain gas keeps micro strategies economic; larger bands

@@ -411,7 +411,9 @@ export class Primitives {
     const v3 = await this.swapV3(tokenIn, tokenOut, amountIn, maxSlippagePct, act);
     if (v3.ok || v3.stage !== "build") return v3;
     const agg = await this.swapViaAggregator(tokenIn, tokenOut, amountIn, maxSlippagePct, act);
-    return agg.ok ? agg : v3; // if the aggregator can't route either, surface the V3 reason
+    if (agg.ok) return agg;
+    // Both failed — surface the AGGREGATOR reason (informative), not the generic "no V3 pool".
+    return { ok: false, primitive: "swap", stage: "reason" in agg ? agg.stage : "build", reason: `no V3 pool; aggregatore: ${"reason" in agg ? agg.reason : "fallito"}` };
   }
 
   /** Cross-venue swap via the aggregator: quote → build calldata → approve → send. Same execution
@@ -428,7 +430,7 @@ export class Primitives {
     const guard = await this.preSendGuard(); if (!guard.ok) return { ok: false, primitive: "swap", stage: "execute", reason: guard.reason };
     const slippageBps = Math.round(Math.max(0.1, Math.min(50, maxSlippagePct)) * 100);
     const built = await this.aggregator.swapCalldata(tokenIn, tokenOut, amountIn, owner, slippageBps);
-    if (!built) return { ok: false, primitive: "swap", stage: "build", reason: "aggregator calldata build failed" };
+    if (!built) { this.logger.warn({ tokenIn, tokenOut }, "aggregator swapCalldata build returned null"); return { ok: false, primitive: "swap", stage: "build", reason: "aggregator calldata build failed" }; }
     try {
       await this.approveDirect(tokenIn, built.router, amountIn);
       const pf = await this.chain.preflight({ to: built.router, data: built.calldata, value: 0n, account: owner });
@@ -442,6 +444,7 @@ export class Primitives {
       void this.settleDirect(txHash, portfolio);
       return { ok: true, mode: "executed", primitive: "swap", txHash, detail };
     } catch (error) {
+      this.logger.warn({ tokenIn, tokenOut, err: error instanceof Error ? error.message : String(error) }, "aggregator swap execute failed");
       return { ok: false, primitive: "swap", stage: "execute", reason: error instanceof Error ? error.message : String(error) };
     }
   }
