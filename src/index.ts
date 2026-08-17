@@ -160,7 +160,7 @@ async function main() {
     blockIndexer.start(); // THE STARTING POINT: derive prices/pools/tokens from every block → DB (everything reads the DB)
     walletHoldings.start(); // keyless direct-from-chain wallet token holdings for the dashboard
     displayPrices.start(); // Lane A: batch-refresh indicative token prices into DB (dashboard reads cache, never APIs)
-    dashboard = startDashboard({ config, db, chain, positions, logger });
+    dashboard = startDashboard({ config, db, chain, positions, logger, primitives, aggregator });
     if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED) autoflash.start();
     if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED && config.AUTOARM_ENABLED) autoArm.start();
     // On-chain HF monitor: watches ALL near-threshold positions (no cap), fires fresh at the cross.

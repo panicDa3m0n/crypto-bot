@@ -92,10 +92,11 @@ export class PositionManager {
     if (!p.filledAmountToken || !p.filledPrice) return;
     const token = p.token as Address; const base = p.baseToken as Address;
     const tokenDec = await this.decimals(token);
-    // Manual/tool-requested exit (close_position) — sell now via the SAME deterministic path, then clear.
+    // Manual/tool-requested exit (close_position) — sell now via the SAME deterministic path. The request
+    // is CLEARED only on a SUCCESSFUL sell (inside sell()), so a transient sim/RPC failure retries next
+    // tick instead of silently dropping the close (the bug that made LFI look "stuck" for hours).
     if (p.exitNowPct != null && p.exitNowPct > 0) {
-      await this.db.updatePositionPlan(p.id, { exitNowPct: null }).catch(() => undefined);
-      return this.sell(p, Math.min(100, p.exitNowPct), `CLOSE (manuale) ${Math.min(100, p.exitNowPct)}%`, tokenDec);
+      return this.sell(p, Math.min(100, p.exitNowPct), `CLOSE (manuale) ${Math.min(100, p.exitNowPct)}%`, tokenDec, true);
     }
     const baseUsd = await this.chain.tokenPrice(base).catch(() => 0);
     if (!(baseUsd > 0)) return;
@@ -126,8 +127,9 @@ export class PositionManager {
     }
   }
 
-  /** Executes a sell of `pct`% of the ORIGINAL filled amount; updates remaining + notifies. */
-  private async sell(p: PositionPlan, pct: number, reason: string, tokenDec: number): Promise<void> {
+  /** Executes a sell of `pct`% of the ORIGINAL filled amount; updates remaining + notifies. When
+   * `wasManualExit`, clears the pending exit request ONLY on success so a transient failure retries. */
+  private async sell(p: PositionPlan, pct: number, reason: string, tokenDec: number, wasManualExit = false): Promise<void> {
     const token = p.token as Address; const base = p.baseToken as Address;
     const sellTokens = (p.filledAmountToken ?? 0) * (pct / 100);
     const sellWei = BigInt(Math.floor(sellTokens * 10 ** tokenDec));
@@ -135,7 +137,7 @@ export class PositionManager {
     const exec = await this.primitives.swapV3(token, base, sellWei, 10, true).catch((e) => ({ ok: false as const, primitive: "swap", stage: "execute" as const, reason: e instanceof Error ? e.message : String(e) }));
     if (exec.ok && exec.mode === "executed") {
       const remaining = Math.max(0, p.remainingPct - pct);
-      await this.db.updatePositionPlan(p.id, { remainingPct: remaining, status: remaining <= 0.01 ? "closed" : "open", lastResult: reason });
+      await this.db.updatePositionPlan(p.id, { remainingPct: remaining, status: remaining <= 0.01 ? "closed" : "open", lastResult: reason, ...(wasManualExit ? { exitNowPct: null } : {}) });
       await this.db.addJournal("action", `POSITION #${p.id} ${reason}: venduto ${pct}% di ${p.symbol ?? p.token.slice(0, 8)} (rimane ${remaining.toFixed(0)}%)`, { plan: p.id, tx: (exec as { txHash?: string }).txHash }, "position").catch(() => undefined);
       this.wake(`position:${p.id}`, `Position #${p.id} (${p.symbol ?? "token"}): ${reason} — sold ${pct}%, ${remaining.toFixed(0)}% left. Review and re-plan if needed.`);
     } else {

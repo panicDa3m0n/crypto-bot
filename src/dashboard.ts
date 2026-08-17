@@ -9,7 +9,7 @@ import { selfState, selfContext } from "./self.js";
 import { computeGains } from "./gains.js";
 import { SCARLET_STREAM } from "./scarlet/agent.js";
 
-type Deps = { config: Config; db: Database; chain: BerachainClients; positions: PositionService; logger: Logger };
+type Deps = { config: Config; db: Database; chain: BerachainClients; positions: PositionService; logger: Logger; primitives?: import("./primitives.js").Primitives; aggregator?: import("./aggregator.js").Aggregator };
 
 /**
  * Read-only human dashboard (staged restyle). Right now: a lean wallet overview + an Explorer
@@ -81,6 +81,30 @@ export function startDashboard(deps: Deps): { close: () => void } | undefined {
         const cycles = order.map((c) => { const g = byCycle.get(c)!; const entries = g.entries.slice().reverse(); return { cycle: g.cycle, at: entries[0]?.at ?? g.at, reason: g.reason, entries }; });
         res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "access-control-allow-origin": "*" });
         res.end(JSON.stringify({ enabled: deps.config.SCARLET_V2_ENABLED, cycles, now: new Date().toISOString() }));
+        return;
+      }
+      if (url.pathname.startsWith("/api/route-probe")) {
+        // Route diagnostics using the LIVE system objects (real primitives + aggregator), NOT a separate
+        // simulation: for a token, does the current V3-only path find buy/sell routes, and does the
+        // cross-venue aggregator? Reveals exactly where the engine's narrow routing loses good tokens.
+        const token = (url.searchParams.get("token") || "").toLowerCase();
+        if (!/^0x[a-f0-9]{40}$/.test(token) || !deps.primitives || !deps.aggregator) { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "token non valido o probe non disponibile" })); return; }
+        const weth = (deps.config.WBERA_ADDRESS as `0x${string}`);
+        const t = token as `0x${string}`;
+        const wethIn = 10n ** 15n; // ~0.001 WETH (~$2) buy probe
+        const out = (r: unknown): string | null => { const d = (r as { detail?: { expectedOut?: string } })?.detail; return d?.expectedOut ?? null; };
+        const check = await deps.primitives.checkToken(t).catch((e) => ({ error: String(e) }));
+        const v3buy = await deps.primitives.swapV3(weth, t, wethIn, 8, false).catch((e) => ({ ok: false as const, reason: String(e) }));
+        const aggBuy = await deps.aggregator.quoteResult(weth, t, wethIn).catch(() => ({ status: "error" as const, quote: null }));
+        // Sell probe: size from whichever buy route produced tokens (round-trip realism).
+        const v3buyOut = "ok" in v3buy && v3buy.ok ? out(v3buy) : null;
+        const tokAmt = v3buyOut ? BigInt(v3buyOut) : (aggBuy.quote?.amountOut ?? 0n);
+        const v3sell = tokAmt > 0n ? await deps.primitives.swapV3(t, weth, tokAmt, 8, false).catch((e) => ({ ok: false as const, reason: String(e) })) : null;
+        const aggSell = tokAmt > 0n ? await deps.aggregator.quoteResult(t, weth, tokAmt).catch(() => ({ status: "error" as const, quote: null })) : null;
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+        res.end(JSON.stringify({ token, check,
+          v3: { buy: { ok: "ok" in v3buy && v3buy.ok, reason: (v3buy as { reason?: string }).reason ?? null, out: v3buyOut }, sell: v3sell ? { ok: "ok" in v3sell && v3sell.ok, reason: (v3sell as { reason?: string }).reason ?? null, out: out(v3sell) } : null },
+          agg: { buy: { status: aggBuy.status, out: aggBuy.quote?.amountOut?.toString() ?? null }, sell: aggSell ? { status: aggSell.status, out: aggSell.quote?.amountOut?.toString() ?? null } : null } }));
         return;
       }
       if (url.pathname.startsWith("/api/positions")) {
