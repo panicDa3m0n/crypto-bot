@@ -127,10 +127,17 @@ export async function dispatchActionTool(name: string, args: Record<string, unkn
       if (!Number.isInteger(id)) return { error: "positionId non valido" };
       const plan = await deps.db.getPositionPlan(id).catch(() => undefined);
       if (!plan || plan.chainId !== chainId) return { error: `posizione #${id} non trovata` };
-      if (plan.status !== "open") return { error: `posizione #${id} non è aperta (stato: ${plan.status}) — nulla da vendere` };
+      if (["closed", "cancelled"].includes(plan.status)) return { error: `posizione #${id} già ${plan.status}` };
       const pct = Math.min(100, Math.max(1, numOrNull(args.pct) ?? 100));
-      await deps.db.updatePositionPlan(id, { exitNowPct: pct });
-      return { ok: true, positionId: id, message: `Il sistema venderà ${pct}% di ${plan.symbol ?? "questa posizione"} al prossimo tick e ti aggiornerà.` };
+      const spent = plan.filledPrice != null && plan.remainingPct > 0; // funds emitted → must recover
+      if (spent) {
+        // Sell to RECOVER the credit — routed through the engine's deterministic exit (retries if transient).
+        await deps.db.updatePositionPlan(id, { status: "open", exitNowPct: pct });
+        return { ok: true, positionId: id, recovering: true, message: `Recupero credito: il sistema vende ${pct}% di ${plan.symbol ?? "questa posizione"} al prossimo tick e riaccredita il ricavato.` };
+      }
+      // Never filled → just cancel; no funds were spent.
+      await deps.db.updatePositionPlan(id, { status: "cancelled", exitNowPct: null, lastResult: "annullata da Scarlet (mai riempita — nessun credito da recuperare)" });
+      return { ok: true, positionId: id, cancelled: true, message: `Strategia #${id} annullata: non era stata riempita, nessun fondo speso.` };
     }
 
     case "adjust_position": {
@@ -138,10 +145,14 @@ export async function dispatchActionTool(name: string, args: Record<string, unkn
       if (!Number.isInteger(id)) return { error: "positionId non valido" };
       const plan = await deps.db.getPositionPlan(id).catch(() => undefined);
       if (!plan || plan.chainId !== chainId) return { error: `posizione #${id} non trovata` };
+      if (["closed", "cancelled"].includes(plan.status)) return { error: `posizione #${id} già ${plan.status}` };
       const sl = numOrNull(args.stopLossPct), tp = numOrNull(args.takeProfitPct);
-      if (sl == null && tp == null) return { error: "specifica almeno stopLossPct o takeProfitPct" };
-      await deps.db.updatePositionPlan(id, { ...(sl != null ? { stopLossPct: sl } : {}), ...(tp != null ? { takeProfitPct: tp } : {}) });
-      return { ok: true, positionId: id, stopLossPct: sl ?? plan.stopLossPct, takeProfitPct: tp ?? plan.takeProfitPct, message: "Stop/target aggiornati e riarmati dal sistema." };
+      const unblock = plan.status === "error"; // adjusting an errored strategy UNBLOCKS it (retry)
+      if (sl == null && tp == null && !unblock) return { error: "specifica almeno stopLossPct o takeProfitPct" };
+      const resume = unblock ? { status: plan.filledPrice != null ? "open" : "entering", entryAttempts: 0, exitNowPct: null } : {};
+      await deps.db.updatePositionPlan(id, { ...(sl != null ? { stopLossPct: sl } : {}), ...(tp != null ? { takeProfitPct: tp } : {}), ...resume });
+      return { ok: true, positionId: id, unblocked: unblock, stopLossPct: sl ?? plan.stopLossPct, takeProfitPct: tp ?? plan.takeProfitPct,
+        message: unblock ? "Strategia SBLOCCATA e rimessa in esecuzione dal sistema (con lo stop/target aggiornati)." : "Stop/target aggiornati e riarmati." };
     }
 
     default:

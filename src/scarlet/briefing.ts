@@ -51,10 +51,17 @@ export async function buildTradingBriefing(db: Database, positionsSvc: PositionS
   };
 
   // Programmed positions the deterministic manager auto-executes (entry/stop-loss/take-profit/partials).
-  const plansRaw = await db.activePositionPlans(config.CHAIN_ID).catch(() => []);
+  const [plansRaw, erroredRaw] = await Promise.all([
+    db.activePositionPlans(config.CHAIN_ID).catch(() => []),
+    db.erroredPositionPlans(config.CHAIN_ID).catch(() => [])
+  ]);
   const plans = {
-    note: plansRaw.length ? "Le tue posizioni PROGRAMMATE che il sistema esegue per te ai prezzi live (entry/stop/take)." : "Nessuna posizione programmata. Usa un piano così il sistema gestisce entry ed uscite senza che tu vigili.",
-    list: plansRaw.map((p) => ({ id: p.id, symbol: p.symbol, status: p.status, entryKind: p.entryKind, entryPrice: p.entryPrice, amountUsd: p.entryAmountUsd, filledPrice: p.filledPrice, remainingPct: p.remainingPct, stopLossPct: p.stopLossPct, takeProfitPct: p.takeProfitPct, lastResult: p.lastResult }))
+    note: plansRaw.length ? "Le tue posizioni PROGRAMMATE che il sistema esegue ai prezzi live (entry/stop/take)." : "Nessuna posizione programmata.",
+    list: plansRaw.map((p) => ({ id: p.id, symbol: p.symbol, status: p.status, entryKind: p.entryKind, entryPrice: p.entryPrice, amountUsd: p.entryAmountUsd, filledPrice: p.filledPrice, remainingPct: p.remainingPct, stopLossPct: p.stopLossPct, takeProfitPct: p.takeProfitPct, lastResult: p.lastResult })),
+    ...(erroredRaw.length ? { blocked: {
+      note: "⚠️ STRATEGIE IN ERRORE — bloccate, NON gestite dal sistema. DEVI agire: `adjust_position` per modificarle e rimetterle in esecuzione, oppure `close_position` per chiuderle (se avevano già comprato, recupera il credito vendendo).",
+      list: erroredRaw.map((p) => ({ id: p.id, symbol: p.symbol, giaComprata: p.filledPrice != null, errore: p.lastResult }))
+    } } : {})
   };
 
   // Watchlist — placeholder until the dedicated gradino (token tenuti d'occhio con tesi + trigger).
@@ -112,6 +119,7 @@ export async function buildTradingBriefing(db: Database, positionsSvc: PositionS
     pos: positionsRaw.map((p) => p.id).sort(),
     hold: untracked.map((h) => h.token).sort(),
     plans: plansRaw.map((p) => `${p.id}:${p.status}`).sort(),
+    blocked: erroredRaw.map((p) => p.id).sort(), // a strategy going to error must wake her to act
     fresh: justLaunched.map((p) => p.newToken).sort()
   });
 

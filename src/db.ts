@@ -14,7 +14,7 @@ export type PositionPlan = {
   filledAmountToken: number | null; filledPrice: number | null; filledAt: string | null;
   stopLossPct: number | null; takeProfitPct: number | null;
   partials: Array<{ atPct: number; sellPct: number; done?: boolean }>;
-  remainingPct: number; note: string | null; lastResult: string | null; exitNowPct: number | null;
+  remainingPct: number; note: string | null; lastResult: string | null; exitNowPct: number | null; entryAttempts: number;
 };
 function rowToPlan(r: Record<string, unknown>): PositionPlan {
   const num = (v: unknown): number | null => v === null || v === undefined ? null : Number(v);
@@ -23,7 +23,7 @@ function rowToPlan(r: Record<string, unknown>): PositionPlan {
     status: String(r.status), entryKind: String(r.entry_kind), entryPrice: num(r.entry_price), entryAmountUsd: Number(r.entry_amount_usd),
     filledAmountToken: num(r.filled_amount_token), filledPrice: num(r.filled_price), filledAt: r.filled_at ? new Date(r.filled_at as string).toISOString() : null,
     stopLossPct: num(r.stop_loss_pct), takeProfitPct: num(r.take_profit_pct), partials: (r.partials as PositionPlan["partials"]) ?? [],
-    remainingPct: Number(r.remaining_pct), note: (r.note as string) ?? null, lastResult: (r.last_result as string) ?? null, exitNowPct: num(r.exit_now_pct)
+    remainingPct: Number(r.remaining_pct), note: (r.note as string) ?? null, lastResult: (r.last_result as string) ?? null, exitNowPct: num(r.exit_now_pct), entryAttempts: Number(r.entry_attempts ?? 0)
   };
 }
 
@@ -539,6 +539,9 @@ export class Database {
       -- Manual/tool-requested immediate exit: the engine sells this % of the original fill on its next
       -- tick, then clears it (so close_position routes through the SAME deterministic execution path).
       ALTER TABLE position_plans ADD COLUMN IF NOT EXISTS exit_now_pct NUMERIC;
+      -- Retry counter for entries. A strategy that fails hard (on-chain revert) or exhausts retries goes
+      -- to status 'error' (blocked): the engine stops touching it; Scarlet sees it and must modify or close.
+      ALTER TABLE position_plans ADD COLUMN IF NOT EXISTS entry_attempts INTEGER NOT NULL DEFAULT 0;
       CREATE TABLE IF NOT EXISTS lending_positions (
         chain_id INTEGER NOT NULL,
         protocol TEXT NOT NULL,          -- family: morpho | aave-v3 | compound | ...
@@ -680,6 +683,11 @@ export class Database {
     const r = await this.pool.query(`SELECT * FROM position_plans WHERE chain_id=$1 AND status IN ('pending-entry','entering','open','exiting') ORDER BY created_at`, [chainId]);
     return r.rows.map(rowToPlan);
   }
+  /** Blocked (errored) plans — the engine skips them; the briefing surfaces them so Scarlet acts. */
+  async erroredPositionPlans(chainId: number): Promise<Array<PositionPlan>> {
+    const r = await this.pool.query(`SELECT * FROM position_plans WHERE chain_id=$1 AND status='error' ORDER BY updated_at DESC LIMIT 20`, [chainId]);
+    return r.rows.map(rowToPlan);
+  }
   async countOpenPositionPlans(chainId: number): Promise<number> {
     const r = await this.pool.query<{ n: string }>(`SELECT count(*)::text n FROM position_plans WHERE chain_id=$1 AND status IN ('pending-entry','entering','open','exiting')`, [chainId]);
     return Number(r.rows[0].n);
@@ -692,9 +700,9 @@ export class Database {
     const r = await this.pool.query(`SELECT * FROM position_plans WHERE chain_id=$1 ORDER BY created_at DESC LIMIT $2`, [chainId, limit]);
     return r.rows.map(rowToPlan);
   }
-  async updatePositionPlan(id: number, fields: Partial<{ status: string; filledAmountToken: number; filledPrice: number; filledAt: string; remainingPct: number; lastResult: string; stopLossPct: number | null; takeProfitPct: number | null; exitNowPct: number | null; partials: unknown }>): Promise<void> {
+  async updatePositionPlan(id: number, fields: Partial<{ status: string; filledAmountToken: number; filledPrice: number; filledAt: string; remainingPct: number; lastResult: string; stopLossPct: number | null; takeProfitPct: number | null; exitNowPct: number | null; entryAttempts: number; partials: unknown }>): Promise<void> {
     const sets: string[] = []; const vals: unknown[] = [id]; let i = 2;
-    const map: Record<string, string> = { status: "status", filledAmountToken: "filled_amount_token", filledPrice: "filled_price", filledAt: "filled_at", remainingPct: "remaining_pct", lastResult: "last_result", stopLossPct: "stop_loss_pct", takeProfitPct: "take_profit_pct", exitNowPct: "exit_now_pct" };
+    const map: Record<string, string> = { status: "status", filledAmountToken: "filled_amount_token", filledPrice: "filled_price", filledAt: "filled_at", remainingPct: "remaining_pct", lastResult: "last_result", stopLossPct: "stop_loss_pct", takeProfitPct: "take_profit_pct", exitNowPct: "exit_now_pct", entryAttempts: "entry_attempts" };
     for (const [k, col] of Object.entries(map)) { const v = (fields as Record<string, unknown>)[k]; if (v !== undefined) { sets.push(`${col}=$${i++}`); vals.push(v); } }
     if (fields.partials !== undefined) { sets.push(`partials=$${i++}`); vals.push(jsonParam(fields.partials)); }
     if (!sets.length) return;

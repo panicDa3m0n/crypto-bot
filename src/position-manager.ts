@@ -16,6 +16,7 @@ import type { Primitives } from "./primitives.js";
  * plan far from reality just idles. Scarlet is told to plan only what can plausibly trigger soon.
  */
 const DEC = parseAbi(["function decimals() view returns (uint8)", "function balanceOf(address) view returns (uint256)"]);
+const MAX_ENTRY_ATTEMPTS = 4; // after this many transient entry failures, block the strategy (status 'error')
 
 export class PositionManager {
   private timer?: NodeJS.Timeout;
@@ -69,21 +70,34 @@ export class PositionManager {
     if (baseAmount <= 0n) return;
     // Simulate the buy to read the executable token price now.
     const sim = await this.primitives.swapBest(base, token, baseAmount, 8, false).catch(() => undefined);
-    if (!sim || !sim.ok || sim.mode !== "simulated") { return; } // not routable yet
+    if (!sim || !sim.ok || sim.mode !== "simulated") { return this.failEntry(p, sim && "reason" in sim ? String(sim.reason) : "non instradabile ora"); }
     const tokenDec = await this.decimals(token);
     const tokenOut = Number(BigInt(String((sim.detail as { expectedOut?: string }).expectedOut ?? "0"))) / 10 ** tokenDec;
-    if (!(tokenOut > 0)) return;
+    if (!(tokenOut > 0)) return this.failEntry(p, "quote di acquisto nulla");
     const priceNow = p.entryAmountUsd / tokenOut; // USD per token
-    if (p.entryKind === "limit" && p.entryPrice != null && priceNow > p.entryPrice) return; // wait for the dip
+    if (p.entryKind === "limit" && p.entryPrice != null && priceNow > p.entryPrice) return; // wait for the dip — NOT a failure
     // Ensure we hold enough base (wrap native → WETH if the base is the wrapped-native).
     await this.ensureBase(base, baseAmount).catch(() => undefined);
     const exec = await this.primitives.swapBest(base, token, baseAmount, 8, true).catch((e) => ({ ok: false as const, primitive: "swap", stage: "execute" as const, reason: e instanceof Error ? e.message : String(e) }));
     if (exec.ok && exec.mode === "executed") {
-      await this.db.updatePositionPlan(p.id, { status: "open", filledAmountToken: tokenOut, filledPrice: priceNow, filledAt: new Date().toISOString(), lastResult: `filled ${tokenOut.toFixed(4)} ${p.symbol ?? ""} @ $${priceNow.toPrecision(4)}` });
+      await this.db.updatePositionPlan(p.id, { status: "open", entryAttempts: 0, filledAmountToken: tokenOut, filledPrice: priceNow, filledAt: new Date().toISOString(), lastResult: `filled ${tokenOut.toFixed(4)} ${p.symbol ?? ""} @ $${priceNow.toPrecision(4)}` });
       await this.db.addJournal("action", `POSITION #${p.id} ENTRY riempita: ${tokenOut.toFixed(4)} ${p.symbol ?? p.token.slice(0, 8)} @ $${priceNow.toPrecision(4)} (${p.entryAmountUsd}$)`, { plan: p.id, tx: (exec as { txHash?: string }).txHash }, "position").catch(() => undefined);
       this.wake(`position:${p.id}`, `Position #${p.id} (${p.symbol ?? "token"}) ENTRY filled @ $${priceNow.toPrecision(4)}. Stop ${p.stopLossPct ?? "—"}% / TP ${p.takeProfitPct ?? "—"}% now armed and auto-managed.`);
     } else {
-      await this.db.updatePositionPlan(p.id, { lastResult: `entry failed: ${"reason" in exec ? exec.reason.slice(0, 100) : "unknown"}` });
+      await this.failEntry(p, "reason" in exec ? exec.reason : "sconosciuto");
+    }
+  }
+
+  /** Entry failure → retry on a transient error, but BLOCK (status 'error') on an on-chain revert or after
+   * exhausting retries. A blocked strategy stops burning gas and is surfaced to Scarlet to modify/close. */
+  private async failEntry(p: PositionPlan, reason: string): Promise<void> {
+    const hard = /revert|STF|insufficient|honeypot|non vendibile|transfer/i.test(reason);
+    const attempts = (p.entryAttempts ?? 0) + 1;
+    if (hard || attempts >= MAX_ENTRY_ATTEMPTS) {
+      await this.db.updatePositionPlan(p.id, { status: "error", entryAttempts: attempts, lastResult: `ENTRY BLOCCATA (${hard ? "revert on-chain" : `${attempts} tentativi falliti`}): ${reason.slice(0, 120)}` });
+      this.wake(`position-error:${p.id}`, `Strategia #${p.id} (${p.symbol ?? "token"}) BLOCCATA in errore all'ingresso: ${reason.slice(0, 80)}. Modificala (adjust_position) o chiudila (close_position).`);
+    } else {
+      await this.db.updatePositionPlan(p.id, { entryAttempts: attempts, lastResult: `entry ritenta (${attempts}/${MAX_ENTRY_ATTEMPTS}): ${reason.slice(0, 100)}` });
     }
   }
 
@@ -141,8 +155,16 @@ export class PositionManager {
       await this.db.addJournal("action", `POSITION #${p.id} ${reason}: venduto ${pct}% di ${p.symbol ?? p.token.slice(0, 8)} (rimane ${remaining.toFixed(0)}%)`, { plan: p.id, tx: (exec as { txHash?: string }).txHash }, "position").catch(() => undefined);
       this.wake(`position:${p.id}`, `Position #${p.id} (${p.symbol ?? "token"}): ${reason} — sold ${pct}%, ${remaining.toFixed(0)}% left. Review and re-plan if needed.`);
     } else {
-      await this.db.updatePositionPlan(p.id, { lastResult: `${reason} — SELL FAILED: ${"reason" in exec ? exec.reason.slice(0, 80) : "unknown"}` });
-      this.wake(`position-stuck:${p.id}`, `Position #${p.id} (${p.symbol ?? "token"}) hit ${reason} but the SELL FAILED (likely honeypot/locked). Manual attention needed.`);
+      const why = "reason" in exec ? exec.reason : "unknown";
+      const hard = /revert|STF|insufficient|transfer/i.test(why);
+      if (hard) {
+        // On-chain revert (e.g. sell-tax/honeypot) → BLOCK. Keep it filled+open-value but status 'error'.
+        await this.db.updatePositionPlan(p.id, { status: "error", exitNowPct: null, lastResult: `VENDITA BLOCCATA (revert): ${why.slice(0, 110)}` });
+        this.wake(`position-error:${p.id}`, `Strategia #${p.id} (${p.symbol ?? "token"}): la VENDITA reverta on-chain (${why.slice(0, 60)}) — probabile sell-tax. BLOCCATA: modifica o chiudi.`);
+      } else {
+        // Transient (RPC/route) → keep the pending exit and retry next tick (idempotent close).
+        await this.db.updatePositionPlan(p.id, { lastResult: `${reason} — vendita ritenta (transitorio): ${why.slice(0, 80)}` });
+      }
     }
   }
 
