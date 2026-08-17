@@ -403,6 +403,49 @@ export class Primitives {
     }
   }
 
+  /** Best-route swap: Uniswap V3 first (direct, proven), and ONLY when V3 has no pool for the pair,
+   * fall back to the cross-venue aggregator (KyberSwap) — so a token that lives on V4/Aerodrome/etc.
+   * (which the gate now admits) is still executable. A non-routing failure (disabled/execute) is NOT
+   * retried on the aggregator (never risk a double broadcast). */
+  async swapBest(tokenIn: Address, tokenOut: Address, amountIn: bigint, maxSlippagePct: number, act: boolean): Promise<ActionOutcome> {
+    const v3 = await this.swapV3(tokenIn, tokenOut, amountIn, maxSlippagePct, act);
+    if (v3.ok || v3.stage !== "build") return v3;
+    const agg = await this.swapViaAggregator(tokenIn, tokenOut, amountIn, maxSlippagePct, act);
+    return agg.ok ? agg : v3; // if the aggregator can't route either, surface the V3 reason
+  }
+
+  /** Cross-venue swap via the aggregator: quote → build calldata → approve → send. Same execution
+   * accounting (decision + execution record + settle) as swapV3, so P&L/gas still hit the ledger. */
+  async swapViaAggregator(tokenIn: Address, tokenOut: Address, amountIn: bigint, maxSlippagePct: number, act: boolean): Promise<ActionOutcome> {
+    const owner = this.owner();
+    if (!owner) return { ok: false, primitive: "swap", stage: "build", reason: "no wallet configured" };
+    if (!this.aggregator) return { ok: false, primitive: "swap", stage: "build", reason: "aggregator unavailable" };
+    const q = await this.aggregator.quoteResult(tokenIn, tokenOut, amountIn);
+    if (q.status !== "ok" || !q.quote) return { ok: false, primitive: "swap", stage: "build", reason: `aggregator: ${q.status}` };
+    const detail = { tokenIn, tokenOut, amountIn: amountIn.toString(), expectedOut: q.quote.amountOut.toString(), via: "aggregator" };
+    if (!act) return { ok: true, mode: "simulated", primitive: "swap", detail };
+    if (!this.config.EXECUTION_ENABLED) return { ok: false, primitive: "swap", stage: "disabled", reason: "execution is disabled; only simulation is available" };
+    const guard = await this.preSendGuard(); if (!guard.ok) return { ok: false, primitive: "swap", stage: "execute", reason: guard.reason };
+    const slippageBps = Math.round(Math.max(0.1, Math.min(50, maxSlippagePct)) * 100);
+    const built = await this.aggregator.swapCalldata(tokenIn, tokenOut, amountIn, owner, slippageBps);
+    if (!built) return { ok: false, primitive: "swap", stage: "build", reason: "aggregator calldata build failed" };
+    try {
+      await this.approveDirect(tokenIn, built.router, amountIn);
+      const pf = await this.chain.preflight({ to: built.router, data: built.calldata, value: 0n, account: owner });
+      const portfolio = await this.positions.reconcile(await this.chain.portfolio(await this.db.dailyLossUsd(), true));
+      const decisionId = randomUUID();
+      await this.db.saveDecision(decisionId, { action: "ENTER", strategyId: `agg:${tokenIn}->${tokenOut}`, rationale: `aggregator swap ${amountIn} ${tokenIn} -> ${tokenOut}`, confidence: 1, riskUsd: 0, expectedNetProfitUsd: 0, capitalUsd: 0, expiresAt: new Date(Date.now() + 300_000).toISOString(), evidence: [], needsResearch: [] }, "agent_action", { primitive: "swap", intent: detail }, portfolio, { primitive: "swap", intent: detail }, null);
+      const txHash = await this.chain.send(built.router, built.calldata, 0n, pf.gas * 125n / 100n, pf.gasPriceWei);
+      await this.db.recordExecution({ decisionId, protocolId: `agg:${tokenIn.toLowerCase()}:${tokenOut.toLowerCase()}`, txHash, target: built.router, calldata: built.calldata, valueWei: 0n, gasLimit: pf.gas, beraUsdAtSubmission: portfolio.beraUsd, status: "submitted" });
+      await this.db.updateDecision(decisionId, "submitted", { hash: txHash });
+      this.logger.warn({ tokenIn, tokenOut, router: built.router, txHash }, "Scarlet aggregator swap broadcast");
+      void this.settleDirect(txHash, portfolio);
+      return { ok: true, mode: "executed", primitive: "swap", txHash, detail };
+    } catch (error) {
+      return { ok: false, primitive: "swap", stage: "execute", reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   /** Direct exact approval to a spender (no allowlist), waiting for it to mine. Used by
    * swapV3 so it works for ANY token (a fresh snipe target has no allowlisted spender). */
   private async approveDirect(token: Address, spender: Address, amount: bigint): Promise<void> {

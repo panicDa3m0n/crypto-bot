@@ -68,7 +68,7 @@ export class PositionManager {
     const baseAmount = BigInt(Math.floor((p.entryAmountUsd / baseUsd) * 10 ** baseDec));
     if (baseAmount <= 0n) return;
     // Simulate the buy to read the executable token price now.
-    const sim = await this.primitives.swapV3(base, token, baseAmount, 8, false).catch(() => undefined);
+    const sim = await this.primitives.swapBest(base, token, baseAmount, 8, false).catch(() => undefined);
     if (!sim || !sim.ok || sim.mode !== "simulated") { return; } // not routable yet
     const tokenDec = await this.decimals(token);
     const tokenOut = Number(BigInt(String((sim.detail as { expectedOut?: string }).expectedOut ?? "0"))) / 10 ** tokenDec;
@@ -77,7 +77,7 @@ export class PositionManager {
     if (p.entryKind === "limit" && p.entryPrice != null && priceNow > p.entryPrice) return; // wait for the dip
     // Ensure we hold enough base (wrap native → WETH if the base is the wrapped-native).
     await this.ensureBase(base, baseAmount).catch(() => undefined);
-    const exec = await this.primitives.swapV3(base, token, baseAmount, 8, true).catch((e) => ({ ok: false as const, primitive: "swap", stage: "execute" as const, reason: e instanceof Error ? e.message : String(e) }));
+    const exec = await this.primitives.swapBest(base, token, baseAmount, 8, true).catch((e) => ({ ok: false as const, primitive: "swap", stage: "execute" as const, reason: e instanceof Error ? e.message : String(e) }));
     if (exec.ok && exec.mode === "executed") {
       await this.db.updatePositionPlan(p.id, { status: "open", filledAmountToken: tokenOut, filledPrice: priceNow, filledAt: new Date().toISOString(), lastResult: `filled ${tokenOut.toFixed(4)} ${p.symbol ?? ""} @ $${priceNow.toPrecision(4)}` });
       await this.db.addJournal("action", `POSITION #${p.id} ENTRY riempita: ${tokenOut.toFixed(4)} ${p.symbol ?? p.token.slice(0, 8)} @ $${priceNow.toPrecision(4)} (${p.entryAmountUsd}$)`, { plan: p.id, tx: (exec as { txHash?: string }).txHash }, "position").catch(() => undefined);
@@ -104,7 +104,7 @@ export class PositionManager {
     if (heldTokens <= 0) { await this.db.updatePositionPlan(p.id, { status: "closed" }); return; }
     const heldWei = BigInt(Math.floor(heldTokens * 10 ** tokenDec));
     // Simulate selling the held amount to read the REAL current exit price.
-    const sim = await this.primitives.swapV3(token, base, heldWei, 8, false).catch(() => undefined);
+    const sim = await this.primitives.swapBest(token, base, heldWei, 8, false).catch(() => undefined);
     if (!sim || !sim.ok || sim.mode !== "simulated") { await this.db.updatePositionPlan(p.id, { lastResult: "can't sell right now (no route / honeypot) — watching" }); return; }
     const baseOut = Number(BigInt(String((sim.detail as { expectedOut?: string }).expectedOut ?? "0"))) / 10 ** (await this.decimals(base));
     const priceNow = (baseOut * baseUsd) / heldTokens; // USD per token, executable
@@ -134,7 +134,7 @@ export class PositionManager {
     const sellTokens = (p.filledAmountToken ?? 0) * (pct / 100);
     const sellWei = BigInt(Math.floor(sellTokens * 10 ** tokenDec));
     if (sellWei <= 0n) return;
-    const exec = await this.primitives.swapV3(token, base, sellWei, 10, true).catch((e) => ({ ok: false as const, primitive: "swap", stage: "execute" as const, reason: e instanceof Error ? e.message : String(e) }));
+    const exec = await this.primitives.swapBest(token, base, sellWei, 10, true).catch((e) => ({ ok: false as const, primitive: "swap", stage: "execute" as const, reason: e instanceof Error ? e.message : String(e) }));
     if (exec.ok && exec.mode === "executed") {
       const remaining = Math.max(0, p.remainingPct - pct);
       await this.db.updatePositionPlan(p.id, { remainingPct: remaining, status: remaining <= 0.01 ? "closed" : "open", lastResult: reason, ...(wasManualExit ? { exitNowPct: null } : {}) });
