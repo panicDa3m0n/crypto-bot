@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
-import { encodeAbiParameters, encodeFunctionData, maxUint256, parseAbi, parseUnits, type Address } from "viem";
+import { decodeAbiParameters, encodeAbiParameters, encodeFunctionData, maxUint256, parseAbi, parseUnits, type Address } from "viem";
 import { ATOMIC_EXECUTOR_BYTECODE } from "./organs.js";
+import { HONEYPOT_PROBE_BYTECODE } from "./honeypot-probe.js";
 
 import { Erc4626Adapter, ExactAllowanceAdapter, WberaAdapter, type ProposedCall } from "./adapters.js";
 import { erc20Abi, type BerachainClients } from "./chain.js";
@@ -13,6 +14,22 @@ import type { PositionService } from "./positions.js";
 import type { Aggregator } from "./aggregator.js";
 
 const previewAbi = parseAbi(["function previewDeposit(uint256 assets) view returns (uint256 shares)"]);
+
+/** Pull the raw revert data (0x…) out of a viem/RPC error, whatever nesting the provider uses. */
+function extractRevertData(err: unknown): string | null {
+  const seen = new Set<unknown>(); const stack: unknown[] = [err];
+  while (stack.length) {
+    const o = stack.pop();
+    if (!o || typeof o !== "object" || seen.has(o)) continue; seen.add(o);
+    for (const k of ["data", "details", "cause", "error", "info", "value"]) {
+      const v = (o as Record<string, unknown>)[k];
+      if (typeof v === "string" && v.startsWith("0x") && v.length > 2) return v;
+      if (v && typeof v === "object") stack.push(v);
+    }
+  }
+  const m = String((err as { message?: string })?.message ?? "").match(/0x[0-9a-fA-F]{8,}/);
+  return m ? m[0] : null;
+}
 
 /**
  * Scarlet's hands. Each primitive is intent -> trusted-adapter calldata ->
@@ -302,33 +319,68 @@ export class Primitives {
 
   // --- check_token: the parasite's survival gate (anti-rug / honeypot) --------
 
-  /** Safety gate before buying a token — CROSS-VENUE via the aggregator (not a single V3 pool, which
-   * gave false negatives on blue chips like cbBTC whose liquidity lives on other tiers/venues). Confirms
-   * a real BUY route AND, critically, a real SELL route for the acquired amount (honeypot detection).
-   * Retries on transient aggregator/RPC errors so a momentary failure is NOT mislabeled a honeypot — the
-   * distinction the LFI episode showed matters. `poolFeeBps` (deepest V3 tier) is informational only. */
+  /** Real round-trip honeypot probe: eth_call a contract-CREATION that buys the token then sells it via
+   * the V3 router, all in one simulated call. A transfer-blocking honeypot (which fools quote-based
+   * checks) reverts on the SELL leg. Returns the V3 buy/sell truth. null if the wallet isn't configured. */
+  private async honeypotProbe(token: Address): Promise<{ buyable: boolean; sellable: boolean; feeBps?: number; sellTaxPct?: number; reason?: string } | null> {
+    const owner = this.owner(); if (!owner) return null;
+    const weth = this.config.WBERA_ADDRESS as Address; const router = this.config.DEX_ROUTER as Address;
+    const probe = 10n ** 15n; // ~0.001 WETH
+    const args = encodeAbiParameters([{ type: "address" }, { type: "address" }, { type: "address" }, { type: "uint24[]" }], [token, weth, router, [100, 500, 2500, 3000, 10000]]);
+    const initcode = (HONEYPOT_PROBE_BYTECODE + args.slice(2)) as `0x${string}`;
+    try {
+      await (this.chain.fallback as unknown as { request: (a: unknown) => Promise<unknown> }).request({ method: "eth_call", params: [{ from: owner, data: initcode, value: "0x" + probe.toString(16) }, "latest", { [owner]: { balance: "0x" + (probe + 10n ** 18n).toString(16) } }] });
+      return { buyable: true, sellable: false, reason: "probe non ha revertato (inatteso)" };
+    } catch (err) {
+      const data = extractRevertData(err);
+      if (!data || data.length < 10) return { buyable: false, sellable: false, reason: "revert vuoto" };
+      if (data.startsWith("0x08c379a0")) { // Error(string)
+        let msg = ""; try { msg = decodeAbiParameters([{ type: "string" }], ("0x" + data.slice(10)) as `0x${string}`)[0] as string; } catch { /* keep empty */ }
+        if (/NO_BUY_ROUTE/.test(msg)) return { buyable: false, sellable: false, reason: "nessuna rotta V3 di acquisto" };
+        return { buyable: true, sellable: false, reason: `vendita reverta: ${msg || "revert"}` };
+      }
+      if (data.length >= 2 + 192) { // raw abi.encode(bought, back, fee) → constructor SUCCEEDED
+        try {
+          const [bought, back, fee] = decodeAbiParameters([{ type: "uint256" }, { type: "uint256" }, { type: "uint256" }], data as `0x${string}`);
+          const sellable = (back as bigint) > 0n;
+          const sellTaxPct = sellable ? Math.max(0, Math.round((1 - Number(back as bigint) / Number(probe)) * 100)) : undefined;
+          return { buyable: (bought as bigint) > 0n, sellable, feeBps: Number(fee as bigint), sellTaxPct, reason: "round-trip reale" };
+        } catch { return { buyable: true, sellable: false, reason: "revert non decodificabile" }; }
+      }
+      return { buyable: true, sellable: false, reason: "vendita reverta (honeypot?)" };
+    }
+  }
+
+  /** Safety gate before buying a token. PRIMARY oracle = a REAL round-trip sim (buy+sell via eth_call) —
+   * the only reliable way to catch transfer-blocking honeypots that fool quote-based checks. If the token
+   * has NO V3 route at all, fall back to the cross-venue aggregator quote (best-effort for V4/Aerodrome). */
   async checkToken(token: Address): Promise<{ token: string; safe: boolean; canSell: boolean; buyable: boolean; poolFeeBps?: number; reasons: string[] }> {
     const reasons: string[] = [];
     const base = this.config.WBERA_ADDRESS as Address;
-    const probe = 10n ** 15n; // ~0.001 wrapped-native (~$2): a small, realistic buy across all venues
-    if (!this.aggregator) { reasons.push("aggregatore non disponibile — impossibile verificare la vendibilità"); return { token, safe: false, canSell: false, buyable: false, reasons }; }
-    // 1) BUY route across ALL venues.
+    const probe = 10n ** 15n;
+    // 1) REAL round-trip (V3). The hard sellability guarantee.
+    const rt = await this.honeypotProbe(token).catch(() => null);
+    if (rt && rt.buyable) {
+      if (rt.sellable) {
+        if (rt.sellTaxPct != null && rt.sellTaxPct > 25) reasons.push(`⚠️ sell-tax ~${rt.sellTaxPct}%`);
+        reasons.push("round-trip reale OK: comprabile e vendibile (V3, verificato eseguendo il giro)");
+        return { token, safe: true, canSell: true, buyable: true, poolFeeBps: rt.feeBps, reasons };
+      }
+      reasons.push(`HONEYPOT: la VENDITA reale reverta (${rt.reason}) — NON comprare`);
+      return { token, safe: false, canSell: false, buyable: true, reasons };
+    }
+    // 2) No V3 route → aggregator quote (best-effort; V4/Aerodrome tokens can't be round-trip-sim'd here).
+    if (!this.aggregator) { reasons.push("nessuna rotta V3 e aggregatore non disponibile"); return { token, safe: false, canSell: false, buyable: false, reasons }; }
     const buy = await this.aggQuoteRetry(base, token, probe);
     if (buy.status !== "ok" || !buy.quote || buy.quote.amountOut <= 0n) {
-      reasons.push(buy.status === "error" ? "quote di acquisto non disponibile ora (aggregatore/RPC) — transitorio, riprova (NON è honeypot)" : "nessuna rotta di acquisto su alcun venue leggibile");
+      reasons.push(buy.status === "error" ? "quote di acquisto transitorio — riprova (NON è honeypot)" : "nessuna rotta di acquisto su alcun venue");
       return { token, safe: false, canSell: false, buyable: false, reasons };
     }
-    const bought = buy.quote.amountOut;
-    // 2) SELL route for exactly the acquired amount — the real honeypot test.
-    const sell = await this.aggQuoteRetry(token, base, bought);
+    const sell = await this.aggQuoteRetry(token, base, buy.quote.amountOut);
     const canSell = sell.status === "ok" && !!sell.quote && sell.quote.amountOut > 0n;
-    if (!canSell) reasons.push(sell.status === "error" ? "quote di vendita non disponibile ora — transitorio, riprova (non necessariamente honeypot)" : "ACQUISTO instradabile ma VENDITA no su alcun venue — forte segnale HONEYPOT");
-    else { const retention = Number(sell.quote!.amountOut) / Number(probe); if (retention < 0.75) reasons.push(`perdita round-trip ~${((1 - retention) * 100).toFixed(0)}%: probabile sell-tax pesante`); }
-    const buyable = true;
-    const poolFeeBps = await this.bestV3Fee(base, token).catch(() => undefined); // informational (dossier)
-    const safe = buyable && canSell;
-    if (safe && reasons.length === 0) reasons.push("acquistabile e vendibile su venue reali (aggregatore); dimensiona comunque con prudenza");
-    return { token, safe, canSell, buyable, poolFeeBps, reasons };
+    if (!canSell) reasons.push(sell.status === "error" ? "quote di vendita transitorio — riprova" : "ACQUISTO ma non VENDITA (aggregatore) — forte segnale HONEYPOT");
+    else reasons.push("solo-aggregatore (no pool V3): rotta buy+sell cross-venue OK, ma vendibilità NON garantita al 100% — size piccola");
+    return { token, safe: canSell, canSell, buyable: true, reasons };
   }
 
   /** Aggregator quote with retry: only a persistent no-route is real; a transient 'error' is retried,
