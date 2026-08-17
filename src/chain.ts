@@ -44,6 +44,8 @@ export class BerachainClients {
   readonly secondaryRpc: string;
   readonly precisionRpc: string;
   readonly fallbackRpc: string;
+  readonly executionRpc: string;
+  private readonly rl = new Map<string, { n: number; at: number }>();
   private readonly priceCache = new Map<string, number>();
   // Concurrency governor for the precision lane: cap in-flight reads so a burst (232 positions ×
   // several pools) can't trip the RPC's rate-limit in the first place. Excess reads queue.
@@ -63,6 +65,7 @@ export class BerachainClients {
     this.secondaryRpc = config.SECONDARY_RPC_HTTP_URL;
     this.precisionRpc = config.PRECISION_RPC_HTTP_URL ?? config.SECONDARY_RPC_HTTP_URL;
     this.fallbackRpc = config.FALLBACK_RPC_HTTP_URL ?? config.PRIMARY_RPC_HTTP_URL;
+    this.executionRpc = config.EXECUTION_RPC_HTTP_URL ?? this.fallbackRpc;
     this.primary = createPublicClient({ chain, transport: http(config.PRIMARY_RPC_HTTP_URL, { timeout: 12_000, retryCount: 1 }) });
     this.secondary = createPublicClient({ chain, transport: http(config.SECONDARY_RPC_HTTP_URL, { timeout: 12_000, retryCount: 1 }) });
     this.precision = createPublicClient({ chain, transport: http(this.precisionRpc, { timeout: 12_000, retryCount: 0, batch: true }) });
@@ -72,9 +75,20 @@ export class BerachainClients {
     if (account && config.WALLET_ADDRESS && account.address.toLowerCase() !== config.WALLET_ADDRESS.toLowerCase()) {
       throw new Error("The configured signer does not match WALLET_ADDRESS");
     }
+    // The signer broadcasts ONLY through the dedicated execution lane — never the read-contended primary.
     this.wallet = account
-      ? createWalletClient({ chain, account, transport: http(config.PRIMARY_RPC_HTTP_URL) })
+      ? createWalletClient({ chain, account, transport: http(this.executionRpc, { timeout: 12_000, retryCount: 1 }) })
       : undefined;
+    this.logger?.info({ primary: this.primaryRpc, secondary: this.secondaryRpc, precision: this.precisionRpc, fallback: this.fallbackRpc, execution: this.executionRpc, dedicatedExecution: this.executionRpc !== this.primaryRpc }, "RPC lanes");
+  }
+
+  /** Rate-limit meter: counts per-lane 429/limit hits and logs (throttled ≤1/30s per lane) so we can
+   * SEE which RPC blocks and when — the data to decide where to add a dedicated/paid endpoint. */
+  noteRateLimit(lane: string, url: string): void {
+    const e = this.rl.get(lane) ?? { n: 0, at: 0 };
+    e.n += 1;
+    if (Date.now() - e.at > 30_000) { this.logger?.warn({ lane, url, hits: e.n }, "RPC rate-limited"); e.at = Date.now(); }
+    this.rl.set(lane, e);
   }
 
   /**
@@ -91,6 +105,7 @@ export class BerachainClients {
         return await fn(this.precision);
       } catch (err) {
         if (!isTransientOrRateLimit(err)) throw err;
+        this.noteRateLimit("precision", this.precisionRpc);
         this.logger?.warn({ label, err: errMsg(err), from: this.precisionRpc, to: this.fallbackRpc }, "precision RPC rate-limited/errored → rerouting to fallback");
         return await fn(this.fallback);
       }
@@ -264,7 +279,8 @@ export class BerachainClients {
 
   async send(to: Address, data: Hex, value: bigint, gas: bigint, gasPriceWei: bigint): Promise<Hex> {
     if (!this.wallet) throw new Error("Wallet signer is unavailable");
-    return this.wallet.sendTransaction({ to, data, value, gas, gasPrice: gasPriceWei });
+    try { return await this.wallet.sendTransaction({ to, data, value, gas, gasPrice: gasPriceWei }); }
+    catch (err) { if (isTransientOrRateLimit(err)) this.noteRateLimit("execution", this.executionRpc); throw err; }
   }
 
   /** Current base fee per gas (EIP-1559) from the latest block. 0n if unavailable (pre-1559 / RPC gap). */
@@ -277,7 +293,8 @@ export class BerachainClients {
    * for block inclusion. `maxFeePerGas` must already include base-fee headroom + the priority tip. */
   async sendEip1559(to: Address, data: Hex, value: bigint, gas: bigint, maxFeePerGas: bigint, maxPriorityFeePerGas: bigint): Promise<Hex> {
     if (!this.wallet) throw new Error("Wallet signer is unavailable");
-    return this.wallet.sendTransaction({ to, data, value, gas, maxFeePerGas, maxPriorityFeePerGas });
+    try { return await this.wallet.sendTransaction({ to, data, value, gas, maxFeePerGas, maxPriorityFeePerGas }); }
+    catch (err) { if (isTransientOrRateLimit(err)) this.noteRateLimit("execution", this.executionRpc); throw err; }
   }
 }
 

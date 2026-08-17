@@ -18,6 +18,10 @@ const schema = z.object({
   // reroutes to when its reference RPC rate-limits (429) or errors. Both default from the profile.
   PRECISION_RPC_HTTP_URL: z.string().url().optional(),
   FALLBACK_RPC_HTTP_URL: z.string().url().optional(),
+  // DEDICATED execution lane: used ONLY to broadcast real transactions (position buys/sells,
+  // liquidations, arb) so it stays free + fresh when we need to fire — never contended by the
+  // read firehose. Point it at a dedicated (ideally paid) endpoint; defaults to the fallback RPC.
+  EXECUTION_RPC_HTTP_URL: z.string().url().optional(),
   // Chain selector: CHAIN_ID picks the networks/<CHAIN_ID>.json profile that fills every
   // chain-specific field below (RPC, addresses, explorer, DEXes, tokens, infra). Flip it to migrate.
   CHAIN_ID: z.coerce.number().int().positive().default(8453),
@@ -320,6 +324,7 @@ function applyNetwork(input: Record<string, string | undefined>, net: Network): 
   set("HEADS_RPC_WS_URL", net.rpc.ws);
   set("PRECISION_RPC_HTTP_URL", net.rpc.precision ?? net.rpc.secondary);
   set("FALLBACK_RPC_HTTP_URL", net.rpc.fallback ?? net.rpc.primary);
+  set("EXECUTION_RPC_HTTP_URL", net.rpc.execution ?? net.rpc.fallback ?? net.rpc.primary);
   set("EXPLORER_NAME", net.explorer.name);
   set("EXPLORER_URL", net.explorer.url);
   set("BLOCKSCOUT_API_URL", net.explorer.blockscout);

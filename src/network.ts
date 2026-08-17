@@ -46,7 +46,7 @@ export const networkSchema = z.object({
   nativeSymbol: z.string(),
   wrapped: z.object({ address: addr, symbol: z.string(), decimals: z.number().int().default(18) }),
   explorer: z.object({ name: z.string(), url: z.string().url(), blockscout: z.string().url().optional() }),
-  rpc: z.object({ primary: z.string().url(), secondary: z.string().url(), ws: z.string().optional(), precision: z.string().url().optional(), fallback: z.string().url().optional() }),
+  rpc: z.object({ primary: z.string().url(), secondary: z.string().url(), ws: z.string().optional(), precision: z.string().url().optional(), fallback: z.string().url().optional(), execution: z.string().url().optional() }),
   data: z.object({ gtNetwork: z.string(), llamaChain: z.string(), etherscanChainId: z.number().int() }),
   infra: z.object({ aggregator1inch: addr.optional(), balancerVault: addr.optional(), morpho: addr.optional(), permit2: addr.optional() }).default({}),
   dexes: z.array(dexProfileSchema).default([]),
