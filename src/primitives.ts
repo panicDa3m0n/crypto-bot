@@ -409,11 +409,16 @@ export class Primitives {
    * retried on the aggregator (never risk a double broadcast). */
   async swapBest(tokenIn: Address, tokenOut: Address, amountIn: bigint, maxSlippagePct: number, act: boolean): Promise<ActionOutcome> {
     const v3 = await this.swapV3(tokenIn, tokenOut, amountIn, maxSlippagePct, act);
-    if (v3.ok || v3.stage !== "build") return v3;
+    if (v3.ok) return v3;
+    // Fall back to the aggregator when V3 has NO ROUTE (build) OR REVERTS (execute) — a revert (STF /
+    // SafeERC20 / insufficient) means fee-on-transfer or V4-only liquidity AND that no funds moved, so a
+    // retry is safe. A non-revert execute failure (RPC mid-broadcast, uncertain) is NEVER retried.
+    const v3reason = "reason" in v3 ? v3.reason : "";
+    const safeToRetry = v3.stage === "build" || (v3.stage === "execute" && /revert|STF|SafeERC20|insufficient|transfer|TF\b/i.test(v3reason));
+    if (!safeToRetry) return v3;
     const agg = await this.swapViaAggregator(tokenIn, tokenOut, amountIn, maxSlippagePct, act);
     if (agg.ok) return agg;
-    // Both failed — surface the AGGREGATOR reason (informative), not the generic "no V3 pool".
-    return { ok: false, primitive: "swap", stage: "reason" in agg ? agg.stage : "build", reason: `no V3 pool; aggregatore: ${"reason" in agg ? agg.reason : "fallito"}` };
+    return { ok: false, primitive: "swap", stage: "reason" in agg ? agg.stage : "build", reason: `V3 (${v3reason.slice(0, 40)}); aggregatore: ${"reason" in agg ? agg.reason : "fallito"}` };
   }
 
   /** Cross-venue swap via the aggregator: quote → build calldata → approve → send. Same execution
