@@ -358,6 +358,13 @@ export class Primitives {
     const reasons: string[] = [];
     const base = this.config.WBERA_ADDRESS as Address;
     const probe = 10n ** 15n;
+    // 0) EMPIRICAL memory: a token whose REAL sell already reverted (STF/time-based honeypot the atomic
+    // probe can't see) is flagged sell-blocked forever. Refuse it — never get stuck in it twice.
+    const ent = (await this.db.getEntity(this.config.CHAIN_ID, token).catch(() => []))[0];
+    if (ent && (ent.meta as { sellBlocked?: boolean } | null)?.sellBlocked) {
+      reasons.push("token già risultato INVENDIBILE in una vendita reale (sell-block/honeypot) — rifiutato definitivamente");
+      return { token, safe: false, canSell: false, buyable: true, reasons };
+    }
     // 1) REAL round-trip (V3). The hard sellability guarantee.
     const rt = await this.honeypotProbe(token).catch(() => null);
     if (rt && rt.buyable) {

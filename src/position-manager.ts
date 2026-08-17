@@ -159,6 +159,8 @@ export class PositionManager {
       const hard = /revert|STF|insufficient|transfer/i.test(why);
       if (hard) {
         // On-chain revert (e.g. sell-tax/honeypot) → BLOCK. Keep it filled+open-value but status 'error'.
+        // EMPIRICAL: flag the token sell-blocked so the gate refuses it forever (catches time-based honeypots).
+        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: p.token, kind: "token", meta: { sellBlocked: true, sellBlockReason: why.slice(0, 80), sellBlockedAt: new Date().toISOString() }, source: "sell-fail" }).catch(() => undefined);
         await this.db.updatePositionPlan(p.id, { status: "error", exitNowPct: null, lastResult: `VENDITA BLOCCATA (revert): ${why.slice(0, 110)}` });
         this.wake(`position-error:${p.id}`, `Strategia #${p.id} (${p.symbol ?? "token"}): la VENDITA reverta on-chain (${why.slice(0, 60)}) — probabile sell-tax. BLOCCATA: modifica o chiudi.`);
       } else {
