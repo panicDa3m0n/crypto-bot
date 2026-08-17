@@ -78,6 +78,9 @@ export async function dispatchActionTool(name: string, args: Record<string, unkn
       const nav = (await deps.db.latestPortfolio().catch(() => undefined))?.estimatedNavUsd ?? 0;
       if (!(nav > 0)) return { error: "NAV non disponibile ora — riprova al prossimo ciclo" };
       const openPlans = await deps.db.activePositionPlans(chainId).catch(() => []);
+      // ONE strategy per token: a token can't have two open plans. Modify/close the existing one first.
+      const existing = openPlans.find((p) => p.token.toLowerCase() === token);
+      if (existing) return { error: `hai GIÀ una strategia su ${existing.symbol ?? token.slice(0, 8)} (#${existing.id}, stato ${existing.status}) — un token può avere UNA sola strategia. Modificala con adjust_position (o chiudila con close_position) prima di aprirne un'altra.` };
       if (openPlans.length >= cfg.POSITION_MAX_OPEN) return { error: `già ${openPlans.length} posizioni aperte (tetto di sanità ${cfg.POSITION_MAX_OPEN}) — chiudine una` };
 
       // HONEYPOT GATE — the only hard refusal: a token we cannot SELL. Cross-venue buy+sell route check.
