@@ -10,6 +10,7 @@ import type { Database } from "./db.js";
 import type { Decision, ExecutionRequest, PortfolioSnapshot } from "./domain.js";
 import type { GuardedExecutor } from "./executor.js";
 import type { PositionService } from "./positions.js";
+import type { Aggregator } from "./aggregator.js";
 
 const previewAbi = parseAbi(["function previewDeposit(uint256 assets) view returns (uint256 shares)"]);
 
@@ -49,7 +50,8 @@ export class Primitives {
     private readonly positions: PositionService,
     private readonly wbera: WberaAdapter,
     private readonly allowance: ExactAllowanceAdapter,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly aggregator?: Aggregator
   ) {}
 
   private get morpho(): Address { return this.config.MORPHO_CORE as Address; }
@@ -300,40 +302,61 @@ export class Primitives {
 
   // --- check_token: the parasite's survival gate (anti-rug / honeypot) --------
 
-  /** Safety gate before buying a token: confirms it has a wrapped-native pool with liquidity
-   * and, critically, that it can be SOLD BACK (honeypot detection) via an on-chain quote.
-   * Routes the sell simulation through the DEEPEST pool (by liquidity), never the first one
-   * found, so a thin/empty pool is not mistaken for a transfer-blocking honeypot. */
+  /** Safety gate before buying a token — CROSS-VENUE via the aggregator (not a single V3 pool, which
+   * gave false negatives on blue chips like cbBTC whose liquidity lives on other tiers/venues). Confirms
+   * a real BUY route AND, critically, a real SELL route for the acquired amount (honeypot detection).
+   * Retries on transient aggregator/RPC errors so a momentary failure is NOT mislabeled a honeypot — the
+   * distinction the LFI episode showed matters. `poolFeeBps` (deepest V3 tier) is informational only. */
   async checkToken(token: Address): Promise<{ token: string; safe: boolean; canSell: boolean; buyable: boolean; poolFeeBps?: number; reasons: string[] }> {
     const reasons: string[] = [];
-    const base = this.config.WBERA_ADDRESS as Address; // wrapped native (WMON)
-    const factory = this.config.DEX_FACTORY as Address; // Uniswap V3-style factory
-    const quoter = this.config.DEX_QUOTER as Address; // QuoterV2
-    const ZERO = "0x0000000000000000000000000000000000000000";
+    const base = this.config.WBERA_ADDRESS as Address;
+    const probe = 10n ** 15n; // ~0.001 wrapped-native (~$2): a small, realistic buy across all venues
+    if (!this.aggregator) { reasons.push("aggregatore non disponibile — impossibile verificare la vendibilità"); return { token, safe: false, canSell: false, buyable: false, reasons }; }
+    // 1) BUY route across ALL venues.
+    const buy = await this.aggQuoteRetry(base, token, probe);
+    if (buy.status !== "ok" || !buy.quote || buy.quote.amountOut <= 0n) {
+      reasons.push(buy.status === "error" ? "quote di acquisto non disponibile ora (aggregatore/RPC) — transitorio, riprova (NON è honeypot)" : "nessuna rotta di acquisto su alcun venue leggibile");
+      return { token, safe: false, canSell: false, buyable: false, reasons };
+    }
+    const bought = buy.quote.amountOut;
+    // 2) SELL route for exactly the acquired amount — the real honeypot test.
+    const sell = await this.aggQuoteRetry(token, base, bought);
+    const canSell = sell.status === "ok" && !!sell.quote && sell.quote.amountOut > 0n;
+    if (!canSell) reasons.push(sell.status === "error" ? "quote di vendita non disponibile ora — transitorio, riprova (non necessariamente honeypot)" : "ACQUISTO instradabile ma VENDITA no su alcun venue — forte segnale HONEYPOT");
+    else { const retention = Number(sell.quote!.amountOut) / Number(probe); if (retention < 0.75) reasons.push(`perdita round-trip ~${((1 - retention) * 100).toFixed(0)}%: probabile sell-tax pesante`); }
+    const buyable = true;
+    const poolFeeBps = await this.bestV3Fee(base, token).catch(() => undefined); // informational (dossier)
+    const safe = buyable && canSell;
+    if (safe && reasons.length === 0) reasons.push("acquistabile e vendibile su venue reali (aggregatore); dimensiona comunque con prudenza");
+    return { token, safe, canSell, buyable, poolFeeBps, reasons };
+  }
+
+  /** Aggregator quote with retry: only a persistent no-route is real; a transient 'error' is retried,
+   * so a momentary aggregator/RPC hiccup is not mistaken for "no route / honeypot". */
+  private async aggQuoteRetry(inT: Address, outT: Address, amt: bigint): Promise<{ status: "ok" | "no-route" | "error"; quote: { amountOut: bigint; routeSummary: unknown } | null }> {
+    if (!this.aggregator) return { status: "error", quote: null };
+    for (let i = 0; i < 3; i += 1) {
+      const q = await this.aggregator.quoteResult(inT, outT, amt);
+      if (q.status !== "error") return q;
+      if (i < 2) await new Promise((r) => setTimeout(r, 350 * (i + 1)));
+    }
+    return { status: "error", quote: null };
+  }
+
+  /** Deepest Uniswap-V3 fee tier for a base/token pair — informational only (dossier display). */
+  private async bestV3Fee(base: Address, token: Address): Promise<number | undefined> {
+    const factory = this.config.DEX_FACTORY as Address;
     const factoryAbi = parseAbi(["function getPool(address,address,uint24) view returns (address)"]);
     const poolAbi = parseAbi(["function liquidity() view returns (uint128)"]);
-    const quoterAbi = parseAbi(["function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160,uint32,uint256)"]);
-    // Find EVERY fee-tier pool and pick the deepest by in-range liquidity.
-    let poolFeeBps: number | undefined; let bestLiq = -1n;
+    const ZERO = "0x0000000000000000000000000000000000000000";
+    let best: number | undefined; let bestLiq = -1n;
     for (const fee of [100, 500, 3000, 10000]) {
       const pool = await this.chain.primary.readContract({ address: factory, abi: factoryAbi, functionName: "getPool", args: [base, token, fee] }).catch(() => ZERO) as Address;
       if (!pool || pool.toLowerCase() === ZERO) continue;
       const liq = await this.chain.primary.readContract({ address: pool, abi: poolAbi, functionName: "liquidity" }).catch(() => 0n) as bigint;
-      if (liq > bestLiq) { bestLiq = liq; poolFeeBps = fee; }
+      if (liq > bestLiq) { bestLiq = liq; best = fee; }
     }
-    if (poolFeeBps === undefined) { reasons.push("no wrapped-native V3 pool found here — it may only trade on venues we cannot read (Uniswap V4, Kuru CLOB, Curve). Check via the 0x aggregator before buying; do not buy blind."); return { token, safe: false, canSell: false, buyable: false, reasons }; }
-    // Simulate a buy (base->token) and, above all, a sell back (token->base) on the DEEPEST pool.
-    const probe = 10n * 10n ** 18n; // ~10 wrapped-native, small but above dust
-    let buyOut = 0n; let buyable = false; let canSell = false;
-    try { const r = await this.chain.primary.simulateContract({ address: quoter, abi: quoterAbi, functionName: "quoteExactInputSingle", args: [{ tokenIn: base, tokenOut: token, amountIn: probe, fee: poolFeeBps, sqrtPriceLimitX96: 0n }] }); buyOut = r.result[0]; buyable = buyOut > 0n; }
-    catch { reasons.push("buy quote failed on the deepest V3 pool — token may not be tradable via this DEX"); }
-    if (buyable) {
-      try { const r = await this.chain.primary.simulateContract({ address: quoter, abi: quoterAbi, functionName: "quoteExactInputSingle", args: [{ tokenIn: token, tokenOut: base, amountIn: buyOut, fee: poolFeeBps, sqrtPriceLimitX96: 0n }] }); const back = r.result[0]; canSell = back > 0n; const retention = Number(back) / Number(probe); if (canSell && retention < 0.7) reasons.push(`high round-trip loss (~${((1 - retention) * 100).toFixed(0)}%): likely a heavy sell tax`); }
-      catch { reasons.push("SELL quote reverts on the SAME deepest pool where the buy succeeded — strong honeypot signal (buy but not sell). Do not touch."); }
-    }
-    const safe = buyable && canSell;
-    if (safe && reasons.length === 0) reasons.push("has a wrapped-native V3 pool and is sellable in simulation on the deepest pool; still size cautiously");
-    return { token, safe, canSell, buyable, poolFeeBps, reasons };
+    return best;
   }
 
   // --- swap: one-call Uniswap V3 exact-in (auto best-tier + minOut + approve) --

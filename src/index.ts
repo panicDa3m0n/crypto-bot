@@ -89,7 +89,7 @@ const oracle = new PriceOracle(config, chain, db, logger);
 chain.setOracle(oracle); // align system-wide tokenPrice to our on-chain oracle (API is the fallback)
 const monadSignals = new MonadSignals(config, chain, db, aggregator, logger);
 const perception = new Perception(sensorium, db, chain, monadSignals, positions, config);
-const primitives = new Primitives(config, chain, db, executor, positions, wberaAdapter, allowanceAdapter, logger);
+const primitives = new Primitives(config, chain, db, executor, positions, wberaAdapter, allowanceAdapter, logger, aggregator);
 const chronicle = new Chronicle(config, db, logger);
 const marketData = new MarketData(config);
 const resolver = new EntityResolver(config, chain, logger);
