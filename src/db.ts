@@ -434,10 +434,14 @@ export class Database {
         buys INTEGER NOT NULL DEFAULT 0,
         sells INTEGER NOT NULL DEFAULT 0,
         last_price DOUBLE PRECISION,
+        net_flow_usd DOUBLE PRECISION NOT NULL DEFAULT 0, -- signed: buys(+) − sells(+), the real buy pressure
+        liq_usd DOUBLE PRECISION,                          -- token liquidity snapshot at bucket time (trajectory → rug-drain signal)
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (chain_id, token, bucket)
       );
       CREATE INDEX IF NOT EXISTS token_stats_lookup_idx ON token_stats(chain_id, token, bucket DESC);
+      ALTER TABLE token_stats ADD COLUMN IF NOT EXISTS net_flow_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+      ALTER TABLE token_stats ADD COLUMN IF NOT EXISTS liq_usd DOUBLE PRECISION;
       -- DISPLAY prices only (Lane A): indicative, slow-refreshed, batch-sourced. NEVER used for
       -- arb/liquidation decisions — those compute fresh execution quotes (Lane B). Kept in its own
       -- table so the fast-changing price never churns the immutable entity metadata.
@@ -1204,18 +1208,20 @@ export class Database {
   }
 
   /** Increment per-token market stats for the current 5-min bucket (from V3 swap amounts). */
-  async upsertTokenStats(chainId: number, bucket: number, rows: Array<{ token: string; volUsd: number; buys: number; sells: number; lastPrice: number }>): Promise<void> {
+  async upsertTokenStats(chainId: number, bucket: number, rows: Array<{ token: string; volUsd: number; buys: number; sells: number; lastPrice: number; netFlowUsd: number; liqUsd: number | null }>): Promise<void> {
     if (!rows.length) return;
     await this.pool.query(
-      `INSERT INTO token_stats(chain_id, token, bucket, vol_usd, buys, sells, last_price)
-       SELECT $1, t, $2, v, b, s, lp FROM unnest($3::text[], $4::float8[], $5::int[], $6::int[], $7::float8[]) AS x(t, v, b, s, lp)
+      `INSERT INTO token_stats(chain_id, token, bucket, vol_usd, buys, sells, last_price, net_flow_usd, liq_usd)
+       SELECT $1, t, $2, v, b, s, lp, nf, lq FROM unnest($3::text[], $4::float8[], $5::int[], $6::int[], $7::float8[], $8::float8[], $9::float8[]) AS x(t, v, b, s, lp, nf, lq)
        ON CONFLICT (chain_id, token, bucket) DO UPDATE SET
          vol_usd = token_stats.vol_usd + EXCLUDED.vol_usd,
          buys = token_stats.buys + EXCLUDED.buys,
          sells = token_stats.sells + EXCLUDED.sells,
          last_price = COALESCE(EXCLUDED.last_price, token_stats.last_price),
+         net_flow_usd = token_stats.net_flow_usd + EXCLUDED.net_flow_usd,
+         liq_usd = COALESCE(EXCLUDED.liq_usd, token_stats.liq_usd),
          updated_at = NOW()`,
-      [chainId, bucket, rows.map((r) => r.token.toLowerCase()), rows.map((r) => r.volUsd), rows.map((r) => r.buys), rows.map((r) => r.sells), rows.map((r) => r.lastPrice)]
+      [chainId, bucket, rows.map((r) => r.token.toLowerCase()), rows.map((r) => r.volUsd), rows.map((r) => r.buys), rows.map((r) => r.sells), rows.map((r) => r.lastPrice), rows.map((r) => r.netFlowUsd), rows.map((r) => r.liqUsd)]
     );
   }
   async pruneTokenStats(chainId: number, olderThanHours: number): Promise<number> {
@@ -1224,19 +1230,25 @@ export class Database {
     return r.rowCount ?? 0;
   }
   /** Windowed market stats for a token — the chain-sourced replacement for the DexScreener feed. */
-  async tokenStats(chainId: number, token: string): Promise<{ vol5m: number; vol1h: number; vol24h: number; txns24h: number; buys24h: number; sells24h: number; change1h: number | null; change24h: number | null; lastPrice: number | null }> {
+  async tokenStats(chainId: number, token: string): Promise<{ vol5m: number; vol1h: number; vol24h: number; txns24h: number; buys24h: number; sells24h: number; change1h: number | null; change24h: number | null; lastPrice: number | null; netFlow1h: number; liqUsd: number | null; liqChange1h: number | null }> {
     const now = Math.floor(Date.now() / 1000);
-    const r = await this.pool.query<{ vol5m: string; vol1h: string; vol24h: string; buys24h: string; sells24h: string }>(
+    const r = await this.pool.query<{ vol5m: string; vol1h: string; vol24h: string; buys24h: string; sells24h: string; netflow1h: string; liqnow: string | null; liqold: string | null }>(
       `SELECT
          COALESCE(SUM(vol_usd) FILTER (WHERE bucket >= $3),0)::text AS vol5m,
          COALESCE(SUM(vol_usd) FILTER (WHERE bucket >= $4),0)::text AS vol1h,
          COALESCE(SUM(vol_usd),0)::text AS vol24h,
          COALESCE(SUM(buys),0)::text AS buys24h,
-         COALESCE(SUM(sells),0)::text AS sells24h
+         COALESCE(SUM(sells),0)::text AS sells24h,
+         COALESCE(SUM(net_flow_usd) FILTER (WHERE bucket >= $4),0)::text AS netflow1h,
+         (SELECT liq_usd FROM token_stats WHERE chain_id=$1 AND token=$2 AND liq_usd IS NOT NULL ORDER BY bucket DESC LIMIT 1)::text AS liqnow,
+         (SELECT liq_usd FROM token_stats WHERE chain_id=$1 AND token=$2 AND liq_usd IS NOT NULL AND bucket <= $4 ORDER BY bucket DESC LIMIT 1)::text AS liqold
        FROM token_stats WHERE chain_id=$1 AND token=$2 AND bucket >= $5`,
       [chainId, token.toLowerCase(), now - 300, now - 3600, now - 86400]
     );
     const row = r.rows[0];
+    const liqNow = row.liqnow != null ? Number(row.liqnow) : null;
+    const liqOld = row.liqold != null ? Number(row.liqold) : null;
+    const liqChange1h = liqNow != null && liqOld != null && liqOld > 0 ? (liqNow / liqOld - 1) * 100 : null;
     // Price change: latest bucket price vs the price ~1h / ~24h ago (nearest bucket at/under the mark).
     const priceAt = async (secsAgo: number): Promise<number | null> => {
       const q = await this.pool.query<{ last_price: number | null }>(
@@ -1254,8 +1266,70 @@ export class Database {
     return {
       vol5m: Number(row.vol5m), vol1h: Number(row.vol1h), vol24h: Number(row.vol24h),
       txns24h: Number(row.buys24h) + Number(row.sells24h), buys24h: Number(row.buys24h), sells24h: Number(row.sells24h),
-      change1h: chg(p1h), change24h: chg(p24h), lastPrice: latest
+      change1h: chg(p1h), change24h: chg(p24h), lastPrice: latest,
+      netFlow1h: Number(row.netflow1h), liqUsd: liqNow, liqChange1h
     };
+  }
+
+  /** Same-symbol siblings + our verdict on each — a proactive serial-redeploy / brand-impersonation
+   * signal (a symbol we've marked 'avoid' many times before is almost certainly another rug). */
+  async symbolSiblings(chainId: number, symbol: string, excludeToken: string, limit = 12): Promise<{ total: number; avoid: number; samples: Array<{ address: string; verdict: string | null }> }> {
+    if (!symbol || symbol === "?") return { total: 0, avoid: 0, samples: [] };
+    const r = await this.pool.query<{ address: string; verdict: string | null }>(
+      `SELECT e.address, (SELECT verdict FROM token_annotations a WHERE a.chain_id=$1 AND a.token=e.address ORDER BY at DESC LIMIT 1) AS verdict
+       FROM entities e WHERE e.chain_id=$1 AND e.kind='token' AND lower(e.symbol)=lower($2) AND e.address <> $3 ORDER BY e.created_at DESC LIMIT $4`,
+      [chainId, symbol, excludeToken.toLowerCase(), limit]
+    );
+    return { total: r.rows.length, avoid: r.rows.filter((x) => x.verdict === "avoid").length, samples: r.rows.slice(0, 5) };
+  }
+
+  /** Ranked OPPORTUNITY feed — the fresh, indexer-sourced replacement for the stale legacy discovery
+   * lists. One deduplicated set of ACTIVE tokens (traded in the last `windowMin`), each with the signals
+   * Scarlet's strategies need — momentum, buy/sell pressure, net USD flow, liquidity + its trajectory
+   * (rug-drain), age — scored by a composite so she focuses on the best few instead of sifting raw lists. */
+  async topOpportunities(chainId: number, opts: { windowMin?: number; limit?: number } = {}): Promise<Array<{ address: string; symbol: string | null; priceUsd: number | null; ageMin: number | null; vol1h: number; buys1h: number; sells1h: number; netFlow1h: number; change1h: number | null; liqUsd: number | null; liqChange1h: number | null; score: number; bucket: "fresh" | "mover" }>> {
+    const now = Math.floor(Date.now() / 1000);
+    const since1h = now - 3600, sinceWin = now - (opts.windowMin ?? 30) * 60;
+    const r = await this.pool.query<{ token: string; symbol: string | null; decimals: number | null; price: number | null; created: Date | null; vol1h: string; buys1h: string; sells1h: string; netflow1h: string; liqnow: string | null; liqold: string | null; p_now: number | null; p_1h: number | null }>(
+      `WITH agg AS (
+         SELECT token,
+           SUM(vol_usd) FILTER (WHERE bucket >= $2) AS vol1h,
+           SUM(buys) FILTER (WHERE bucket >= $2) AS buys1h,
+           SUM(sells) FILTER (WHERE bucket >= $2) AS sells1h,
+           COALESCE(SUM(net_flow_usd) FILTER (WHERE bucket >= $2),0) AS netflow1h,
+           SUM(vol_usd) FILTER (WHERE bucket >= $3) AS volwin
+         FROM token_stats WHERE chain_id=$1 AND bucket >= $2 GROUP BY token
+         HAVING SUM(vol_usd) FILTER (WHERE bucket >= $3) > 0
+       )
+       SELECT a.token, e.symbol, e.decimals, tp.price_usd AS price, e.created_at AS created,
+         a.vol1h::text, a.buys1h::text, a.sells1h::text, a.netflow1h::text,
+         (SELECT liq_usd FROM token_stats s WHERE s.chain_id=$1 AND s.token=a.token AND liq_usd IS NOT NULL ORDER BY bucket DESC LIMIT 1)::text AS liqnow,
+         (SELECT liq_usd FROM token_stats s WHERE s.chain_id=$1 AND s.token=a.token AND liq_usd IS NOT NULL AND bucket <= $2 ORDER BY bucket DESC LIMIT 1)::text AS liqold,
+         (SELECT last_price FROM token_stats s WHERE s.chain_id=$1 AND s.token=a.token AND last_price IS NOT NULL ORDER BY bucket DESC LIMIT 1) AS p_now,
+         (SELECT last_price FROM token_stats s WHERE s.chain_id=$1 AND s.token=a.token AND last_price IS NOT NULL AND bucket <= $2 ORDER BY bucket DESC LIMIT 1) AS p_1h
+       FROM agg a
+       LEFT JOIN entities e ON e.chain_id=$1 AND e.address=a.token AND e.kind='token'
+       LEFT JOIN token_prices tp ON tp.chain_id=$1 AND tp.token=a.token
+       WHERE e.address NOT IN ('0x4200000000000000000000000000000000000006','0x833589fcd6edb6e08f4c7c32d4f71b54bda02913')`,
+      [chainId, since1h, sinceWin]
+    );
+    const out = r.rows.map((x) => {
+      const vol1h = Number(x.vol1h) || 0, buys = Number(x.buys1h) || 0, sells = Number(x.sells1h) || 0, netFlow1h = Number(x.netflow1h) || 0;
+      const liqUsd = x.liqnow != null ? Number(x.liqnow) : null, liqOld = x.liqold != null ? Number(x.liqold) : null;
+      const liqChange1h = liqUsd != null && liqOld != null && liqOld > 0 ? (liqUsd / liqOld - 1) * 100 : null;
+      const change1h = x.p_now != null && x.p_1h != null && x.p_1h > 0 ? (x.p_now / x.p_1h - 1) * 100 : null;
+      const ageMin = x.created ? Math.round((Date.now() - x.created.getTime()) / 60000) : null;
+      // Composite score: volume + buy-pressure + momentum, dampened by liquidity drain (rug) and by
+      // sell-dominant flow. Deliberately simple + transparent — a first-pass ranking, not a black box.
+      const pressure = buys + sells > 0 ? (buys - sells) / (buys + sells) : 0; // −1..+1
+      let score = Math.log10(1 + vol1h) * 2 + pressure * 3 + (netFlow1h > 0 ? 2 : -1) + Math.max(-3, Math.min(3, (change1h ?? 0) / 20));
+      if (liqChange1h != null && liqChange1h < -30) score -= 4; // liquidity draining hard → likely rug
+      if (liqUsd != null && liqUsd < 3000) score -= 1;          // ultra-thin
+      const bucket: "fresh" | "mover" = ageMin != null && ageMin <= 180 ? "fresh" : "mover";
+      return { address: x.token, symbol: x.symbol, priceUsd: x.price, ageMin, vol1h: Math.round(vol1h), buys1h: buys, sells1h: sells, netFlow1h: Math.round(netFlow1h), change1h, liqUsd: liqUsd != null ? Math.round(liqUsd) : null, liqChange1h, score: Math.round(score * 100) / 100, bucket };
+    });
+    out.sort((a, b) => b.score - a.score);
+    return out.slice(0, opts.limit ?? 20);
   }
   /** Trending tokens = top by 1h chain volume (from token_stats), with identity + price. Indexer-sourced
    * replacement for the GeckoTerminal "trending" discovery. */

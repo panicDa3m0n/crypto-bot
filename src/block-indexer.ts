@@ -49,6 +49,7 @@ const sanePrice = (p: number | null | undefined): p is number => p != null && Nu
 const TOPIC0S = [V3_SWAP, V2_SYNC, V2_SWAP, PAIR_CREATED, POOL_CREATED, MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE];
 const CHUNK = 10;            // public getLogs range cap
 const ANCHOR_TTL_MS = 30_000; // refresh ETH/USD at most this often
+const Q96 = 2n ** 96n;
 
 type RawLog = { address: string; topics: string[]; data: string; blockNumber: string };
 type RawRpc = { request: (a: { method: string; params: unknown }) => Promise<unknown> };
@@ -206,7 +207,7 @@ export class BlockIndexer {
     const px = await this.db.getTokenPrices(this.config.CHAIN_ID, [...tokenSet]).catch(() => new Map()) as Map<string, { priceUsd: number | null; source: string }>;
     const state = new Map<string, { pool: string; archetype: string; r0?: bigint; r1?: bigint; sqrtPrice?: bigint; liquidity?: bigint; block: number }>();
     const rows = new Map<string, { price: number; conf: number }>(); // token → USD price this block (last swap wins)
-    const stats = new Map<string, { volUsd: number; buys: number; sells: number; lastPrice: number }>(); // V3 volume/txns per token
+    const stats = new Map<string, { volUsd: number; buys: number; sells: number; lastPrice: number; netFlowUsd: number; liqUsd: number | null }>(); // per-token market stats this block
     // A token's current USD: a QUOTE (WETH/USDC), a DIRECT price computed this block (conf≥0.95), or the
     // stored DB price. Only direct/quote anchors are used for multi-hop, so hop prices never chain.
     const usdOf = (t: string): number | null => {
@@ -241,8 +242,8 @@ export class BlockIndexer {
       if (!T || !A || !sanePrice(priceT)) continue; // reject thin-pool / extreme-tick garbage
       rows.set(T, { price: priceT, conf });
 
-      // V3 volume/txns: swap USD size = |anchor-side amount| × its USD; buy = T flows OUT of the pool
-      // (negative in V3's signed convention).
+      // V3 volume/txns/flow: buy = T flows OUT (negative in V3's signed convention). netFlow = +S buy /
+      // −S sell (buy pressure). liq = anchor(quote)-side VIRTUAL reserve × USD × 2 (rug-drain trajectory).
       if (isSwap) {
         const aAmt = A === t0 ? sword(l.data, 0) : sword(l.data, 1);
         const tAmt = A === t0 ? sword(l.data, 1) : sword(l.data, 0);
@@ -250,8 +251,12 @@ export class BlockIndexer {
         if (aAmt != null && tAmt != null) {
           const S = Math.abs(Number(aAmt) / 10 ** decA) * U;
           if (S > 0 && S < MAX_SWAP_USD && Number.isFinite(S)) {
-            const s = stats.get(T) ?? { volUsd: 0, buys: 0, sells: 0, lastPrice: priceT };
-            s.volUsd += S; if (tAmt < 0n) s.buys += 1; else s.sells += 1; s.lastPrice = priceT; stats.set(T, s);
+            const s = stats.get(T) ?? { volUsd: 0, buys: 0, sells: 0, lastPrice: priceT, netFlowUsd: 0, liqUsd: null };
+            const buy = tAmt < 0n;
+            s.volUsd += S; if (buy) s.buys += 1; else s.sells += 1; s.netFlowUsd += buy ? S : -S; s.lastPrice = priceT;
+            const sp = word(l.data, 2), L = word(l.data, 3);
+            if (sp && L && sp > 0n) { const qRes = A === t0 ? (L * Q96) / sp : (L * sp) / Q96; s.liqUsd = (Number(qRes) / 10 ** decA) * U * 2; }
+            stats.set(T, s);
           }
         }
       }
@@ -275,8 +280,12 @@ export class BlockIndexer {
       const S = Math.abs(Number(netA) / 10 ** decA) * U;
       if (!(S > 0) || S >= MAX_SWAP_USD || !Number.isFinite(S)) continue;
       const priceT = rows.get(T)?.price ?? px.get(T)?.priceUsd ?? 0;
-      const s = stats.get(T) ?? { volUsd: 0, buys: 0, sells: 0, lastPrice: priceT };
-      s.volUsd += S; if (netT < 0n) s.buys += 1; else s.sells += 1; if (priceT > 0) s.lastPrice = priceT; stats.set(T, s);
+      const s = stats.get(T) ?? { volUsd: 0, buys: 0, sells: 0, lastPrice: priceT, netFlowUsd: 0, liqUsd: null };
+      const buy = netT < 0n; // T flows OUT of the pool → bought
+      s.volUsd += S; if (buy) s.buys += 1; else s.sells += 1; s.netFlowUsd += buy ? S : -S; if (priceT > 0) s.lastPrice = priceT;
+      const st = state.get(l.address.toLowerCase()); // reserves from this pool's Sync (same block)
+      if (st?.r0 != null && st.r1 != null) { const qRes = A === t0 ? st.r0 : st.r1; s.liqUsd = (Number(qRes) / 10 ** decA) * U * 2; }
+      stats.set(T, s);
     }
 
     if (this.config.DEBUG_KEEP_RAW_BLOCKS && logs.length) await this.db.saveRawBlock(this.config.CHAIN_ID, block, logs).catch(() => undefined);

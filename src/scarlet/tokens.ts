@@ -113,10 +113,12 @@ async function buildDossier(deps: ToolDeps, addr: string): Promise<unknown> {
     source: "indexer",
     volumeUsd: stats ? { m5: Math.round(stats.vol5m), h1: Math.round(stats.vol1h), h24: Math.round(stats.vol24h) } : null,
     txns24h: stats?.txns24h ?? null, buys24h: stats?.buys24h ?? null, sells24h: stats?.sells24h ?? null,
+    netFlowUsd1h: stats ? Math.round(stats.netFlow1h) : null, // >0 = compratori netti (pressione d'acquisto)
     priceChangePct: stats ? { h1: stats.change1h, h24: stats.change24h } : null,
-    liquidityUsd: liquidityUsd != null ? Math.round(liquidityUsd) : null,
+    liquidityUsd: liquidityUsd != null ? Math.round(liquidityUsd) : (stats?.liqUsd != null ? Math.round(stats.liqUsd) : null),
+    liquidityChangePct1h: stats?.liqChange1h ?? null, // ⚠️ molto negativo = liquidità in prosciugamento (rug)
     pools: pools.slice(0, 8),
-    note: "volume/txns su finestra 24h (V3); liquidità V3 approssimata (riserve virtuali); price-change si riempie man mano"
+    note: "dati indexer freschi. netFlowUsd1h>0=compratori netti; liquidityChangePct1h molto negativo=liquidità che esce (rug in corso)"
   };
   const token = (entities as Array<{ kind: string; symbol: string | null; name: string | null; decimals: number | null; meta: unknown; note: string | null; status: string }>).find((e) => e.kind === "token");
   const meta = (token?.meta ?? {}) as Record<string, unknown>;
@@ -129,6 +131,8 @@ async function buildDossier(deps: ToolDeps, addr: string): Promise<unknown> {
 
   const anns = annotations as Array<{ at: string; verdict: string; note: string | null; tags: string[] }>;
   const acts = activity as Array<{ direction: string; valueRaw: string; at: string; txHash: string }>;
+  // Serial-redeploy / brand-impersonation signal: other tokens sharing this symbol + our past verdicts.
+  const sib = token?.symbol ? await deps.db.symbolSiblings(chainId, token.symbol, addr, 12).catch(() => ({ total: 0, avoid: 0, samples: [] as Array<{ address: string; verdict: string | null }> })) : { total: 0, avoid: 0, samples: [] as Array<{ address: string; verdict: string | null }> };
 
   const chain = meta.chain as Record<string, unknown> | undefined;
   const hints = [
@@ -151,6 +155,7 @@ async function buildDossier(deps: ToolDeps, addr: string): Promise<unknown> {
     ourInteraction: acts.length ? { count: acts.length, last: { direction: acts[0].direction, at: acts[0].at, tx: acts[0].txHash } } : "mai interagito con questo token",
     onchain: chain ? { ...chain, note: "dati sincronizzati (Blockscout). Ri-sincronizza con sync_address se syncedAt è vecchio." } : "non ancora sincronizzato — sync_address per holders/creator/tag/marketcap",
     judgment: anns.length ? { last: anns[0], history: anns.length } : "nessun tuo giudizio ancora — usa annotate_token",
+    redeployReputation: sib.total ? { sameSymbolTokens: sib.total, markedAvoid: sib.avoid, samples: sib.samples, note: sib.avoid >= 2 ? "⚠️ questo simbolo è già stato usato da altri token che HAI marcato avoid — probabile redeploy/impersonation seriale" : "esistono altri token con lo stesso simbolo" } : "primo token con questo simbolo che vedi (nessun redeploy noto)",
     hints
   };
 }

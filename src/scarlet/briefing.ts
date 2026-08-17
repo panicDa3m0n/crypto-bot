@@ -60,22 +60,19 @@ export async function buildTradingBriefing(db: Database, positionsSvc: PositionS
   // Watchlist — placeholder until the dedicated gradino (token tenuti d'occhio con tesi + trigger).
   const watchlist = { note: "Watchlist non ancora attiva (arriva nel gradino dedicato).", items: [] as unknown[] };
 
-  // Token DISCOVERY — candidates that might rise: fresh launches, momentum, trending volume, smart-money
-  // accumulation. Trimmed of the arb-specific and liquidation fields the trader doesn't act on.
-  const [gradSnap, flowSnap, whaleSnap, freshLaunches] = await Promise.all([
-    db.latestMarketSnapshot<{ momentum: unknown[]; note: string }>("graduation", "recent").catch(() => undefined),
-    db.latestMarketSnapshot<{ topByVolume: unknown[]; trending: unknown[]; hotPools: unknown[] }>("flow", "recent").catch(() => undefined),
-    db.latestMarketSnapshot<{ accumulatingNow: unknown[] }>("whale", "recent").catch(() => undefined),
-    db.recentDiscoveredPools(180, 12).catch(() => [])
+  // Token DISCOVERY — ONE ranked opportunity feed from the block-indexer (fresh at the second), not the
+  // old stale external-sensor lists. Each token carries the signals her strategies need: momentum, buy/
+  // sell pressure, net USD flow, liquidity + its trajectory (liqChange1h very negative = rug-drain), age.
+  const [opps, justLaunched] = await Promise.all([
+    db.topOpportunities(config.CHAIN_ID, { windowMin: 30, limit: 24 }).catch(() => []),
+    db.recentDiscoveredPools(120, 8).catch(() => [])
   ]);
+  const trim = (o: Awaited<ReturnType<Database["topOpportunities"]>>[number]) => ({ symbol: o.symbol, token: o.address, ageMin: o.ageMin, priceUsd: o.priceUsd, vol1h: o.vol1h, buys: o.buys1h, sells: o.sells1h, netFlowUsd: o.netFlow1h, chg1h: o.change1h != null ? r2(o.change1h) : null, liqUsd: o.liqUsd, liqChg1h: o.liqChange1h != null ? r2(o.liqChange1h) : null, score: o.score });
   const discovery = {
-    note: "Segnali di scoperta token (candidati che POTREBBERO salire). Prima di comprare: verifica honeypot, guarda il grafico, entra piccolo, imposta uno stop. (Strumenti in arrivo nei prossimi gradini.)",
-    freshLaunches: freshLaunches.length ? freshLaunches.map((p) => ({ symbol: p.newSymbol, token: p.newToken, dex: p.dex, liquidityUsd: p.liquidityUsd, at: p.discoveredAt })) : "nessun lancio recente",
-    momentum: gradSnap?.momentum ?? [],
-    trending: flowSnap?.trending ?? [],
-    topByVolume: flowSnap?.topByVolume ?? [],
-    hotPools: flowSnap?.hotPools ?? [],
-    whaleAccumulation: whaleSnap?.accumulatingNow ?? []
+    note: "Opportunità dall'indexer (dati FRESCHI), già scorate: score alto = momentum + pressione d'acquisto sani. ⚠️ liqChg1h molto negativo = liquidità in prosciugamento (rug in corso). netFlowUsd>0 = compratori netti. Verifica SEMPRE con search_token prima di comprare; entra piccolo, metti uno stop.",
+    freshMovers: opps.filter((o) => o.bucket === "fresh").slice(0, 10).map(trim),
+    movers: opps.filter((o) => o.bucket === "mover").slice(0, 10).map(trim),
+    justLaunched: justLaunched.length ? justLaunched.map((p) => ({ symbol: p.newSymbol, token: p.newToken, dex: p.dex, liquidityUsd: p.liquidityUsd, at: p.discoveredAt, note: "appena creato — potrebbe non aver ancora tradato (nessuna stat)" })) : "nessun lancio recentissimo"
   };
 
   // Memory: recent decisions + saved-notes index.
@@ -89,11 +86,10 @@ export async function buildTradingBriefing(db: Database, positionsSvc: PositionS
   };
 
   // Known tokens/entities (address-keyed knowledge base).
-  const known = await db.listEntities(config.CHAIN_ID, { status: "active", limit: 60 }).catch(() => []);
+  const known = await db.listEntities(config.CHAIN_ID, { status: "active", limit: 30 }).catch(() => []);
   const registry = {
-    note: "I token/entità che GIÀ conosci (address-keyed). Non ri-scoprirli, costruisci su questi.",
-    count: known.length,
-    entities: known.map((e) => ({ address: e.address, kind: e.kind, symbol: e.symbol, note: e.note }))
+    note: "Alcuni token/entità che GIÀ conosci (address-keyed). Per i tuoi giudizi usa find_tokens(verdict=…).",
+    entities: known.map((e) => ({ address: e.address, symbol: e.symbol, note: e.note }))
   };
 
   // Self-drive: baseline (captured once), current NAV, progress to the next milestone.
@@ -116,7 +112,7 @@ export async function buildTradingBriefing(db: Database, positionsSvc: PositionS
     pos: positionsRaw.map((p) => p.id).sort(),
     hold: untracked.map((h) => h.token).sort(),
     plans: plansRaw.map((p) => `${p.id}:${p.status}`).sort(),
-    fresh: (Array.isArray(freshLaunches) ? freshLaunches : []).map((p) => p.newToken).sort()
+    fresh: justLaunched.map((p) => p.newToken).sort()
   });
 
   return { fingerprint, chainHead, gains, self: selfContext(self), temperament: self.temperament, positions, plans, watchlist, discovery, memory, registry, guidance };
