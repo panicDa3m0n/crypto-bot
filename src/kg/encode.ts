@@ -21,19 +21,18 @@ const MAX_UINT = (1n << 256n) - 1n;
 
 export interface MarketParamsLite { loanToken: Address; collateralToken: Address; oracle: Address; irm: Address; lltv: bigint }
 
-/** Encode a flash-liquidation plan into the KGExecutor Call[]: approve loan→Morpho, Morpho.liquidate
- * (seizedAssets path, repaidShares=0), then swap the seized collateral → loan through its SPECIFIC pool.
- * The executor's flashExecute wraps borrow/repay; require(minProfit) is the boundary. Returns null if the
- * collateral→loan hop isn't own-executable. */
-export async function encodeLiquidationPlan(router: LocalRouter, morpho: Address, params: MarketParamsLite, borrower: Address, seized: bigint, collPool: PoolState, executor: Address): Promise<ExecutorCall[] | null> {
-  const enc = await router.encodeLeg(collPool, params.collateralToken, params.loanToken, seized, 0n, executor);
-  if (!enc) return null;
-  return [
+/** Encode a flash-liquidation plan into the KGExecutor Call[] = LIQUIDATION PREFIX (approve loan→Morpho,
+ * Morpho.liquidate seizedAssets-path) + the GENERIC swap-trace compiler over the exit legs (1..n hops).
+ * Reuses `encodeCycle` for the swaps — no second multi-hop compiler. Returns null if any exit hop isn't
+ * own-executable. require(minProfit) on the loan token is the boundary. */
+export async function encodeLiquidationPlan(router: LocalRouter, morpho: Address, params: MarketParamsLite, borrower: Address, seized: bigint, exitLegs: SwapTrace[], poolStates: Map<string, PoolState>, executor: Address): Promise<ExecutorCall[] | null> {
+  const swaps = await encodeCycle(router, poolStates, exitLegs, executor); // same compiler as arb cycles
+  if (!swaps) return null;
+  const prefix: ExecutorCall[] = [
     { target: params.loanToken, value: 0n, data: encodeFunctionData({ abi: ERC20_APPROVE, functionName: "approve", args: [morpho, MAX_UINT] }) },
-    { target: morpho, value: 0n, data: encodeFunctionData({ abi: MORPHO_LIQUIDATE, functionName: "liquidate", args: [{ loanToken: params.loanToken, collateralToken: params.collateralToken, oracle: params.oracle, irm: params.irm, lltv: params.lltv }, borrower, seized, 0n, "0x"] }) },
-    { target: params.collateralToken, value: 0n, data: encodeFunctionData({ abi: ERC20_APPROVE, functionName: "approve", args: [enc.router, seized] }) },
-    { target: enc.router, value: enc.value, data: enc.calldata }
+    { target: morpho, value: 0n, data: encodeFunctionData({ abi: MORPHO_LIQUIDATE, functionName: "liquidate", args: [{ loanToken: params.loanToken, collateralToken: params.collateralToken, oracle: params.oracle, irm: params.irm, lltv: params.lltv }, borrower, seized, 0n, "0x"] }) }
   ];
+  return [...prefix, ...swaps];
 }
 
 export async function encodeCycle(router: LocalRouter, poolStates: Map<string, PoolState>, legs: SwapTrace[], executor: Address): Promise<ExecutorCall[] | null> {

@@ -155,38 +155,41 @@ export function sizeCycle(version: StateVersion, cycle: KGCycle, poolSims: Map<s
   return { amountIn: bestX, numeraire, realizedPnl: bestP, gasUnits: r.gasUnits, funding: opts.funding, ops, legs };
 }
 
-// ── Flash-liquidation as an ordinary plan (F5) ───────────────────────────────
+// ── Flash-liquidation as an ordinary plan (F5) — exit is a GENERIC swap route (1..n hops, F5.2) ────
+/** One hop of the collateral→loan exit route. `bestRoute` chooses the topology; the kernel simulates it
+ * exactly. First hop's tokenIn = collateral, last hop's tokenOut = loan. */
+export interface ExitHop { poolId: string; tokenIn: AssetId; tokenOut: AssetId; archetype: string }
+
 export interface FlashLiquidationPlan {
   ops: Transformation[];
-  numeraire: AssetId;   // loan token (the profit asset)
-  flashAmount: bigint;  // loan flash-borrowed = debt repaid
-  seized: bigint;       // collateral seized
-  repaid: bigint;       // loan repaid to Morpho
-  swapPoolId: string;
+  numeraire: AssetId;    // loan token (the profit asset)
+  flashAmount: bigint;   // loan flash-borrowed = debt repaid (share-exact)
+  seized: bigint;        // collateral seized
+  repaid: bigint;        // loan repaid to Morpho (= repaidAssets)
   liquidateOp: LiquidateOp;
-  swapOp: SwapOp;
+  exitOps: SwapOp[];     // the collateral→loan swap route (1 = direct, 2+ = multi-hop)
 }
 
-/** Build the canonical flash-liquidation plan for a liquidatable position:
- *   FlashBorrow(loan, repaid) → Liquidate(seize) → Swap(collateral→loan, full) → FlashRepay(loan, repaid)
- * `seize`/`repaid` are computed from the position (full-repay, capped by collateral). Returns null if the
- * position is not protocol-liquidatable or nothing is seizable. Numéraire = loan token; realized PnL =
- * swapOut − repaid. The economic actionability (PnL>0, net>threshold) is the gate's job, not this. */
-export function planFlashLiquidation(market: LendingMarketSim, pos: BorrowerPositionSim, collateralPoolId: string, collateralArchetype: string, provider = "morpho"): FlashLiquidationPlan | null {
-  if (!pos.protocolLiquidatable(market)) return null;
-  // Target full-debt repayment; computeLiquidation caps to collateral/borrowShares and returns the
-  // SHARE-EXACT repaidAssets Morpho will pull → flash exactly that so the on-chain repay can't come short.
+/** Build the flash-liquidation plan for a liquidatable position with a GENERIC exit route:
+ *   FlashBorrow(loan, repaid) → Liquidate(seize) → exitOps[collateral→…→loan] → FlashRepay(loan, repaid)
+ * `seize`/`repaid` are share-exact (computeLiquidation). The exit route is chosen upstream by bestRoute on
+ * the candidate universe; here we only wire the SwapOps (full-balance chaining) — the kernel decides the
+ * real output. Returns null if not liquidatable, nothing seizable, or the route is malformed. */
+export function planFlashLiquidation(market: LendingMarketSim, pos: BorrowerPositionSim, exit: ExitHop[], provider = "morpho"): FlashLiquidationPlan | null {
+  if (!pos.protocolLiquidatable(market) || !exit.length) return null;
+  const loan = market.params.loanToken, coll = market.params.collateralToken;
+  if (exit[0].tokenIn.toLowerCase() !== coll.toLowerCase() || exit[exit.length - 1].tokenOut.toLowerCase() !== loan.toLowerCase()) return null;
   const calc = computeLiquidation(market, pos, seizeForFullRepay(market, pos));
   if (!calc) return null;
-  const loan = market.params.loanToken, coll = market.params.collateralToken;
   const liquidateOp = new LiquidateOp(market.marketId, pos.borrower, calc.seized);
-  const swapOp = new SwapOp(collateralPoolId, coll, loan, 0n, collateralArchetype, true);
-  const ops: Transformation[] = [new FlashBorrowOp(provider, loan, calc.repaidAssets), liquidateOp, swapOp, new FlashRepayOp(provider, loan, calc.repaidAssets, 0n)];
-  return { ops, numeraire: loan, flashAmount: calc.repaidAssets, seized: calc.seized, repaid: calc.repaidAssets, swapPoolId: collateralPoolId, liquidateOp, swapOp };
+  const exitOps = exit.map((h) => new SwapOp(h.poolId, h.tokenIn, h.tokenOut, 0n, h.archetype, true));
+  const ops: Transformation[] = [new FlashBorrowOp(provider, loan, calc.repaidAssets), liquidateOp, ...exitOps, new FlashRepayOp(provider, loan, calc.repaidAssets, 0n)];
+  return { ops, numeraire: loan, flashAmount: calc.repaidAssets, seized: calc.seized, repaid: calc.repaidAssets, liquidateOp, exitOps };
 }
 
-/** Simulate a flash-liquidation plan on forked venue + lending state; realized PnL in the loan token. */
-export function simulateFlashLiquidation(venueSnap: VenueSnapshot, lendingSnap: LendingSnapshot, plan: FlashLiquidationPlan): PlanResult {
+/** Simulate a flash-liquidation plan on forked venue + lending state; realized PnL in the loan token.
+ * `trace` (if given) captures the exit swap legs' exact amounts for the encoder. */
+export function simulateFlashLiquidation(venueSnap: VenueSnapshot, lendingSnap: LendingSnapshot, plan: FlashLiquidationPlan, trace?: SwapTrace[]): PlanResult {
   const obj: SimulationObjective = { numeraire: plan.numeraire, requireClosedPortfolio: true, requireNoTransientDebt: true };
-  return simulatePlan(venueSnap, new PortfolioState(), plan.ops, obj, [], lendingSnap);
+  return simulatePlan(venueSnap, new PortfolioState(), plan.ops, obj, trace ?? [], lendingSnap);
 }
