@@ -136,9 +136,9 @@ export interface ValidationResult { validated: boolean; directions: number; deta
  * ACTUALLY crosses initialized ticks, comparing amountOut + sqrtPriceAfter + initializedTicksCrossed to
  * QuoterV2 (all @ B). A snapshot is validated only if ≥1 direction has a tick-crossing probe that matches
  * EXACTLY. Directions with no reasonable tick-crossing input are `not-validated`, never invented. */
-export async function validateSnapshotVsQuoter(client: PublicClient, quoter: Address, snap: TickSnapshot, token0: Address, token1: Address, feePips: number): Promise<ValidationResult> {
+export async function validateSnapshotVsQuoter(client: PublicClient, quoter: Address, snap: TickSnapshot, token0: Address, token1: Address, feePips: number, tickSpacing: number): Promise<ValidationResult> {
   const blockNumber = BigInt(snap.block);
-  const sim: V3PoolSim = { sqrtPriceX96: snap.sqrtPriceX96, liquidity: snap.liquidity, tick: snap.tick, feePips, ticks: snap.ticks };
+  const sim: V3PoolSim = { sqrtPriceX96: snap.sqrtPriceX96, liquidity: snap.liquidity, tick: snap.tick, feePips, tickSpacing, ticks: snap.ticks };
   let validated = 0, tried = 0; const notes: string[] = [];
 
   for (const zeroForOne of [true, false]) {

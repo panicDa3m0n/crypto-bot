@@ -332,7 +332,7 @@ export class RegistryEnricher {
       if (B <= 0) return { done: 0, rateLimited: false };
       const snap = await scanTickMap(client, pool, tickSpacing, B);
       if (!snap) { await this.db.noteTickBootstrapError(cid, pool, "storage scan failed / too large (cost guard)").catch(() => undefined); return { done: 1, rateLimited: false }; }
-      const v = await validateSnapshotVsQuoter(client, profile.quoter, snap, p.token0 as Address, p.token1 as Address, feePips);
+      const v = await validateSnapshotVsQuoter(client, profile.quoter, snap, p.token0 as Address, p.token1 as Address, feePips, tickSpacing);
       if (!v.validated) { await this.db.failPoolTickStatus(cid, pool, `storage snapshot did not reproduce Quoter (${v.detail})`).catch(() => undefined); return { done: 1, rateLimited: false }; }
       // Replay live Mint/Burn [B+1, cursor] so the authoritative snapshot is current with the indexer head.
       const cursor = (await this.db.getIndexerCursor(cid).catch(() => null)) ?? cov.continuousThrough;

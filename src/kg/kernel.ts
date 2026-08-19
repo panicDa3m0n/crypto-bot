@@ -31,7 +31,7 @@ export function buildPoolSim(p: PoolState, ticks?: Array<{ tick: number; liquidi
     return new StablePoolSim(p.address.toLowerCase(), p.token0, p.token1, p.r0, p.r1, p.dec0, p.dec1, fee / 100, "aerodrome-stable");
   }
   if (p.sqrtPriceX96 == null || p.liquidity == null || p.sqrtPriceX96 <= 0n || p.liquidity <= 0n) return null;
-  return new V3PoolSim(p.address.toLowerCase(), p.token0, p.token1, p.sqrtPriceX96, p.liquidity, getTickAtSqrtRatio(p.sqrtPriceX96), fee || 3000, ticks ?? [], p.archetype, p.tickCoverage === "complete" ? "complete" : "partial");
+  return new V3PoolSim(p.address.toLowerCase(), p.token0, p.token1, p.sqrtPriceX96, p.liquidity, getTickAtSqrtRatio(p.sqrtPriceX96), fee || 3000, ticks ?? [], p.archetype, p.tickCoverage === "complete" ? "complete" : "partial", p.tickSpacing ?? 0);
 }
 
 /** Assemble an immutable snapshot from PoolSims. */

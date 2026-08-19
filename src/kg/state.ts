@@ -93,12 +93,13 @@ export class V3PoolSim extends PoolSim {
     readonly poolId: string, readonly token0: string, readonly token1: string,
     public sqrtPriceX96: bigint, public liquidity: bigint, public tick: number, public feePpm: number,
     readonly ticks: ReadonlyArray<{ tick: number; liquidityNet: bigint }>, readonly archetype: Archetype = "v3",
-    readonly tickCoverage: "complete" | "partial" = "partial" // Item 3: certified from pool_tick_status, never ticks.length
+    readonly tickCoverage: "complete" | "partial" = "partial", // Item 3: certified from pool_tick_status, never ticks.length
+    readonly tickSpacing: number = 0 // REQUIRED for exact tick-crossing (word-boundary walk); 0 → fee-tier fallback
   ) { super(); }
 
   private sim(tokenIn: string, amountIn: bigint) {
     const zeroForOne = tokenIn.toLowerCase() === this.token0;
-    const r = simulateExactInputStateful({ sqrtPriceX96: this.sqrtPriceX96, liquidity: this.liquidity, tick: this.tick, feePips: this.feePpm > 0 ? this.feePpm : 3000, ticks: [...this.ticks] }, zeroForOne, amountIn);
+    const r = simulateExactInputStateful({ sqrtPriceX96: this.sqrtPriceX96, liquidity: this.liquidity, tick: this.tick, feePips: this.feePpm > 0 ? this.feePpm : 3000, tickSpacing: this.tickSpacing, ticks: [...this.ticks] }, zeroForOne, amountIn);
     return r;
   }
 
@@ -116,7 +117,7 @@ export class V3PoolSim extends PoolSim {
     return { amountOut: r.amountOut, amountInUsed: r.amountInUsed, partial: r.partial, exact: this.tickCoverage === "complete" && !r.partial };
   }
 
-  clone(): PoolSim { return new V3PoolSim(this.poolId, this.token0, this.token1, this.sqrtPriceX96, this.liquidity, this.tick, this.feePpm, this.ticks, this.archetype, this.tickCoverage); }
+  clone(): PoolSim { return new V3PoolSim(this.poolId, this.token0, this.token1, this.sqrtPriceX96, this.liquidity, this.tick, this.feePpm, this.ticks, this.archetype, this.tickCoverage, this.tickSpacing); }
   reserveOf(token: string): bigint {
     const Q96 = 2n ** 96n;
     return token.toLowerCase() === this.token0 ? (this.liquidity * Q96) / this.sqrtPriceX96 : (this.liquidity * this.sqrtPriceX96) / Q96;

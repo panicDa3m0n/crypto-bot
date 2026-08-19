@@ -47,7 +47,7 @@ async function main() {
   console.log(`[kg-storage-scan] scanned: ${snap.ticks.length} initialized ticks, currentTick=${snap.tick}, liquidity=${snap.liquidity}`);
 
   if (!profile?.quoter) { console.log("[kg-storage-scan] no known Quoter for this fork → scan-only, NOT certifiable"); await db.close(); process.exit(0); }
-  const v = await validateSnapshotVsQuoter(client, profile.quoter, snap, m.token0 as Address, m.token1 as Address, feePips);
+  const v = await validateSnapshotVsQuoter(client, profile.quoter, snap, m.token0 as Address, m.token1 as Address, feePips, tickSpacing);
   console.log(`[kg-storage-scan] validation: ${v.detail}`);
   console.log(v.validated
     ? `[kg-storage-scan] ✓ VALIDATED — storage map reproduces QuoterV2 (amountOut+sqrtPriceAfter+ticksCrossed exact, ${v.directions} tick-crossing direction(s)) → certifiable complete`
