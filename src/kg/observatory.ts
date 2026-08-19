@@ -1,6 +1,6 @@
 import type { Database } from "../db.js";
 import type { Config } from "../config.js";
-import type { Archetype } from "../router/types.js";
+import type { Archetype, PoolState } from "../router/types.js";
 import type { LiquidityGraph } from "./graph-loader.js";
 import { PoolSim, type SwapTrace } from "./state.js";
 import { buildPoolSim, sizeCycle } from "./kernel.js";
@@ -29,13 +29,22 @@ export interface Candidate {
   minProfitNumeraire: bigint;   // the on-chain minProfit floor the execution calldata would carry
 }
 export interface ObserveStats {
-  detectors: Record<string, number>; sized: number; executable: number; economic: number;
+  detectors: Record<string, number>; sized: number; economic: number;
+  economicallyPositive: number;    // economic edge (net > threshold) before encodability
+  routeEncodable: number;          // of those, we can build calldata for the whole route
+  executable: number;              // encodable ∧ exact ∧ fresh ∧ flash-fundable (the honest gate)
   gasPriceWei: string; gasAgeMs: number | null; gasStale: boolean; ethUsd: number; multiVenuePairs: number;
+  // "profit lost to unsupported forks": factories that carry a positive edge we CANNOT encode.
+  unsupportedForks: Array<{ factory: string; candidates: number; peakUsd: number }>;
+  // Coverage Value: economic edge blocked ONLY by partial tick coverage — the demand signal for certification.
+  blockedByTicks: { candidates: number; sumPeakUsd: number; topFactories: Array<{ factory: string; usd: number }>; topPools: Array<{ pool: string; usd: number }> };
 }
 
-export interface ObserveOpts { minGrossBps?: number; maxCycleLen?: number; cycleLimit?: number; gasMaxAgeMs?: number }
+export interface ObserveOpts { minGrossBps?: number; cycleLimit?: number; gasMaxAgeMs?: number }
 
-export async function runObservatory(db: Database, config: Config, graph: LiquidityGraph, opts: ObserveOpts = {}): Promise<{ candidates: Candidate[]; stats: ObserveStats }> {
+/** capability: DB-only own-execution capability of a pool (null = unsupported fork / unenriched). Injected so
+ * the observatory stays decoupled from LocalRouter yet can fold encodability into the gate. */
+export async function runObservatory(db: Database, config: Config, graph: LiquidityGraph, opts: ObserveOpts = {}, capability?: (ps: PoolState) => { venue: string } | null): Promise<{ candidates: Candidate[]; stats: ObserveStats }> {
   const cid = config.CHAIN_ID;
   const weth = config.WBERA_ADDRESS.toLowerCase(), usdc = config.USDC_E_ADDRESS.toLowerCase();
   const minGrossBps = opts.minGrossBps ?? 1, gasMaxAgeMs = opts.gasMaxAgeMs ?? 120_000;
@@ -69,11 +78,14 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
 
   const candidates: Candidate[] = [];
   const detectors: Record<string, number> = { cycle: 0, "pair-curve": 0 };
-  let sized = 0, executable = 0, economic = 0;
+  let sized = 0, executable = 0, economic = 0, economicallyPositive = 0, routeEncodableN = 0;
+  const unsupported = new Map<string, { candidates: number; peakUsd: number }>(); // unencodable positive edges by fork
+  const blocked = { candidates: 0, sumPeakUsd: 0 }; const blockedFactory = new Map<string, number>(), blockedPool = new Map<string, number>();
   const seenKeys = new Set<string>();
   const sym = (t: string) => t === weth ? "WETH" : t === usdc ? "USDC" : t.slice(0, 8);
 
   // Turn a sized cycle into a gated Candidate + record it (dedup by normalized key within this pass).
+  // Gate pipeline: economicEdge → simulationExact → economicallyPositive → routeEncodable → executable.
   const emit = async (detector: Candidate["detector"], cycle: KGCycle, sims: Map<string, PoolSim>): Promise<void> => {
     const sizedCyc = sizeCycle({ chainId: cid, blockNumber: graph.head }, cycle, sims, { funding: "flash", flashProvider: "morpho", flashFee: 0n });
     if (!sizedCyc) return;
@@ -83,11 +95,28 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
     const pools = cycle.edges.map((e) => e.pool);
     const ckey = `${detector}:${num}:${[...pools].sort().join(",")}`;
     if (seenKeys.has(ckey)) return; seenKeys.add(ckey);
-    // Honesty: with no fresh gas we CANNOT claim executable (net would be optimistic). Force fail-closed.
-    let isExec = opp.executable, reason = opp.rejectionReason;
+    // ROUTE-ENCODABLE (Item 4, semantic fix): a route we can't even build calldata for is NOT executable, no
+    // matter how profitable the sim says. Fold own-encodability (DB-only capability) into the gate.
+    const legPools = cycle.edges.map((e) => graph.pools.get(e.pool)).filter((p): p is PoolState => !!p);
+    const unenc = capability ? legPools.filter((p) => !capability(p)) : [];
+    const routeEncodable = unenc.length === 0;
+    const econPositive = opp.executable; // the OLD gate (exact ∧ fresh ∧ flash-fundable ∧ net>threshold)
+    let isExec = econPositive && routeEncodable;
+    let reason = opp.rejectionReason;
+    if (econPositive && !routeEncodable) reason = `route not encodable: ${unenc.length} hop(s) on unsupported fork`;
     if (gasStale && isExec) { isExec = false; reason = "gas_state unavailable/stale — net not trustable"; }
+
     if (opp.economicEdge) economic++;
+    if (econPositive) economicallyPositive++;
+    if (econPositive && routeEncodable) routeEncodableN++;
     if (isExec) executable++;
+    // Metric: profit lost to unsupported forks (economically positive but we can't encode the route).
+    if (econPositive && !routeEncodable) for (const p of unenc) { const f = p.factory ?? "(unknown)"; const e = unsupported.get(f) ?? { candidates: 0, peakUsd: 0 }; e.candidates++; e.peakUsd = Math.max(e.peakUsd, opp.netPnlUsd ?? opp.grossPnlUsd ?? 0); unsupported.set(f, e); }
+    // Coverage Value: economic edge blocked ONLY by partial tick coverage → what certifying WOULD unlock.
+    if (opp.economicEdge && /partial tick coverage/.test(opp.rejectionReason ?? "")) {
+      const usd = Math.max(0, opp.netPnlUsd ?? opp.grossPnlUsd ?? 0); blocked.candidates++; blocked.sumPeakUsd += usd;
+      for (const e of cycle.edges) if (CONC.has(e.archetype as Archetype)) { const p = graph.pools.get(e.pool); const f = p?.factory ?? "(unknown)"; blockedFactory.set(f, (blockedFactory.get(f) ?? 0) + usd); blockedPool.set(e.pool, (blockedPool.get(e.pool) ?? 0) + usd); }
+    }
     detectors[detector]++;
     const cand: Candidate = {
       detector, ckey, numeraire: num, route: cycle.tokens.map(sym).join("→"), pools,
@@ -142,9 +171,19 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
     if (ok) await emit("pair-curve", rc, sims);
   }
 
+  const top = <V,>(m: Map<string, V>, val: (v: V) => number, n = 8) => [...m.entries()].sort((a, b) => val(b[1]) - val(a[1])).slice(0, n);
   return {
     candidates,
-    stats: { detectors, sized, executable, economic, gasPriceWei: gasPriceWei.toString(), gasAgeMs: gas?.ageMs ?? null, gasStale, ethUsd, multiVenuePairs: multiVenue.length },
+    stats: {
+      detectors, sized, economic, economicallyPositive, routeEncodable: routeEncodableN, executable,
+      gasPriceWei: gasPriceWei.toString(), gasAgeMs: gas?.ageMs ?? null, gasStale, ethUsd, multiVenuePairs: multiVenue.length,
+      unsupportedForks: top(unsupported, (v) => v.peakUsd).map(([factory, v]) => ({ factory, candidates: v.candidates, peakUsd: v.peakUsd })),
+      blockedByTicks: {
+        candidates: blocked.candidates, sumPeakUsd: blocked.sumPeakUsd,
+        topFactories: top(blockedFactory, (v) => v).map(([factory, usd]) => ({ factory, usd })),
+        topPools: top(blockedPool, (v) => v).map(([pool, usd]) => ({ pool, usd })),
+      },
+    },
   };
 }
 

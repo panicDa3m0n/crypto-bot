@@ -1,11 +1,11 @@
 /**
- * KG OBSERVE (Item 4.2/4.3/4.4 — the KGObserver inner loop, run once). Loads the full DB graph, runs every
- * detector (READ-ONLY, DB-first gas), persists the lifecycle rows, then does a SHADOW PREFLIGHT on ONLY the
- * top-K executable candidates: a fresh eth_call at the real on-chain minProfit floor, measuring predicted vs
- * chain reality (the `precision = preflight-pass / offline-executable` metric). This honours the RPC principle:
- * thousands of offline candidates → a handful of eth_calls. Scarlet/execution stay OFF (no broadcast).
+ * KG OBSERVE (Item 4 — the KGObserver inner loop, run once). Loads the full DB graph, runs every detector
+ * (READ-ONLY, DB-first gas), folds own-ENCODABILITY into the gate, persists the lifecycle rows, then SHADOW
+ * PREFLIGHTs ONLY the top-K executable candidates: a fresh eth_call at the real minProfit floor, classifying
+ * predicted-vs-chain outcomes into a taxonomy. Reports precision = chain-executable / offline-executable, plus
+ * "profit lost to unsupported forks" and the tick-coverage value. Scarlet/execution stay OFF (no broadcast).
  *
- *   ... run --rm brain node dist/scripts/kg-observe.js [minGrossBps=1] [preflightK=6]
+ *   ... run --rm brain node dist/scripts/kg-observe.js [minGrossBps=1] [preflightK=8]
  */
 import { decodeErrorResult, encodeFunctionData, parseAbi, type Address, type Hex } from "viem";
 import { loadConfig } from "../config.js";
@@ -25,55 +25,58 @@ function revertReason(err: unknown): string {
   if (data && data.length >= 10) { try { const d = decodeErrorResult({ abi: REVERT, data }); if (d.args?.[0]) return String(d.args[0]); } catch { /* not a string revert */ } }
   return e?.cause?.reason ?? e?.cause?.shortMessage ?? e?.shortMessage ?? e?.details ?? String(err).slice(0, 120);
 }
+/** Preflight failure taxonomy — WHERE the offline model and chain reality diverge (drives what to fix next). */
+function classify(reason: string): string {
+  const r = reason.toLowerCase();
+  if (/profit below min/.test(r)) return "PROFIT_MOVED";                                   // was profitable, no longer clears floor
+  if (/transfer|allowance|balance|insufficient|erc20|taxed|fee-on-transfer/.test(r)) return "TOKEN_BEHAVIOR_MISMATCH";
+  if (/call failed|out of gas|invalid opcode|execution reverted/.test(r)) return "POOL_BEHAVIOR_MISMATCH"; // pool doesn't behave as modeled
+  return "UNKNOWN_REVERT: " + reason.slice(0, 60);
+}
 
 async function main() {
   const minGrossBps = Number(process.argv[2] ?? 1);
-  const preflightK = Number(process.argv[3] ?? 6);
+  const preflightK = Number(process.argv[3] ?? 8);
   const config = loadConfig();
   const logger = createLogger({ ...config, LOG_LEVEL: "silent" as never });
   const db = new Database(config.DATABASE_URL);
   const chain = new BerachainClients(config, logger);
   const cid = config.CHAIN_ID;
+  const router = new LocalRouter(config, logger, db, chain);
 
   const g = await loadLiquidityGraph(db, cid);
   const t0 = Date.now();
-  const { candidates, stats } = await runObservatory(db, config, g, { minGrossBps });
+  const { candidates, stats } = await runObservatory(db, config, g, { minGrossBps }, (ps) => router.execCapability(ps));
   const dt = Date.now() - t0;
 
   console.log(`[kg-observe] head=${g.head} lag=${g.lag} gas=${stats.gasPriceWei}wei (age=${stats.gasAgeMs}ms stale=${stats.gasStale}) ethUsd≈${stats.ethUsd.toFixed(2)}`);
-  console.log(`[kg-observe] ${dt}ms: pools=${g.stats.poolsPriced}priced multiVenuePairs=${stats.multiVenuePairs} sized=${stats.sized} economic(gross+)=${stats.economic} executable=${stats.executable} detectors=${JSON.stringify(stats.detectors)}`);
-  const top = candidates.filter((c) => c.grossUsd != null).sort((a, b) => (b.netUsd ?? b.grossUsd ?? -1e9) - (a.netUsd ?? a.grossUsd ?? -1e9)).slice(0, 15);
-  for (const c of top) console.log(`  [${c.detector}] ${c.route.padEnd(22)} gross=${c.grossUsd != null ? "$" + c.grossUsd.toFixed(4) : "n/a"} net=${c.netUsd != null ? "$" + c.netUsd.toFixed(4) : "n/a"} exact=${c.simulationExact} ${c.executable ? "EXECUTABLE ✓" : "skip(" + (c.rejectionReason ?? "") + ")"}`);
+  console.log(`[kg-observe] ${dt}ms  pools=${g.stats.poolsPriced}priced multiVenuePairs=${stats.multiVenuePairs} sized=${stats.sized} detectors=${JSON.stringify(stats.detectors)}`);
+  console.log(`[kg-observe] GATE: economicEdge=${stats.economic} → economicallyPositive=${stats.economicallyPositive} → routeEncodable=${stats.routeEncodable} → executable=${stats.executable}`);
+  if (stats.unsupportedForks.length) console.log(`[kg-observe] profit lost to UNSUPPORTED FORKS (positive edge, can't encode): ${stats.unsupportedForks.map((f) => `${f.factory.slice(0, 10)}:${f.candidates}cand/$${f.peakUsd.toFixed(2)}`).join("  ")}`);
+  const bt = stats.blockedByTicks;
+  console.log(`[kg-observe] COVERAGE VALUE (edge blocked ONLY by partial ticks): ${bt.candidates} cand, Σ$${bt.sumPeakUsd.toFixed(2)}; topFactories=${bt.topFactories.slice(0, 4).map((f) => `${f.factory.slice(0, 10)}:$${f.usd.toFixed(2)}`).join(" ")} topPools=${bt.topPools.slice(0, 4).map((p) => `${p.pool.slice(0, 10)}:$${p.usd.toFixed(2)}`).join(" ")}`);
 
-  // ── SHADOW PREFLIGHT (Item 4.4): top-K executable only → fresh eth_call, predicted vs chain reality ──
+  const top = candidates.filter((c) => c.grossUsd != null).sort((a, b) => (b.netUsd ?? b.grossUsd ?? -1e9) - (a.netUsd ?? a.grossUsd ?? -1e9)).slice(0, 12);
+  for (const c of top) console.log(`  [${c.detector}] ${c.route.padEnd(22)} net=${c.netUsd != null ? "$" + c.netUsd.toFixed(4) : "n/a"} exact=${c.simulationExact} ${c.executable ? "EXECUTABLE ✓" : "skip(" + (c.rejectionReason ?? "") + ")"}`);
+
+  // ── SHADOW PREFLIGHT (Item 4.4): top-K executable → fresh eth_call, classify predicted-vs-chain ──
   const org = await db.getOrgan("kg-executor").catch(() => null);
   const exe = candidates.filter((c) => c.executable).sort((a, b) => (b.netUsd ?? -1e9) - (a.netUsd ?? -1e9)).slice(0, preflightK);
   console.log(`\n[kg-observe] SHADOW PREFLIGHT: ${exe.length} executable candidate(s)${org ? "" : " — NO kg-executor organ, skipping"}`);
-  let pass = 0, attempted = 0;
+  const outcomes: Record<string, number> = {};
+  let pass = 0;
   if (org) {
-    const kg = org.address as Address;
-    const owner = config.WALLET_ADDRESS as Address;
-    const router = new LocalRouter(config, logger, db, chain);
+    const kg = org.address as Address, owner = config.WALLET_ADDRESS as Address;
     for (const c of exe) {
+      const record = async (status: string) => { outcomes[status.split(":")[0]] = (outcomes[status.split(":")[0]] ?? 0) + 1; await db.setCandidatePreflight(cid, c.ckey, status, g.head).catch(() => undefined); };
       const calls = await encodeCycle(router, g.pools, c.legs, kg).catch(() => null);
-      if (!calls) { await db.setCandidatePreflight(cid, c.ckey, "encode-fail (fork not own-executable)", g.head).catch(() => undefined); console.log(`   ${c.route.padEnd(22)} ENCODE-FAIL (a hop is on an unknown fork)`); continue; }
-      attempted++;
+      if (!calls) { await record("ENCODE_UNSUPPORTED"); console.log(`   ${c.route.padEnd(22)} ENCODE_UNSUPPORTED`); continue; }
       const tuples = calls.map((x) => ({ target: x.target, value: x.value, data: x.data }));
-      // (1) route validity at minProfit=0, then (2) real minProfit floor at CURRENT chain head.
-      try { await chain.primary.call({ account: owner, to: kg, data: encodeFunctionData({ abi: FLASH_ABI, functionName: "flashExecute", args: [0, c.numeraire as Address, c.amountIn, 0n, tuples] }) }); }
-      catch (e) { const r = revertReason(e); await db.setCandidatePreflight(cid, c.ckey, `route-revert: ${r}`, g.head).catch(() => undefined); console.log(`   ${c.route.padEnd(22)} ROUTE-REVERT "${r}"`); continue; }
-      try {
-        await chain.primary.call({ account: owner, to: kg, data: encodeFunctionData({ abi: FLASH_ABI, functionName: "flashExecute", args: [0, c.numeraire as Address, c.amountIn, c.minProfitNumeraire, tuples] }) });
-        pass++; await db.setCandidatePreflight(cid, c.ckey, "pass", g.head).catch(() => undefined);
-        console.log(`   ${c.route.padEnd(22)} PREFLIGHT PASS ✓ (predicted net=$${(c.netUsd ?? 0).toFixed(4)} holds at head ${g.head}, minProfit=${c.minProfitNumeraire})`);
-      } catch (e) {
-        const r = revertReason(e); const below = /profit below min/i.test(r);
-        await db.setCandidatePreflight(cid, c.ckey, below ? "fail-unprofitable-at-head" : `fail: ${r}`, g.head).catch(() => undefined);
-        console.log(`   ${c.route.padEnd(22)} PREFLIGHT FAIL — ${below ? "no longer clears real minProfit at head (mirror moved / competition)" : `"${r}"`}`);
-      }
+      try { await chain.primary.call({ account: owner, to: kg, data: encodeFunctionData({ abi: FLASH_ABI, functionName: "flashExecute", args: [0, c.numeraire as Address, c.amountIn, c.minProfitNumeraire, tuples] }) });
+        pass++; await record("pass"); console.log(`   ${c.route.padEnd(22)} PASS ✓ net=$${(c.netUsd ?? 0).toFixed(4)} holds at head ${g.head}`);
+      } catch (e) { const cl = classify(revertReason(e)); await record(cl); console.log(`   ${c.route.padEnd(22)} ${cl}`); }
     }
-    const encodeFail = exe.length - attempted;
-    console.log(`[kg-observe] PRECISION: ${pass}/${exe.length} offline-executable are chain-executable at head ${g.head} (${exe.length ? (100 * pass / exe.length).toFixed(0) : 0}%) — encodeFail=${encodeFail} (unsupported fork), routeOrProfitFail=${attempted - pass}`);
+    console.log(`[kg-observe] PRECISION: ${pass}/${exe.length} chain-executable (${exe.length ? (100 * pass / exe.length).toFixed(0) : 0}%)  outcomes=${JSON.stringify(outcomes)}`);
   }
   await db.close().catch(() => undefined);
   process.exit(0);

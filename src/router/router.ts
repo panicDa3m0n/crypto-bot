@@ -105,6 +105,11 @@ export class LocalRouter extends Aggregator {
     return this.execVenues().get(factory) ?? null;
   }
 
+  /** PUBLIC, DB-only own-execution capability of a pool (factory → our router + encoder venue), or null when
+   * the fork is unsupported / the factory isn't enriched yet. The KG observatory folds this into `executable`
+   * so a route we can't even ENCODE is never called executable. No chain RPC. */
+  execCapability(pool: PoolState): { router: Address; venue: Archetype } | null { return this.resolveExec(pool); }
+
   /** SlipStream tickSpacing (immutable) — DB-FIRST: read from the pool's enriched meta (PoolState.tickSpacing),
    * NEVER live from chain. null = not yet enriched → not own-executable yet (caller falls back). */
   private resolveTickSpacing(pool: PoolState): number | null {
