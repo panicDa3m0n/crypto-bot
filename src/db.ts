@@ -482,6 +482,14 @@ export class Database {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (chain_id, pool)
       );
+      -- Item 3.2 (historical-log bootstrap): bootstrap_through = last historical block whose Mint/Burn are
+      -- fully applied (grows creation_block → coverageStart−1, advanced ATOMICALLY with its deltas);
+      -- coverage_generation = the indexer generation the completeness was certified against; creation_source
+      -- = provenance of creation_block; priority = bootstrap worklist priority (0=P0 demand-driven … 3=P3).
+      ALTER TABLE pool_tick_status ADD COLUMN IF NOT EXISTS bootstrap_through BIGINT;
+      ALTER TABLE pool_tick_status ADD COLUMN IF NOT EXISTS coverage_generation INTEGER;
+      ALTER TABLE pool_tick_status ADD COLUMN IF NOT EXISTS creation_source TEXT;
+      ALTER TABLE pool_tick_status ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 3;
       CREATE TABLE IF NOT EXISTS raw_blocks (
         chain_id INTEGER NOT NULL,
         block_number BIGINT NOT NULL,
@@ -1478,6 +1486,79 @@ export class Database {
   async invalidateTickCertification(chainId: number, reason: string): Promise<number> {
     const r = await this.pool.query(`UPDATE pool_tick_status SET complete=false, status='partial', last_error=$2, updated_at=NOW() WHERE chain_id=$1 AND complete=true`, [chainId, reason]);
     return r.rowCount ?? 0;
+  }
+
+  /** Full tick-status row for a pool (Item 3.2 bootstrap decisions). */
+  async getPoolTickStatus(chainId: number, pool: string): Promise<{ status: string; source: string; creationBlock: number | null; bootstrapThrough: number | null; complete: boolean; coverageGeneration: number | null; priority: number } | null> {
+    const r = await this.pool.query<{ status: string; source: string; creation_block: string | null; bootstrap_through: string | null; complete: boolean; coverage_generation: number | null; priority: number }>(
+      `SELECT status, source, creation_block::text, bootstrap_through::text, complete, coverage_generation, priority FROM pool_tick_status WHERE chain_id=$1 AND pool=$2`, [chainId, pool.toLowerCase()]);
+    const x = r.rows[0];
+    return x ? { status: x.status, source: x.source, creationBlock: x.creation_block != null ? Number(x.creation_block) : null, bootstrapThrough: x.bootstrap_through != null ? Number(x.bootstrap_through) : null, complete: x.complete, coverageGeneration: x.coverage_generation, priority: x.priority } : null;
+  }
+  /** Concentrated pools NOT yet tick-complete — the bootstrap worklist, priority ASC (0=P0 demand-driven). */
+  async poolsNeedingTickBootstrap(chainId: number, limit = 20, maxPriority = 3): Promise<Array<{ pool: string; archetype: string; createdBlock: number | null; origin: string | null }>> {
+    const r = await this.pool.query<{ address: string; arch: string; created_block: string | null; origin: string | null }>(
+      `SELECT e.address, e.meta->>'archetype' arch, e.created_block::text, e.meta->>'origin' origin
+       FROM entities e LEFT JOIN pool_tick_status pts ON pts.chain_id=e.chain_id AND pts.pool=e.address
+       WHERE e.chain_id=$1 AND e.kind='pool' AND e.meta->>'archetype'='v3' AND length(e.address)=42
+         AND (pts.complete IS NULL OR pts.complete=false) AND (pts.status IS NULL OR pts.status <> 'failed')
+         AND COALESCE(pts.priority,3) <= $3
+       ORDER BY COALESCE(pts.priority,3) ASC, pts.updated_at ASC NULLS FIRST LIMIT $2`, [chainId, limit, maxPriority]);
+    return r.rows.map((x) => ({ pool: x.address, archetype: x.arch, createdBlock: x.created_block != null ? Number(x.created_block) : null, origin: x.origin }));
+  }
+  async setPoolTickPriority(chainId: number, pool: string, priority: number): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO pool_tick_status(chain_id, pool, priority) VALUES($1,$2,$3)
+       ON CONFLICT (chain_id, pool) DO UPDATE SET priority=LEAST(pool_tick_status.priority,$3), updated_at=NOW()`, [chainId, pool.toLowerCase(), priority]);
+  }
+  async setPoolTickCreation(chainId: number, pool: string, creationBlock: number, source: string): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO pool_tick_status(chain_id, pool, creation_block, creation_source, status) VALUES($1,$2,$3,$4,'bootstrapping')
+       ON CONFLICT (chain_id, pool) DO UPDATE SET creation_block=$3, creation_source=$4, updated_at=NOW()`, [chainId, pool.toLowerCase(), creationBlock, source]);
+  }
+  async failPoolTickStatus(chainId: number, pool: string, error: string): Promise<void> {
+    await this.pool.query(`UPDATE pool_tick_status SET status='failed', last_error=$3, attempts=attempts+1, updated_at=NOW() WHERE chain_id=$1 AND pool=$2`, [chainId, pool.toLowerCase(), error.slice(0, 300)]);
+  }
+  /** SOFT bootstrap error (e.g. an archive-depth getLogs miss): bump attempts + record; only mark 'failed'
+   * (giving up → needs 3.4 storage-scan/archive) once attempts reach `cap`. Returns whether it gave up. */
+  async noteTickBootstrapError(chainId: number, pool: string, error: string, cap = 8): Promise<boolean> {
+    const r = await this.pool.query<{ failed: boolean }>(
+      `UPDATE pool_tick_status SET attempts=attempts+1, last_error=$3, status = CASE WHEN attempts+1 >= $4 THEN 'failed' ELSE status END, updated_at=NOW()
+       WHERE chain_id=$1 AND pool=$2 RETURNING (attempts >= $4) AS failed`, [chainId, pool.toLowerCase(), error.slice(0, 300), cap]);
+    return r.rows[0]?.failed ?? false;
+  }
+  /** Certify a bootstrapped pool complete — ONLY after the caller re-checked coverage/generation. Stamps the
+   * generation it was certified against (a later gap's global invalidation still resets it). */
+  async certifyPoolTickComplete(chainId: number, pool: string, generation: number, source: string): Promise<void> {
+    await this.pool.query(`UPDATE pool_tick_status SET complete=true, status='complete', source=$3, coverage_generation=$4, updated_at=NOW() WHERE chain_id=$1 AND pool=$2`, [chainId, pool.toLowerCase(), source, generation]);
+  }
+  /** RESTART-SAFE bootstrap step: in ONE transaction, assert the chunk is contiguous (from == through+1, or
+   * == creation_block for the first), additively apply its Mint/Burn deltas, and advance bootstrap_through —
+   * so a crash either applies both or neither (exactly-once, independent of chunk boundaries). */
+  async applyTickBootstrapChunk(chainId: number, pool: string, fromBlock: number, toBlock: number, deltas: Array<{ tickLower: number; tickUpper: number; liquidityDelta: bigint }>): Promise<{ ok: boolean; reason?: string }> {
+    const p = pool.toLowerCase();
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const st = await client.query<{ creation_block: string | null; bootstrap_through: string | null }>(`SELECT creation_block::text, bootstrap_through::text FROM pool_tick_status WHERE chain_id=$1 AND pool=$2 FOR UPDATE`, [chainId, p]);
+      const row = st.rows[0];
+      if (!row) { await client.query("ROLLBACK"); return { ok: false, reason: "no status row" }; }
+      const bt = row.bootstrap_through != null ? Number(row.bootstrap_through) : null;
+      const creation = row.creation_block != null ? Number(row.creation_block) : null;
+      const expectedFrom = bt != null ? bt + 1 : creation;
+      if (expectedFrom == null || fromBlock !== expectedFrom) { await client.query("ROLLBACK"); return { ok: false, reason: `non-contiguous: expected from ${expectedFrom}, got ${fromBlock}` }; }
+      const net = new Map<number, bigint>();
+      for (const d of deltas) { net.set(d.tickLower, (net.get(d.tickLower) ?? 0n) + d.liquidityDelta); net.set(d.tickUpper, (net.get(d.tickUpper) ?? 0n) - d.liquidityDelta); }
+      if (net.size) {
+        const values: unknown[] = [];
+        const tuples = [...net.entries()].map(([tick, v], i) => { const b = i * 5; values.push(chainId, p, tick, v.toString(), toBlock); return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},NOW())`; });
+        await client.query(`INSERT INTO tick_liquidity(chain_id,pool,tick,liquidity_net,block_number,updated_at) VALUES ${tuples.join(",")} ON CONFLICT (chain_id,pool,tick) DO UPDATE SET liquidity_net = tick_liquidity.liquidity_net + EXCLUDED.liquidity_net, block_number = GREATEST(tick_liquidity.block_number, EXCLUDED.block_number), updated_at=NOW()`, values);
+      }
+      await client.query(`UPDATE pool_tick_status SET bootstrap_through=$3, status='bootstrapping', attempts=attempts+1, updated_at=NOW() WHERE chain_id=$1 AND pool=$2`, [chainId, p, toBlock]);
+      await client.query("COMMIT");
+      return { ok: true };
+    } catch (e) { await client.query("ROLLBACK").catch(() => undefined); return { ok: false, reason: e instanceof Error ? e.message : String(e) }; }
+    finally { client.release(); }
   }
   async saveRawBlock(chainId: number, block: number, logs: unknown): Promise<void> {
     await this.pool.query(`INSERT INTO raw_blocks(chain_id, block_number, logs) VALUES($1,$2,$3) ON CONFLICT (chain_id, block_number) DO UPDATE SET logs=$3, at=NOW()`, [chainId, block, jsonParam(logs)]);

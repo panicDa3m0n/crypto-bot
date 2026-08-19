@@ -5,6 +5,7 @@ import type { Database } from "./db.js";
 import type { BerachainClients } from "./chain.js";
 import type { Etherscan } from "./etherscan.js";
 import type { Blockscout } from "./blockscout.js";
+import { UNIV3_MINT, UNIV3_BURN, POOL_CREATED, EVENT_DECODERS, type RawLog } from "./indexer/events.js";
 
 const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)", "function tickSpacing() view returns (int24)"]);
 const AERO_STABLE_ABI = parseAbi(["function stable() view returns (bool)"]);
@@ -78,6 +79,10 @@ export class RegistryEnricher {
       const aero = await this.enrichAeroStable(block);
       did = pools.done + toks.done + facs.done + aero.done;
       rateLimited = pools.rateLimited || toks.rateLimited || facs.rateLimited || aero.rateLimited;
+      // Tick-map bootstrap (Item 3.2): P0 (demand-driven, KG-requested) runs ALWAYS so it's never starved;
+      // P1–P3 (background historical) only when the fast queues are idle.
+      const tb0 = await this.enrichTickBootstrap(0); did += tb0.done; rateLimited = rateLimited || tb0.rateLimited;
+      if (!did) { const tb = await this.enrichTickBootstrap(3); did += tb.done; rateLimited = rateLimited || tb.rateLimited; }
       // Etherscan verified/proxy signal — only when the fast queue is idle and not more than once per interval.
       if (!did && this.etherscan.available && Date.now() - this.lastVerifiedAt > this.config.ENRICH_INTERVAL_MS) { await this.enrichVerified(); this.lastVerifiedAt = Date.now(); }
     } finally {
@@ -179,6 +184,92 @@ export class RegistryEnricher {
       await this.pace();
     }
     return { done, rateLimited: false };
+  }
+
+  /** Locate a pool's CREATION block AUTHORITATIVELY via its factory's PoolCreated log, filtered by the
+   * discriminant indexed topics (token0, token1, fee) — this uses only the LOG index (which public RPCs
+   * serve for history), NOT historical STATE (getCode, which they prune). Cascades primary→fallback→
+   * enrichment. Returns null if the factory/tokens/fee aren't known yet or no provider serves the range. */
+  private async locateCreationBlock(pool: Address, meta: { token0?: string; token1?: string; fee?: unknown; factory?: string }, head: number): Promise<number | null> {
+    const factory = meta.factory?.toLowerCase(), t0 = meta.token0?.toLowerCase(), t1 = meta.token1?.toLowerCase(), fee = Number(meta.fee);
+    if (!factory || !t0 || !t1 || !Number.isFinite(fee) || fee <= 0) return null; // need the discriminant topics
+    const pad = (h: string) => "0x" + h.replace(/^0x/, "").toLowerCase().padStart(64, "0");
+    const topics = [POOL_CREATED, pad(t0), pad(t1), pad(fee.toString(16))];
+    const lanes = [this.chain.primary, this.chain.fallback, this.chain.enrichment]; // base.org (archive logs) first
+    for (const c of lanes) {
+      try {
+        const logs = await (c as unknown as { request: (a: { method: string; params: unknown }) => Promise<unknown> }).request({ method: "eth_getLogs", params: [{ address: factory, topics, fromBlock: "0x0", toBlock: "0x" + head.toString(16) }] }) as RawLog[];
+        if (logs && logs.length) return Number(BigInt(logs[0].blockNumber));
+      } catch { /* range/limit → try next lane */ }
+      await this.pace();
+    }
+    return null;
+  }
+
+  /** ITEM 3.2 — historical tick-map bootstrap (one pending concentrated pool per drain, priority-ordered).
+   * Reconstructs [creationBlock, coverageStart−1] Mint/Burn deltas via the SAME algebra the indexer uses
+   * forward, applied through the RESTART-SAFE transactional cursor (applyTickBootstrapChunk). Certifies
+   * complete ONLY after RE-CHECKING that coverage/generation still hold (a mid-bootstrap jump invalidates
+   * the premise). Range [creation, coverageStart−1] is disjoint from live coverage → additive, no overlap. */
+  private async enrichTickBootstrap(maxPriority = 3): Promise<{ done: number; rateLimited: boolean }> {
+    const cid = this.config.CHAIN_ID;
+    const cov = await this.db.getIndexerCoverage(cid).catch(() => null);
+    if (!cov) return { done: 0, rateLimited: false };
+    const target = cov.coverageStart - 1;
+    const batch = await this.db.poolsNeedingTickBootstrap(cid, 1, maxPriority).catch(() => []);
+    if (!batch.length) return { done: 0, rateLimited: false };
+    const p = batch[0];
+    const pool = p.pool.toLowerCase() as Address;
+    const hex = (n: number) => "0x" + n.toString(16);
+    // Historical logs need archive depth the enrichment lane often lacks → cascade to primary/fallback.
+    const lanes = [this.chain.enrichment, this.chain.primary, this.chain.fallback];
+    const req = async (m: string, prm: unknown): Promise<unknown> => {
+      let lastErr: unknown;
+      for (const c of lanes) { try { return await (c as unknown as { request: (a: { method: string; params: unknown }) => Promise<unknown> }).request({ method: m, params: prm }); } catch (e) { lastErr = e; } }
+      throw lastErr;
+    };
+    try {
+      let status = await this.db.getPoolTickStatus(cid, pool);
+      let creation = status?.creationBlock ?? null;
+      if (creation == null) {
+        const ent = await this.db.getEntity(cid, pool).catch(() => []);
+        const pm = (ent[0]?.meta ?? {}) as { token0?: string; token1?: string; fee?: unknown; factory?: string };
+        const src = (p.origin === "created" && p.createdBlock != null) ? "pool_created" : "pool_created_log";
+        creation = (p.origin === "created" && p.createdBlock != null) ? p.createdBlock : await this.locateCreationBlock(pool, pm, cov.continuousThrough);
+        if (creation == null) { await this.db.noteTickBootstrapError(cid, pool, "creation block not located (factory PoolCreated)").catch(() => undefined); return { done: 0, rateLimited: false }; }
+        await this.db.setPoolTickCreation(cid, pool, creation, src);
+        status = await this.db.getPoolTickStatus(cid, pool);
+      }
+      if (creation > target) { await this.db.certifyPoolTickComplete(cid, pool, cov.generation, "live_indexer"); return { done: 1, rateLimited: false }; } // born inside live coverage
+      let from = status?.bootstrapThrough != null ? status.bootstrapThrough + 1 : creation;
+      let span = 2000, chunks = 0;
+      while (from <= target && chunks < 25) {
+        const to = Math.min(from + span - 1, target);
+        let logs: RawLog[] | null = null;
+        try { logs = await req("eth_getLogs", [{ address: pool, topics: [[UNIV3_MINT, UNIV3_BURN]], fromBlock: hex(from), toBlock: hex(to) }]) as RawLog[]; }
+        catch (e) { if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: chunks, rateLimited: true }; } if (span > 400) { span = Math.floor(span / 2); continue; } const gaveUp = await this.db.noteTickBootstrapError(cid, pool, `getLogs failed @${from} (archive depth?)`).catch(() => false); if (gaveUp) this.logger.debug({ pool, from }, "tick bootstrap: giving up (archive unavailable) → needs storage-scan/3.4"); return { done: chunks, rateLimited: false }; }
+        const deltas: Array<{ tickLower: number; tickUpper: number; liquidityDelta: bigint }> = [];
+        for (const l of logs ?? []) { const d = EVENT_DECODERS.get((l.topics[0] ?? "").toLowerCase())?.(l); if (d && d.kind === "liquidity_v3") deltas.push({ tickLower: d.tickLower, tickUpper: d.tickUpper, liquidityDelta: d.liquidityDelta }); }
+        const r = await this.db.applyTickBootstrapChunk(cid, pool, from, to, deltas);
+        if (!r.ok) { await this.db.failPoolTickStatus(cid, pool, r.reason ?? "apply failed"); return { done: chunks, rateLimited: false }; }
+        from = to + 1; chunks += 1;
+        if (span < 2000 && (logs?.length ?? 0) < 50) span = Math.min(2000, span * 2);
+        await this.pace();
+      }
+      if (from > target) {
+        // RE-CHECK: the premise (unbroken coverage from coverageStart, same generation) must still hold.
+        const cov2 = await this.db.getIndexerCoverage(cid).catch(() => null);
+        if (cov2 && cov2.generation === cov.generation && cov2.coverageStart === cov.coverageStart) {
+          await this.db.certifyPoolTickComplete(cid, pool, cov2.generation, "historical_logs");
+          this.logger.info({ pool, creation, through: target, generation: cov2.generation }, "tick-map bootstrap COMPLETE");
+        }
+      }
+      return { done: chunks || 1, rateLimited: false };
+    } catch (e) {
+      if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: 0, rateLimited: true }; }
+      await this.db.failPoolTickStatus(cid, pool, e instanceof Error ? e.message : String(e)).catch(() => undefined);
+      return { done: 0, rateLimited: false };
+    }
   }
 
   /** Backfill `meta.factory` for pools that have it missing (old/bare pools discovered before the factory

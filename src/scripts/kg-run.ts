@@ -122,6 +122,9 @@ async function main() {
     const usd = opp.grossPnlUsd != null ? `$${opp.grossPnlUsd.toFixed(4)}` : "n/a";
     const net = opp.netPnlUsd != null ? `$${opp.netPnlUsd.toFixed(4)}` : "n/a";
     console.log(`  ${sym(num).padEnd(6)} gross=${usd} gas=$${opp.gasCostUsd.toFixed(4)} net=${net} ${opp.executable ? "EXECUTABLE" : `skip(${opp.rejectionReason})`}  ${c.tokens.map(sym).join("→")} (${c.edges.map((e) => e.archetype).join(",")})`);
+    // Item 3.2 DEMAND-DRIVEN (via DB, no RPC): a good edge blocked only by partial tick coverage → mark its
+    // concentrated legs P0 so the enricher bootstraps them next; the opportunity re-qualifies once complete.
+    if (!opp.executable && /partial tick coverage/.test(opp.rejectionReason ?? "")) for (const e of c.edges) if (CONC.has(e.archetype as Archetype)) await db.setPoolTickPriority(cid, e.pool, 0).catch(() => undefined);
 
     // Encode + eth_call to prove the compilation→executor→simulation path (numéraire flash-fundable only).
     if (!ctx.flashFundable.has(num)) continue;
