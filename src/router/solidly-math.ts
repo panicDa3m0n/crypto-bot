@@ -84,6 +84,9 @@ export function stableProbe(r0: bigint, r1: bigint, dec0: bigint, dec1: bigint, 
   if (r0 <= 0n || r1 <= 0n) return null;
   const rIn = inIsToken0 ? r0 : r1;
   const probe = rIn / 1_000_000n > 0n ? rIn / 1_000_000n : 1n;
-  const out = stableGetAmountOut(probe, inIsToken0, r0, r1, dec0, dec1, feeBps);
+  // Pathological/near-dust reserves can make the Newton invariant non-convergent → no edge (fail-closed),
+  // never propagate the throw into the graph builder.
+  let out: bigint;
+  try { out = stableGetAmountOut(probe, inIsToken0, r0, r1, dec0, dec1, feeBps); } catch { return null; }
   return out > 0n ? { inWei: probe, outWei: out } : null;
 }

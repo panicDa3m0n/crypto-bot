@@ -442,6 +442,42 @@ export class Database {
         synced BOOLEAN NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      -- GAS STATE (Item 4): DB-first gas price so the READ-SIDE (KG observatory/gate) never calls getGasPrice().
+      -- Written by a WRITE-SIDE poller (the enricher, on its own lane, throttled); read by everyone. gas_price_wei
+      -- is the effective price used to value a plan's gasUnits in USD.
+      CREATE TABLE IF NOT EXISTS gas_state (
+        chain_id INTEGER PRIMARY KEY,
+        gas_price_wei NUMERIC NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      -- KG CANDIDATE LIFECYCLE (Item 4.3): every economic opportunity the observatory sees, with its lifetime.
+      -- Keyed by (detector + normalized route) so the SAME opportunity across blocks updates one row: we learn
+      -- how OFTEN they appear, how LONG they last, how much they're WORTH, and whether they survive to preflight.
+      CREATE TABLE IF NOT EXISTS kg_candidates (
+        chain_id INTEGER NOT NULL,
+        ckey TEXT NOT NULL,
+        detector TEXT NOT NULL,
+        numeraire TEXT NOT NULL,
+        route TEXT NOT NULL,
+        pools TEXT[] NOT NULL,
+        amount_in NUMERIC NOT NULL,
+        gross_usd DOUBLE PRECISION,
+        gas_units NUMERIC,
+        gas_usd DOUBLE PRECISION,
+        net_usd DOUBLE PRECISION,
+        simulation_exact BOOLEAN NOT NULL,
+        executable BOOLEAN NOT NULL,
+        rejection_reason TEXT,
+        first_seen_block BIGINT NOT NULL,
+        last_seen_block BIGINT NOT NULL,
+        seen_count INTEGER NOT NULL DEFAULT 1,
+        peak_net_usd DOUBLE PRECISION,
+        preflight_status TEXT,          -- null=not tried, 'pass'/'fail'/reason (Item 4.4 shadow preflight)
+        preflight_block BIGINT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (chain_id, ckey)
+      );
+      CREATE INDEX IF NOT EXISTS kg_candidates_net ON kg_candidates(chain_id, executable, net_usd DESC);
       -- INDEXER COVERAGE (Item 3): the CONTINUOUSLY-observed block range, distinct from the recovery cursor
       -- (indexer_state.last_block) and from current freshness (chain_status). coverage_start = the first
       -- block of the current UNBROKEN ingested sequence (NOT the configured cold-start); continuous_through
@@ -1443,6 +1479,49 @@ export class Database {
     );
     const row = r.rows[0];
     return row ? { indexedBlock: Number(row.indexed_block), networkHead: Number(row.network_head_seen), lag: Number(row.lag_blocks), synced: row.synced, ageMs: Number(row.age) } : null;
+  }
+
+  /** DB-first gas (Item 4). WRITER = a write-side poller (the enricher). The read-side reads this instead of
+   * ever calling getGasPrice(). */
+  async upsertGasState(chainId: number, gasPriceWei: bigint): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO gas_state(chain_id, gas_price_wei) VALUES($1,$2)
+       ON CONFLICT (chain_id) DO UPDATE SET gas_price_wei=$2, updated_at=NOW()`, [chainId, gasPriceWei.toString()]
+    );
+  }
+  /** Read-side gas source: {gasPriceWei, ageMs}. null if never polled. */
+  async getGasState(chainId: number): Promise<{ gasPriceWei: bigint; ageMs: number } | null> {
+    const r = await this.pool.query<{ gas: string; age: string }>(
+      `SELECT gas_price_wei::text AS gas, (EXTRACT(EPOCH FROM (NOW()-updated_at))*1000)::bigint::text AS age FROM gas_state WHERE chain_id=$1`, [chainId]
+    );
+    const row = r.rows[0];
+    return row ? { gasPriceWei: BigInt(row.gas.split(".")[0]), ageMs: Number(row.age) } : null;
+  }
+
+  /** Persist/refresh a KG candidate (Item 4.3). Same (detector, route) → one row whose lifecycle grows:
+   * first_seen_block is preserved, last_seen_block/seen_count/peak advance, current metrics overwrite. */
+  async upsertCandidate(c: { chainId: number; ckey: string; detector: string; numeraire: string; route: string; pools: string[]; amountIn: bigint; grossUsd: number | null; gasUnits: bigint; gasUsd: number | null; netUsd: number | null; simulationExact: boolean; executable: boolean; rejectionReason?: string; block: number }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO kg_candidates(chain_id, ckey, detector, numeraire, route, pools, amount_in, gross_usd, gas_units, gas_usd, net_usd, simulation_exact, executable, rejection_reason, first_seen_block, last_seen_block, seen_count, peak_net_usd)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15,1,$11)
+       ON CONFLICT (chain_id, ckey) DO UPDATE SET
+         amount_in=$7, gross_usd=$8, gas_units=$9, gas_usd=$10, net_usd=$11,
+         simulation_exact=$12, executable=$13, rejection_reason=$14,
+         last_seen_block=$15, seen_count=kg_candidates.seen_count+1,
+         peak_net_usd=GREATEST(kg_candidates.peak_net_usd, COALESCE($11,-1e9)), updated_at=NOW()`,
+      [c.chainId, c.ckey, c.detector, c.numeraire, c.route, c.pools, c.amountIn.toString(), c.grossUsd, c.gasUnits.toString(), c.gasUsd, c.netUsd, c.simulationExact, c.executable, c.rejectionReason ?? null, c.block]
+    );
+  }
+  /** Top candidates for the shadow-preflight pass / reporting (Item 4.4), ranked by net USD. */
+  async topCandidates(chainId: number, limit = 20, executableOnly = false): Promise<Array<{ ckey: string; detector: string; numeraire: string; route: string; pools: string[]; amountIn: bigint; netUsd: number | null; grossUsd: number | null; simulationExact: boolean; executable: boolean; seenCount: number; firstSeenBlock: number; lastSeenBlock: number; peakNetUsd: number | null }>> {
+    const r = await this.pool.query<{ ckey: string; detector: string; numeraire: string; route: string; pools: string[]; amount_in: string; net_usd: number | null; gross_usd: number | null; simulation_exact: boolean; executable: boolean; seen_count: number; first_seen_block: string; last_seen_block: string; peak_net_usd: number | null }>(
+      `SELECT ckey, detector, numeraire, route, pools, amount_in::text, net_usd, gross_usd, simulation_exact, executable, seen_count, first_seen_block::text, last_seen_block::text, peak_net_usd
+       FROM kg_candidates WHERE chain_id=$1 ${executableOnly ? "AND executable=true" : ""} ORDER BY net_usd DESC NULLS LAST LIMIT $2`, [chainId, limit]
+    );
+    return r.rows.map((x) => ({ ckey: x.ckey, detector: x.detector, numeraire: x.numeraire, route: x.route, pools: x.pools, amountIn: BigInt(x.amount_in.split(".")[0]), netUsd: x.net_usd, grossUsd: x.gross_usd, simulationExact: x.simulation_exact, executable: x.executable, seenCount: x.seen_count, firstSeenBlock: Number(x.first_seen_block), lastSeenBlock: Number(x.last_seen_block), peakNetUsd: x.peak_net_usd }));
+  }
+  async setCandidatePreflight(chainId: number, ckey: string, status: string, block: number): Promise<void> {
+    await this.pool.query(`UPDATE kg_candidates SET preflight_status=$3, preflight_block=$4, updated_at=NOW() WHERE chain_id=$1 AND ckey=$2`, [chainId, ckey, status, block]);
   }
   // --- Item 3: indexer coverage / gaps / per-pool tick-map completeness -------
   async getIndexerCoverage(chainId: number): Promise<{ coverageStart: number; continuousThrough: number; generation: number } | null> {

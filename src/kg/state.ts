@@ -151,7 +151,11 @@ export class StablePoolSim extends PoolSim {
   quote(tokenIn: string, amountIn: bigint): SwapOutcome | null {
     if (amountIn <= 0n || this.r0 <= 0n || this.r1 <= 0n || !this.has(tokenIn)) return null;
     const inIs0 = tokenIn.toLowerCase() === this.token0;
-    const out = stableGetAmountOut(amountIn, inIs0, this.r0, this.r1, this.dec0, this.dec1, this.feeBps);
+    // Pathological/near-dust stable reserves can make the Newton invariant non-convergent → treat the pool as
+    // unquotable (fail-closed), never let one bad pool crash the whole graph search.
+    let out: bigint;
+    try { out = stableGetAmountOut(amountIn, inIs0, this.r0, this.r1, this.dec0, this.dec1, this.feeBps); }
+    catch { return null; }
     const rOut = inIs0 ? this.r1 : this.r0;
     return out > 0n && out < rOut ? { amountOut: out, amountInUsed: amountIn, partial: false, exact: true } : null;
   }

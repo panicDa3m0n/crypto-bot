@@ -12,6 +12,7 @@ import { scanTickMap, validateSnapshotVsQuoter, tickStorageProfile } from "./rou
 const UNIV3_QUOTER_BASE = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a" as Address; // Uniswap V3 QuoterV2 on Base
 const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 }; // 2500=Pancake tier
 const STORAGE_SCAN_INTERVAL_MS = 15_000; // heavy last-resort path (Pinax reliable lane) — bound its cadence
+const GAS_POLL_INTERVAL_MS = 20_000;     // DB-first gas: write-side poller cadence (read-side reads gas_state)
 
 const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)", "function tickSpacing() view returns (int24)"]);
 const AERO_STABLE_ABI = parseAbi(["function stable() view returns (bool)"]);
@@ -40,6 +41,7 @@ export class RegistryEnricher {
   private running = false;
   private lastVerifiedAt = 0;
   private lastStorageScanAt = 0;
+  private lastGasAt = 0;
   private scanClient?: PublicClient | null; // lazy reliable lane (Pinax) for storage-scan certification; null = unconfigured
   private nudged = false; // a nudge has a drain scheduled imminently (coalesces a burst of nudges into one)
 
@@ -98,6 +100,12 @@ export class RegistryEnricher {
       if (Date.now() - this.lastStorageScanAt > STORAGE_SCAN_INTERVAL_MS) {
         const ss = await this.enrichTickStorageScan(); did += ss.done; rateLimited = rateLimited || ss.rateLimited;
         this.lastStorageScanAt = Date.now();
+      }
+      // DB-first gas (Item 4): write-side poller so the read-side (KG observatory/gate) never calls getGasPrice.
+      if (Date.now() - this.lastGasAt > GAS_POLL_INTERVAL_MS) {
+        this.lastGasAt = Date.now();
+        const gp = await this.chain.primary.getGasPrice().catch(() => 0n);
+        if (gp > 0n) await this.db.upsertGasState(this.config.CHAIN_ID, gp).catch(() => undefined);
       }
       // Etherscan verified/proxy signal — only when the fast queue is idle and not more than once per interval.
       if (!did && this.etherscan.available && Date.now() - this.lastVerifiedAt > this.config.ENRICH_INTERVAL_MS) { await this.enrichVerified(); this.lastVerifiedAt = Date.now(); }
