@@ -51,6 +51,7 @@ export class SwapOp implements Transformation {
     const o = s.venue.applySwap(this.poolId, this.tokenIn, a);
     if (!o) { s.portfolio.credit(this.tokenIn, a); return { ok: false, reason: "pool quote failed" }; }
     s.portfolio.credit(this.tokenOut, o.amountOut);
+    s.trace?.push({ poolId: this.poolId, tokenIn: this.tokenIn, tokenOut: this.tokenOut, amountIn: a, amountOut: o.amountOut });
     s.gasUnits += this.gas();
     return { ok: true, note: `${a}→${o.amountOut}${o.partial ? " (partial)" : ""}` };
   }

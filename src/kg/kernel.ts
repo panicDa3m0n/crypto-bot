@@ -1,6 +1,6 @@
 import type { PoolState } from "../router/types.js";
 import { getTickAtSqrtRatio } from "../router/tick-math.js";
-import { PoolSim, V2PoolSim, V3PoolSim, VenueSnapshot, PortfolioState, type StateVersion, type SimulationState, type AssetId } from "./state.js";
+import { PoolSim, V2PoolSim, V3PoolSim, VenueSnapshot, PortfolioState, type StateVersion, type SimulationState, type AssetId, type SwapTrace } from "./state.js";
 import { SwapOp, FlashBorrowOp, FlashRepayOp, type Transformation } from "./operators.js";
 import type { KGCycle } from "./cycle-finder.js";
 
@@ -54,9 +54,9 @@ export interface PlanResult {
 
 /** Run `ops` from `initial` against a fresh fork of `snapshot`; evaluate against `obj`. Pure: `initial`
  * and the snapshot are never mutated (the fork is copy-on-write). */
-export function simulatePlan(snapshot: VenueSnapshot, initial: PortfolioState, ops: Transformation[], obj: SimulationObjective): PlanResult {
+export function simulatePlan(snapshot: VenueSnapshot, initial: PortfolioState, ops: Transformation[], obj: SimulationObjective, trace?: SwapTrace[]): PlanResult {
   const startNum = initial.get(obj.numeraire);
-  const s: SimulationState = { version: snapshot.version, portfolio: initial.clone(), venue: snapshot.fork(), gasUnits: 0n };
+  const s: SimulationState = { version: snapshot.version, portfolio: initial.clone(), venue: snapshot.fork(), gasUnits: 0n, trace };
   for (const op of ops) {
     const r = op.apply(s);
     if (!r.ok) return { valid: false, reason: `${op.kind}: ${r.reason}`, realizedPnl: 0n, gasUnits: s.gasUnits, residual: [], finalNumeraire: s.portfolio.get(obj.numeraire) };
@@ -82,10 +82,11 @@ export interface SizeOpts {
 export interface SizedCycle {
   amountIn: bigint;
   numeraire: AssetId;
-  realizedPnl: bigint;   // raw wei of numéraire (start token)
+  realizedPnl: bigint;   // raw wei of numéraire (start token) — GROSS (no gas/flash fee subtracted)
   gasUnits: bigint;
   funding: "own" | "flash";
-  ops: Transformation[]; // the winning plan (for encoding)
+  ops: Transformation[]; // the winning plan (for reference)
+  legs: SwapTrace[];     // per-hop exact amounts (for the encoder)
 }
 
 /** Build the plan for a cycle at a given input size. Start token = cycle.tokens[0] = numéraire. Each leg
@@ -146,8 +147,9 @@ export function sizeCycle(version: StateVersion, cycle: KGCycle, poolSims: Map<s
   }
 
   if (bestP <= 0n) return null; // no profitable size → artifact, drop
-  const { ops } = cyclePlan(cycle, bestX, opts);
-  // Recompute gas at the winner.
-  const r = simulatePlan(snapshot, opts.funding === "own" ? (() => { const p = new PortfolioState(); p.credit(numeraire, bestX); return p; })() : new PortfolioState(), ops, obj);
-  return { amountIn: bestX, numeraire, realizedPnl: bestP, gasUnits: r.gasUnits, funding: opts.funding, ops };
+  const { ops, initial } = cyclePlan(cycle, bestX, opts);
+  // Recompute at the winner WITH a trace to capture per-hop amounts for the encoder.
+  const legs: SwapTrace[] = [];
+  const r = simulatePlan(snapshot, initial, ops, obj, legs);
+  return { amountIn: bestX, numeraire, realizedPnl: bestP, gasUnits: r.gasUnits, funding: opts.funding, ops, legs };
 }

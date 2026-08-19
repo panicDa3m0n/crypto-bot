@@ -218,10 +218,16 @@ export class PortfolioState {
   }
 }
 
-/** The full simulation state: version + portfolio + venue overlay + accumulated gas (units). */
+/** One executed swap leg, recorded when a trace sink is attached — the encoder needs the exact per-hop
+ * input/output amounts (leg N's input = leg N−1's output, unknown until simulated). */
+export interface SwapTrace { poolId: string; tokenIn: AssetId; tokenOut: AssetId; amountIn: bigint; amountOut: bigint }
+
+/** The full simulation state: version + portfolio + venue overlay + accumulated gas (units). An optional
+ * `trace` sink records swap legs (off in the hot search; on when encoding the winner). */
 export interface SimulationState {
   version: StateVersion;
   portfolio: PortfolioState;
   venue: VenueFork;
   gasUnits: bigint;
+  trace?: SwapTrace[];
 }

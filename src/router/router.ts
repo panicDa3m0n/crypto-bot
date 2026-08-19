@@ -250,6 +250,29 @@ export class LocalRouter extends Aggregator {
   }
 
   /**
+   * Encode ONE swap leg through a SPECIFIC pool (NOT re-routed, unlike execPlan which re-selects the best
+   * pool) into that venue-router's calldata — for the KG executor's Call[]. Tokens are ERC20 (no native
+   * wrap in a mid-cycle hop); recipient is the executor so each leg's output funds the next. `minOut` per
+   * leg can be 0 — the executor's final require(minProfit) is the true boundary. Returns null if the pool
+   * isn't own-executable (unknown fork / unresolved slipstream tickSpacing). */
+  async encodeLeg(pool: PoolState, tokenIn: Address, tokenOut: Address, amountIn: bigint, minOut: bigint, recipient: Address): Promise<{ router: Address; calldata: `0x${string}`; value: bigint; venue: Archetype } | null> {
+    const r = await this.resolveExec(pool);
+    if (!r) return null;
+    const { router, venue } = r;
+    let tickSpacing: number | undefined;
+    if (venue === "slipstream") { const ts = await this.resolveTickSpacing(pool.address); if (ts == null) return null; tickSpacing = ts; }
+    const weth = this.cfg.WBERA_ADDRESS as Address;
+    const call = buildExec({
+      venue: venue as "v3" | "aerodrome" | "v2" | "slipstream", router, weth,
+      tokenIn, tokenOut, amountIn, minOut, recipient, deadline: BigInt(Math.floor(Date.now() / 1000) + 1200),
+      nativeIn: false, nativeOut: false, feePpm: pool.feePpm, tickSpacing,
+      stable: venue === "aerodrome" ? (pool.archetype === "aerodrome-stable") : false,
+      factory: (pool.factory ?? this.factoryCache.get(pool.address)) as Address
+    });
+    return { router, calldata: call.calldata, value: call.value, venue };
+  }
+
+  /**
    * EXECUTION calldata for the aggregator path. Builds from a REAL external-aggregator route (super),
    * so the aggregator fallback in swapBest is unchanged. Own execution goes through `execPlan` above,
    * invoked by Primitives.swapViaLocalExec BEFORE this fallback.
