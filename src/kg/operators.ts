@@ -1,4 +1,5 @@
 import type { SimulationState, AssetId } from "./state.js";
+import { lifWad, repaidFromSeized, seizeForFullRepay } from "./lending.js";
 
 /**
  * TRANSFORMATIONS — the typed edges of the stateful Liquidity Graph. Each is an economic state-transition
@@ -90,6 +91,51 @@ export class FlashBorrowOp implements Transformation {
   gas(): bigint { return GAS_FLASH; }
   describe(): string { return `flashBorrow ${this.amount} ${this.token.slice(0, 8)} @${this.provider}`; }
 }
+
+/** Liquidate a Morpho borrower: repay part of their debt in loan token, seize collateral (+ the LIF
+ * bonus). Mutates the LENDING state (position collateral/debt) AND the portfolio (loan out, collateral
+ * in), exactly like a SwapOp mutates pool + portfolio — so a flash-liquidation is an ordinary plan. The
+ * PROTOCOL check (HF<1) gates applicability; the ECONOMIC check (seizable>0, exit>repay+gas) is the gate's
+ * job, never folded in here. `seizeRequest` = collateral we ask to seize (capped to what fully repays). */
+export class LiquidateOp implements Transformation {
+  readonly kind = "liquidate";
+  seized = 0n; repaid = 0n; // filled by apply() — the encoder reads these
+  constructor(readonly marketId: string, readonly borrower: string, readonly seizeRequest: bigint) {}
+
+  applicable(s: SimulationState): boolean {
+    const L = s.lending; if (!L) return false;
+    const m = L.market(this.marketId), pos = L.position(this.marketId, this.borrower);
+    if (!m || !pos || !pos.protocolLiquidatable(m)) return false;
+    const lif = lifWad(m.params.lltv);
+    const seize = min(this.seizeRequest, seizeForFullRepay(pos.debtAssets, m.oraclePrice, lif, pos.collateral));
+    const repaid = repaidFromSeized(seize, m.oraclePrice, lif);
+    return seize > 0n && s.portfolio.get(m.params.loanToken) >= repaid;
+  }
+
+  apply(s: SimulationState): ApplyResult {
+    const L = s.lending; if (!L) return { ok: false, reason: "no lending state" };
+    const m = L.market(this.marketId); const posR = L.position(this.marketId, this.borrower);
+    if (!m || !posR) return { ok: false, reason: "market/position missing" };
+    if (!posR.protocolLiquidatable(m)) return { ok: false, reason: "position not liquidatable (HF≥1)" };
+    const lif = lifWad(m.params.lltv);
+    const seize = min(this.seizeRequest, seizeForFullRepay(posR.debtAssets, m.oraclePrice, lif, posR.collateral));
+    if (seize <= 0n) return { ok: false, reason: "no seizable collateral" };
+    const repaid = repaidFromSeized(seize, m.oraclePrice, lif);
+    if (repaid <= 0n) return { ok: false, reason: "zero repay" };
+    if (!s.portfolio.debit(m.params.loanToken, repaid)) return { ok: false, reason: `insufficient loan to repay (${repaid})` };
+    const pos = L.mutablePosition(this.marketId, this.borrower)!;
+    pos.collateral -= seize; pos.debtAssets -= repaid > pos.debtAssets ? pos.debtAssets : repaid;
+    s.portfolio.credit(m.params.collateralToken, seize);
+    this.seized = seize; this.repaid = repaid;
+    s.gasUnits += this.gas();
+    return { ok: true, note: `liq seize ${seize} repay ${repaid}` };
+  }
+
+  gas(): bigint { return 320_000n; } // Morpho accrue + liquidate
+  describe(): string { return `liquidate ${this.borrower.slice(0, 10)} @${this.marketId.slice(0, 10)} seize≈${this.seizeRequest}`; }
+}
+
+function min(a: bigint, b: bigint): bigint { return a < b ? a : b; }
 
 /** Repay a flash obligation: `amount` principal + `fee` (Morpho = 0). Fails if funds/obligation short. */
 export class FlashRepayOp implements Transformation {

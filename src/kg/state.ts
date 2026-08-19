@@ -223,11 +223,14 @@ export class PortfolioState {
 export interface SwapTrace { poolId: string; tokenIn: AssetId; tokenOut: AssetId; amountIn: bigint; amountOut: bigint }
 
 /** The full simulation state: version + portfolio + venue overlay + accumulated gas (units). An optional
- * `trace` sink records swap legs (off in the hot search; on when encoding the winner). */
+ * `trace` sink records swap legs (off in the hot search; on when encoding the winner). `lending` overlays
+ * the Morpho markets/positions (F5), so a LiquidateOp mutates the same state a SwapOp does — a
+ * flash-liquidation is then an ordinary plan. Absent for pure-swap plans. */
 export interface SimulationState {
   version: StateVersion;
   portfolio: PortfolioState;
   venue: VenueFork;
   gasUnits: bigint;
   trace?: SwapTrace[];
+  lending?: import("./lending.js").LendingFork;
 }

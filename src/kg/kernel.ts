@@ -1,8 +1,9 @@
 import type { PoolState } from "../router/types.js";
 import { getTickAtSqrtRatio } from "../router/tick-math.js";
 import { PoolSim, V2PoolSim, V3PoolSim, VenueSnapshot, PortfolioState, type StateVersion, type SimulationState, type AssetId, type SwapTrace } from "./state.js";
-import { SwapOp, FlashBorrowOp, FlashRepayOp, type Transformation } from "./operators.js";
+import { SwapOp, FlashBorrowOp, FlashRepayOp, LiquidateOp, type Transformation } from "./operators.js";
 import type { KGCycle } from "./cycle-finder.js";
+import { LendingSnapshot, BorrowerPositionSim, LendingMarketSim, lifWad, repaidFromSeized, seizeForFullRepay } from "./lending.js";
 
 /**
  * SIMULATION KERNEL — the deterministic driver over the stateful model. Runs a plan (a list of
@@ -54,9 +55,9 @@ export interface PlanResult {
 
 /** Run `ops` from `initial` against a fresh fork of `snapshot`; evaluate against `obj`. Pure: `initial`
  * and the snapshot are never mutated (the fork is copy-on-write). */
-export function simulatePlan(snapshot: VenueSnapshot, initial: PortfolioState, ops: Transformation[], obj: SimulationObjective, trace?: SwapTrace[]): PlanResult {
+export function simulatePlan(snapshot: VenueSnapshot, initial: PortfolioState, ops: Transformation[], obj: SimulationObjective, trace?: SwapTrace[], lending?: LendingSnapshot): PlanResult {
   const startNum = initial.get(obj.numeraire);
-  const s: SimulationState = { version: snapshot.version, portfolio: initial.clone(), venue: snapshot.fork(), gasUnits: 0n, trace };
+  const s: SimulationState = { version: snapshot.version, portfolio: initial.clone(), venue: snapshot.fork(), gasUnits: 0n, trace, lending: lending?.fork() };
   for (const op of ops) {
     const r = op.apply(s);
     if (!r.ok) return { valid: false, reason: `${op.kind}: ${r.reason}`, realizedPnl: 0n, gasUnits: s.gasUnits, residual: [], finalNumeraire: s.portfolio.get(obj.numeraire) };
@@ -152,4 +153,41 @@ export function sizeCycle(version: StateVersion, cycle: KGCycle, poolSims: Map<s
   const legs: SwapTrace[] = [];
   const r = simulatePlan(snapshot, initial, ops, obj, legs);
   return { amountIn: bestX, numeraire, realizedPnl: bestP, gasUnits: r.gasUnits, funding: opts.funding, ops, legs };
+}
+
+// ── Flash-liquidation as an ordinary plan (F5) ───────────────────────────────
+export interface FlashLiquidationPlan {
+  ops: Transformation[];
+  numeraire: AssetId;   // loan token (the profit asset)
+  flashAmount: bigint;  // loan flash-borrowed = debt repaid
+  seized: bigint;       // collateral seized
+  repaid: bigint;       // loan repaid to Morpho
+  swapPoolId: string;
+  liquidateOp: LiquidateOp;
+  swapOp: SwapOp;
+}
+
+/** Build the canonical flash-liquidation plan for a liquidatable position:
+ *   FlashBorrow(loan, repaid) → Liquidate(seize) → Swap(collateral→loan, full) → FlashRepay(loan, repaid)
+ * `seize`/`repaid` are computed from the position (full-repay, capped by collateral). Returns null if the
+ * position is not protocol-liquidatable or nothing is seizable. Numéraire = loan token; realized PnL =
+ * swapOut − repaid. The economic actionability (PnL>0, net>threshold) is the gate's job, not this. */
+export function planFlashLiquidation(market: LendingMarketSim, pos: BorrowerPositionSim, collateralPoolId: string, collateralArchetype: string, provider = "morpho"): FlashLiquidationPlan | null {
+  if (!pos.protocolLiquidatable(market)) return null;
+  const lif = lifWad(market.params.lltv);
+  const seized = seizeForFullRepay(pos.debtAssets, market.oraclePrice, lif, pos.collateral);
+  if (seized <= 0n) return null;
+  const repaid = repaidFromSeized(seized, market.oraclePrice, lif);
+  if (repaid <= 0n) return null;
+  const loan = market.params.loanToken, coll = market.params.collateralToken;
+  const liquidateOp = new LiquidateOp(market.marketId, pos.borrower, seized);
+  const swapOp = new SwapOp(collateralPoolId, coll, loan, 0n, collateralArchetype, true);
+  const ops: Transformation[] = [new FlashBorrowOp(provider, loan, repaid), liquidateOp, swapOp, new FlashRepayOp(provider, loan, repaid, 0n)];
+  return { ops, numeraire: loan, flashAmount: repaid, seized, repaid, swapPoolId: collateralPoolId, liquidateOp, swapOp };
+}
+
+/** Simulate a flash-liquidation plan on forked venue + lending state; realized PnL in the loan token. */
+export function simulateFlashLiquidation(venueSnap: VenueSnapshot, lendingSnap: LendingSnapshot, plan: FlashLiquidationPlan): PlanResult {
+  const obj: SimulationObjective = { numeraire: plan.numeraire, requireClosedPortfolio: true, requireNoTransientDebt: true };
+  return simulatePlan(venueSnap, new PortfolioState(), plan.ops, obj, [], lendingSnap);
 }

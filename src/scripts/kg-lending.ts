@@ -73,7 +73,7 @@ async function main() {
     const m = fork.market(r.marketId)!;
     const pos = fork.position(r.marketId, r.borrower)!;
     const hf = pos.healthFactor(m);
-    const liquidatable = pos.liquidatable(m);
+    const liquidatable = pos.protocolLiquidatable(m);
     const liqPrice = pos.liqPrice(m);
     const margin = liqPrice > 0n ? Number(m.oraclePrice - liqPrice) / Number(liqPrice) : NaN; // how far above the trigger
     if (liquidatable) liq++;
