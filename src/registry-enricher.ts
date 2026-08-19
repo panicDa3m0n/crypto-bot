@@ -1,11 +1,17 @@
 import type { Logger } from "pino";
-import { parseAbi, type Address } from "viem";
+import { parseAbi, createPublicClient, http, type Address, type PublicClient } from "viem";
+import { base } from "viem/chains";
 import type { Config } from "./config.js";
 import type { Database } from "./db.js";
 import type { BerachainClients } from "./chain.js";
 import type { Etherscan } from "./etherscan.js";
 import type { Blockscout } from "./blockscout.js";
 import { UNIV3_MINT, UNIV3_BURN, POOL_CREATED, EVENT_DECODERS, type RawLog } from "./indexer/events.js";
+import { scanTickMap, validateSnapshotVsQuoter, tickStorageProfile } from "./router/tick-storage.js";
+
+const UNIV3_QUOTER_BASE = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a" as Address; // Uniswap V3 QuoterV2 on Base
+const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 3000: 60, 10000: 200 };
+const STORAGE_SCAN_INTERVAL_MS = 15_000; // heavy last-resort path (Pinax reliable lane) — bound its cadence
 
 const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)", "function tickSpacing() view returns (int24)"]);
 const AERO_STABLE_ABI = parseAbi(["function stable() view returns (bool)"]);
@@ -33,6 +39,8 @@ export class RegistryEnricher {
   private timer?: NodeJS.Timeout;
   private running = false;
   private lastVerifiedAt = 0;
+  private lastStorageScanAt = 0;
+  private scanClient?: PublicClient | null; // lazy reliable lane (Pinax) for storage-scan certification; null = unconfigured
   private nudged = false; // a nudge has a drain scheduled imminently (coalesces a burst of nudges into one)
 
   constructor(
@@ -83,6 +91,14 @@ export class RegistryEnricher {
       // P1–P3 (background historical) only when the fast queues are idle.
       const tb0 = await this.enrichTickBootstrap(0); did += tb0.done; rateLimited = rateLimited || tb0.rateLimited;
       if (!did) { const tb = await this.enrichTickBootstrap(3); did += tb.done; rateLimited = rateLimited || tb.rateLimited; }
+      // Storage-scan certification (Item 3.4b/c/d) — recovery for the FINITE set of pools the historical-log
+      // bootstrap gave up on (status=failed). Runs on its OWN reliable lane (Pinax), disjoint from the bootstrap
+      // lane, so it is decoupled from the bootstrap queue (no starvation behind P0/P3) and bounded solely by the
+      // 15s throttle. Cheap no-op when the failed set is empty. No reliable lane ⇒ dormant.
+      if (Date.now() - this.lastStorageScanAt > STORAGE_SCAN_INTERVAL_MS) {
+        const ss = await this.enrichTickStorageScan(); did += ss.done; rateLimited = rateLimited || ss.rateLimited;
+        this.lastStorageScanAt = Date.now();
+      }
       // Etherscan verified/proxy signal — only when the fast queue is idle and not more than once per interval.
       if (!did && this.etherscan.available && Date.now() - this.lastVerifiedAt > this.config.ENRICH_INTERVAL_MS) { await this.enrichVerified(); this.lastVerifiedAt = Date.now(); }
     } finally {
@@ -267,6 +283,77 @@ export class RegistryEnricher {
       return { done: chunks || 1, rateLimited: false };
     } catch (e) {
       if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: 0, rateLimited: true }; }
+      await this.db.failPoolTickStatus(cid, pool, e instanceof Error ? e.message : String(e)).catch(() => undefined);
+      return { done: 0, rateLimited: false };
+    }
+  }
+
+  /** The reliable read lane for storage scans (a multi-hundred-word tick sweep throttles public RPCs). Pinax
+   * (or any archive-grade endpoint) via PINAX_RPC/SCAN_RPC. Lazily built; null (cached) when unconfigured so
+   * the storage-scan path simply stays dormant — it never falls back to a flaky lane and mis-certifies. */
+  private getScanClient(): PublicClient | null {
+    if (this.scanClient !== undefined) return this.scanClient;
+    const url = process.env.PINAX_RPC || process.env.SCAN_RPC || "";
+    this.scanClient = url ? (createPublicClient({ chain: base, transport: http(url, { batch: false }) }) as unknown as PublicClient) : null;
+    if (!this.scanClient) this.logger.debug("storage-scan lane not configured (PINAX_RPC/SCAN_RPC) → storage certification dormant");
+    return this.scanClient;
+  }
+
+  /**
+   * STORAGE-SCAN certification (Item 3.4b/c/d) — for pools the historical-log bootstrap could NOT complete
+   * (archive depth exhausted, status=failed). Reads the pool's COMPLETE tick map from chain STATE at a settled
+   * block B on the reliable lane, VALIDATES it reproduces QuoterV2 (amountOut+sqrtPriceAfter+ticksCrossed),
+   * REPLACES the DB tick map with that authoritative snapshot + replays live Mint/Burn [B+1,cursor], then
+   * certifies against the CURRENT coverage generation. Fail-closed at every seam: no reliable lane, no known
+   * Quoter for the fork, or a validation miss ⇒ never certify. Snapshot REPLACE (not additive) — the scan is
+   * an authoritative state read, not another delta reconstruction.
+   */
+  private async enrichTickStorageScan(): Promise<{ done: number; rateLimited: boolean }> {
+    const client = this.getScanClient();
+    if (!client) return { done: 0, rateLimited: false };
+    const cid = this.config.CHAIN_ID;
+    const cov = await this.db.getIndexerCoverage(cid).catch(() => null);
+    if (!cov) return { done: 0, rateLimited: false };
+    const batch = await this.db.poolsForStorageScan(cid, 1).catch(() => []);
+    if (!batch.length) return { done: 0, rateLimited: false };
+    const p = batch[0];
+    const pool = p.pool.toLowerCase() as Address;
+    if (pool.length !== 42) return { done: 0, rateLimited: false };   // V4 poolId — not storage-scannable here
+    if (!p.token0 || !p.token1) { await this.db.noteTickBootstrapError(cid, pool, "storage scan: tokens unknown").catch(() => undefined); return { done: 0, rateLimited: false }; }
+    const profile = tickStorageProfile(p.factory ?? undefined, { DEX_FACTORY: this.config.DEX_FACTORY, UNIV3_QUOTER: UNIV3_QUOTER_BASE });
+    if (!profile?.quoter) { await this.db.failPoolTickStatus(cid, pool, "no known Quoter for fork → not storage-certifiable").catch(() => undefined); return { done: 1, rateLimited: false }; }
+    const feePips = Number(p.fee) > 0 ? Number(p.fee) : 500;
+    const tickSpacing = Number(p.tickSpacing) > 0 ? Number(p.tickSpacing) : (FEE_TO_SPACING[feePips] ?? 0);
+    if (!tickSpacing) { await this.db.failPoolTickStatus(cid, pool, "storage scan: tickSpacing unknown").catch(() => undefined); return { done: 1, rateLimited: false }; }
+    try {
+      const head = Number(await client.getBlockNumber().catch(() => 0n));
+      if (!head) return { done: 0, rateLimited: false };
+      const B = Math.min(head - 3, cov.continuousThrough); // settled block the lane serves, ≤ our continuous head
+      if (B <= 0) return { done: 0, rateLimited: false };
+      const snap = await scanTickMap(client, pool, tickSpacing, B);
+      if (!snap) { await this.db.noteTickBootstrapError(cid, pool, "storage scan failed / too large (cost guard)").catch(() => undefined); return { done: 1, rateLimited: false }; }
+      const v = await validateSnapshotVsQuoter(client, profile.quoter, snap, p.token0 as Address, p.token1 as Address, feePips);
+      if (!v.validated) { await this.db.failPoolTickStatus(cid, pool, `storage snapshot did not reproduce Quoter (${v.detail})`).catch(() => undefined); return { done: 1, rateLimited: false }; }
+      // Replay live Mint/Burn [B+1, cursor] so the authoritative snapshot is current with the indexer head.
+      const cursor = (await this.db.getIndexerCursor(cid).catch(() => null)) ?? cov.continuousThrough;
+      const replay: Array<{ tickLower: number; tickUpper: number; liquidityDelta: bigint }> = [];
+      const hex = (n: number) => "0x" + n.toString(16);
+      for (let from = B + 1; from <= cursor; from += 2000) {
+        const to = Math.min(from + 1999, cursor);
+        const logs = await (client as unknown as { request: (a: { method: string; params: unknown }) => Promise<unknown> }).request({ method: "eth_getLogs", params: [{ address: pool, topics: [[UNIV3_MINT, UNIV3_BURN]], fromBlock: hex(from), toBlock: hex(to) }] }) as RawLog[];
+        for (const l of logs ?? []) { const d = EVENT_DECODERS.get((l.topics[0] ?? "").toLowerCase())?.(l); if (d && d.kind === "liquidity_v3") replay.push({ tickLower: d.tickLower, tickUpper: d.tickUpper, liquidityDelta: d.liquidityDelta }); }
+      }
+      const r = await this.db.replaceTickMapSnapshot(cid, pool, B, snap.ticks, cursor, replay);
+      if (!r.ok) { await this.db.failPoolTickStatus(cid, pool, r.reason ?? "snapshot replace failed").catch(() => undefined); return { done: 1, rateLimited: false }; }
+      // RE-CHECK: coverage generation/start must still hold (the indexer may have reset mid-scan) before certify.
+      const cov2 = await this.db.getIndexerCoverage(cid).catch(() => null);
+      if (cov2 && cov2.generation === cov.generation && cov2.coverageStart === cov.coverageStart) {
+        await this.db.certifyPoolTickComplete(cid, pool, cov2.generation, "storage_scan");
+        this.logger.info({ pool, B, through: cursor, ticks: snap.ticks.length, directions: v.directions, generation: cov2.generation }, "tick-map STORAGE SCAN certified complete");
+      }
+      return { done: 1, rateLimited: false };
+    } catch (e) {
+      if (isRateLimit(e)) return { done: 0, rateLimited: true };
       await this.db.failPoolTickStatus(cid, pool, e instanceof Error ? e.message : String(e)).catch(() => undefined);
       return { done: 0, rateLimited: false };
     }

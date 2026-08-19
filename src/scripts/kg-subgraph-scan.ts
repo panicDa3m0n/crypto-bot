@@ -10,17 +10,19 @@
 import { createPublicClient, http, parseAbi, type Address, type PublicClient } from "viem";
 import { base } from "viem/chains";
 import { loadConfig } from "../config.js";
-import { fetchSubgraphTicks } from "../router/tick-subgraph.js";
+import { fetchSubgraphTicks, graphNetworkEndpoint } from "../router/tick-subgraph.js";
 import { bitmapTickSet } from "../router/tick-storage.js";
 
 const SPACING_ABI = parseAbi(["function tickSpacing() view returns (int24)"]);
-const DEFAULT_POOL = "0xbc6c0c5cc269d5febb1ef11c74a1581c34525e21"; // a Pancake V3 Base pool (factory 0x0BFbCF9f)
-const DEFAULT_SUBGRAPH = "https://api.studio.thegraph.com/query/45376/exchange-v3-base/version/latest"; // Pancake V3 Base (keyless Studio)
+const DEFAULT_POOL = "0xd0b53d9277642d899df5c87a3966a349a798f224"; // Uniswap V3 WETH/USDC 0.05% (~1971 ticks)
+const UNIV3_BASE_SUBGRAPH_ID = process.env.UNIV3_BASE_SUBGRAPH_ID ?? "96eJ9Go8gFjySRGnndG7EYxThaiwVDV8BYPp1TMDcoYh";
 
 async function main() {
   loadConfig();
   const pool = (process.argv[2] ?? DEFAULT_POOL).toLowerCase() as Address;
-  const endpoint = process.argv[3] ?? DEFAULT_SUBGRAPH;
+  // Endpoint from THE GRAPH gateway (API key in env, never logged). Explicit arg3 overrides.
+  const endpoint = process.argv[3] ?? graphNetworkEndpoint(process.env.THEGRAPH_API_KEY, UNIV3_BASE_SUBGRAPH_ID);
+  if (!endpoint) { console.log("[kg-subgraph-scan] no subgraph endpoint (set THEGRAPH_API_KEY) → storage-scan fallback"); process.exit(1); }
   const client = createPublicClient({ chain: base, transport: http("https://mainnet.base.org", { batch: false }) }) as unknown as PublicClient;
 
   const maxBlock = Number(await client.getBlockNumber().catch(() => 0n)) - 3;

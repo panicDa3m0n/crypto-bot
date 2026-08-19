@@ -1536,11 +1536,14 @@ export class Database {
    * (historical bootstrap gave up → storage snapshot is the fallback). Priority ASC (P0 first). */
   async poolsForStorageScan(chainId: number, limit = 4): Promise<Array<{ pool: string; factory: string | null; tickSpacing: number | null; fee: number | null; token0: string | null; token1: string | null }>> {
     const r = await this.pool.query<{ address: string; factory: string | null; ts: string | null; fee: string | null; t0: string | null; t1: string | null }>(
+      // FALLBACK SET ONLY: pools the historical-log bootstrap gave up on (status='failed'). The storage scan
+      // is the recovery path for these — never a competitor to an in-flight bootstrap on the same pool. Runs on
+      // its own reliable lane, so it is decoupled from the bootstrap queue. Highest priority / oldest first.
       `SELECT e.address, e.meta->>'factory' factory, e.meta->>'tickSpacing' ts, e.meta->>'fee' fee, e.meta->>'token0' t0, e.meta->>'token1' t1
-       FROM entities e LEFT JOIN pool_tick_status pts ON pts.chain_id=e.chain_id AND pts.pool=e.address
+       FROM entities e JOIN pool_tick_status pts ON pts.chain_id=e.chain_id AND pts.pool=e.address
        WHERE e.chain_id=$1 AND e.kind='pool' AND e.meta->>'archetype'='v3' AND length(e.address)=42
-         AND (pts.complete IS NULL OR pts.complete=false)
-       ORDER BY COALESCE(pts.priority,3) ASC, (pts.status='failed') DESC, pts.updated_at ASC NULLS FIRST LIMIT $2`, [chainId, limit]);
+         AND pts.status='failed' AND pts.complete IS NOT TRUE
+       ORDER BY pts.priority ASC, pts.updated_at ASC NULLS FIRST LIMIT $2`, [chainId, limit]);
     return r.rows.map((x) => ({ pool: x.address, factory: x.factory, tickSpacing: x.ts != null ? Number(x.ts) : null, fee: x.fee != null ? Number(x.fee) : null, token0: x.t0, token1: x.t1 }));
   }
 
