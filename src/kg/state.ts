@@ -1,6 +1,7 @@
 import type { Archetype } from "../router/types.js";
 import { simulateExactInputStateful } from "../router/v3-sim.js";
 import { getTickAtSqrtRatio } from "../router/tick-math.js";
+import { stableGetAmountOut } from "../router/solidly-math.js";
 
 /**
  * STATEFUL SIMULATION KERNEL — the state model of the Liquidity Graph. The KG is not a fixed-weight
@@ -119,6 +120,38 @@ export class V3PoolSim extends PoolSim {
   }
 
   static tickFromSqrt(sqrtPriceX96: bigint): number { return getTickAtSqrtRatio(sqrtPriceX96); }
+}
+
+/** Solidly/Aerodrome STABLE pool (x³y+xy³=k). Uses the integer-exact shared math (solidly-math.ts), so
+ * quote == on-chain getAmountOut. Needs the two tokens' decimal SCALES (10**decimals) and the factory fee
+ * in bps. The reserve mutation matches the contract: the fee LEAVES the pool (to PoolFees), so the input
+ * reserve grows by (amountIn − fee), not the full amountIn — critical for a second swap in a VenueFork. */
+export class StablePoolSim extends PoolSim {
+  constructor(
+    readonly poolId: string, readonly token0: string, readonly token1: string,
+    public r0: bigint, public r1: bigint, readonly dec0: bigint, readonly dec1: bigint, public feeBps: number,
+    readonly archetype: Archetype = "aerodrome-stable"
+  ) { super(); }
+
+  quote(tokenIn: string, amountIn: bigint): SwapOutcome | null {
+    if (amountIn <= 0n || this.r0 <= 0n || this.r1 <= 0n || !this.has(tokenIn)) return null;
+    const inIs0 = tokenIn.toLowerCase() === this.token0;
+    const out = stableGetAmountOut(amountIn, inIs0, this.r0, this.r1, this.dec0, this.dec1, this.feeBps);
+    const rOut = inIs0 ? this.r1 : this.r0;
+    return out > 0n && out < rOut ? { amountOut: out, amountInUsed: amountIn, partial: false } : null;
+  }
+
+  applySwap(tokenIn: string, amountIn: bigint): SwapOutcome | null {
+    const o = this.quote(tokenIn, amountIn);
+    if (!o) return null;
+    const fee = (amountIn * BigInt(Math.round(this.feeBps))) / 10_000n; // fee moved out of the pool (PoolFees)
+    if (tokenIn.toLowerCase() === this.token0) { this.r0 += amountIn - fee; this.r1 -= o.amountOut; }
+    else { this.r1 += amountIn - fee; this.r0 -= o.amountOut; }
+    return o;
+  }
+
+  clone(): PoolSim { return new StablePoolSim(this.poolId, this.token0, this.token1, this.r0, this.r1, this.dec0, this.dec1, this.feeBps, this.archetype); }
+  reserveOf(token: string): bigint { return token.toLowerCase() === this.token0 ? this.r0 : this.r1; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

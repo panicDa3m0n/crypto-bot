@@ -41,6 +41,10 @@ export interface PoolState {
   /** SlipStream pools key by int24 tickSpacing (not fee) for own-execution. DB-first: filled by the
    * enricher into entities.meta.tickSpacing; the router NEVER reads it live. undefined = not yet enriched. */
   tickSpacing?: number;
+  /** Token decimal SCALES (10**decimals) for token0/token1 — REQUIRED for aerodrome-stable math (which
+   * normalises reserves by decimals). From the enriched token entities; undefined = can't quote stable. */
+  dec0?: bigint;
+  dec1?: bigint;
   // FRESHNESS: the block this state was last updated at, and its wall-clock age (see src/freshness.ts).
   block: number;
   ageMs?: number;

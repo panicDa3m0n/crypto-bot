@@ -1,6 +1,6 @@
 import type { PoolState } from "../router/types.js";
 import { getTickAtSqrtRatio } from "../router/tick-math.js";
-import { PoolSim, V2PoolSim, V3PoolSim, VenueSnapshot, PortfolioState, type StateVersion, type SimulationState, type AssetId, type SwapTrace } from "./state.js";
+import { PoolSim, V2PoolSim, V3PoolSim, StablePoolSim, VenueSnapshot, PortfolioState, type StateVersion, type SimulationState, type AssetId, type SwapTrace } from "./state.js";
 import { SwapOp, FlashBorrowOp, FlashRepayOp, LiquidateOp, type Transformation } from "./operators.js";
 import type { KGCycle } from "./cycle-finder.js";
 import { LendingSnapshot, BorrowerPositionSim, LendingMarketSim, computeLiquidation, seizeForFullRepay } from "./lending.js";
@@ -24,7 +24,11 @@ export function buildPoolSim(p: PoolState, ticks?: Array<{ tick: number; liquidi
     if (p.r0 == null || p.r1 == null || p.r0 <= 0n || p.r1 <= 0n) return null;
     return new V2PoolSim(p.address.toLowerCase(), p.token0, p.token1, p.r0, p.r1, fee || 3000, p.archetype);
   }
-  if (p.archetype === "aerodrome-stable") return null;
+  if (p.archetype === "aerodrome-stable") {
+    // Stable (x³y+xy³=k): needs reserves + BOTH token decimal scales (never guess). fee carried as ppm.
+    if (p.r0 == null || p.r1 == null || p.r0 <= 0n || p.r1 <= 0n || p.dec0 == null || p.dec1 == null) return null;
+    return new StablePoolSim(p.address.toLowerCase(), p.token0, p.token1, p.r0, p.r1, p.dec0, p.dec1, fee > 0 ? fee / 100 : 5, "aerodrome-stable");
+  }
   if (p.sqrtPriceX96 == null || p.liquidity == null || p.sqrtPriceX96 <= 0n || p.liquidity <= 0n) return null;
   return new V3PoolSim(p.address.toLowerCase(), p.token0, p.token1, p.sqrtPriceX96, p.liquidity, getTickAtSqrtRatio(p.sqrtPriceX96), fee || 3000, ticks ?? [], p.archetype);
 }

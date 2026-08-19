@@ -19,13 +19,20 @@ import type { Archetype, PoolState } from "../router/types.js";
 import { bestRoute, type RouteResult } from "../router/graph.js";
 import { ConstantProductAdapter } from "../router/adapters/constant-product.js";
 import { V3Adapter } from "../router/adapters/v3.js";
+import { StableAdapter } from "../router/adapters/solidly.js";
 import { LendingMarketSim, BorrowerPositionSim, LendingSnapshot, posKey, computeLiquidation, seizeForFullRepay, type MarketParams } from "../kg/lending.js";
 import { buildPoolSim, makeSnapshot, planFlashLiquidation, simulateFlashLiquidation, type ExitHop } from "../kg/kernel.js";
 import { PoolSim, type SwapTrace } from "../kg/state.js";
 import { encodeLiquidationPlan } from "../kg/encode.js";
 
 const CONC = new Set<Archetype>(["v3", "v4", "slipstream"]);
-const ADAPTERS = [new ConstantProductAdapter(), new V3Adapter()];
+const ADAPTERS = [new ConstantProductAdapter(), new V3Adapter(), new StableAdapter()];
+const AERO_POOL_ABI = parseAbi([
+  "function getReserves() view returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast)",
+  "function stable() view returns (bool)",
+  "function factory() view returns (address)"
+]);
+const AERO_FACTORY_ABI = parseAbi(["function getFee(address pool, bool stable) view returns (uint256)"]);
 const MORPHO_ABI = parseAbi([
   "function market(bytes32 id) view returns (uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares, uint128 lastUpdate, uint128 fee)",
   "function position(bytes32 id, address user) view returns (uint256 supplyShares, uint128 borrowShares, uint128 collateral)",
@@ -64,18 +71,46 @@ async function main() {
   // Build the candidate exit universe for a (collateral, loan) pair = pools touching either → covers direct
   // (collateral/loan) and 2-hop (collateral/hub + hub/loan) since the intermediate lives in one of the two.
   const tickCache = new Map<string, Array<{ tick: number; liquidityNet: bigint }>>();
+  const decCache = new Map<string, bigint | null>();
+  const stableCache = new Map<string, PoolState | null>();
+  async function decScale(token: string): Promise<bigint | null> {
+    const k = token.toLowerCase(); if (decCache.has(k)) return decCache.get(k)!;
+    const d = (await db.tokenMeta(cid, [k]).catch(() => new Map())).get(k)?.decimals;
+    const scale = d != null ? 10n ** BigInt(d) : null; decCache.set(k, scale); return scale;
+  }
   async function universe(collateral: string, loan: string): Promise<PoolState[]> {
     const raw = new Map<string, { address: string; meta: unknown }>();
     for (const t of [collateral, loan]) for (const p of await db.poolsForToken(cid, t).catch(() => [])) raw.set(p.address.toLowerCase(), p);
     const states = await db.poolStateBatch(cid, [...raw.keys()]).catch(() => new Map());
     const out: PoolState[] = [];
     for (const [address, { meta }] of raw) {
-      const m = (meta ?? {}) as { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string ; tickSpacing?: unknown };
+      const m = (meta ?? {}) as { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string; tickSpacing?: unknown };
       if (!m.token0 || !m.token1) continue;
-      const arch = (m.archetype ?? "v3") as Archetype;
-      if (arch === "aerodrome-stable") continue;
+      let arch = (m.archetype ?? "v3") as Archetype;
+      const t0 = m.token0.toLowerCase(), t1 = m.token1.toLowerCase();
+      // Aerodrome pools discovered via Sync are labelled "aerodrome" without stable/volatile info. Read the
+      // immutable stable() flag live (harness), and INCLUDE stable pools now that we have the exact math.
+      // Their state isn't in pool_state yet (indexer skips) → read reserves/fee live here.
+      if (arch === "aerodrome" || arch === "aerodrome-stable") {
+        if (stableCache.has(address)) { const cached = stableCache.get(address)!; if (cached) { out.push(cached); continue; } arch = "aerodrome"; }
+        else {
+          const isStable = await rc<boolean>({ address: address as Address, abi: AERO_POOL_ABI, functionName: "stable" }).catch(() => arch === "aerodrome-stable");
+          if (isStable) {
+            const [res, factory, dec0, dec1] = await Promise.all([
+              rc<[bigint, bigint, bigint]>({ address: address as Address, abi: AERO_POOL_ABI, functionName: "getReserves" }).catch(() => null),
+              rc<Address>({ address: address as Address, abi: AERO_POOL_ABI, functionName: "factory" }).catch(() => (m.factory as Address | undefined)),
+              decScale(t0), decScale(t1)
+            ]);
+            if (!res || dec0 == null || dec1 == null) { stableCache.set(address, null); continue; }
+            const feeRaw = factory ? await rc<bigint>({ address: factory, abi: AERO_FACTORY_ABI, functionName: "getFee", args: [address as Address, true] }).catch(() => 5n) : 5n;
+            const ps: PoolState = { address, archetype: "aerodrome-stable", token0: t0, token1: t1, feePpm: Number(feeRaw) * 100, factory: factory?.toLowerCase(), r0: res[0], r1: res[1], dec0, dec1, block: 0 };
+            stableCache.set(address, ps); out.push(ps); continue;
+          }
+          stableCache.set(address, null); arch = "aerodrome";
+        }
+      }
       const st = states.get(address);
-      out.push({ address, archetype: arch, token0: m.token0.toLowerCase(), token1: m.token1.toLowerCase(), feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0, factory: m.factory?.toLowerCase(), r0: st?.r0 ?? null, r1: st?.r1 ?? null, sqrtPriceX96: st?.sqrtPrice ?? null, liquidity: st?.liquidity ?? null, block: st?.block ?? 0, tickSpacing: Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : undefined });
+      out.push({ address, archetype: arch, token0: t0, token1: t1, feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0, factory: m.factory?.toLowerCase(), r0: st?.r0 ?? null, r1: st?.r1 ?? null, sqrtPriceX96: st?.sqrtPrice ?? null, liquidity: st?.liquidity ?? null, block: st?.block ?? 0, tickSpacing: Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : undefined });
     }
     return out;
   }

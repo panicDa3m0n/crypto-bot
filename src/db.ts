@@ -885,6 +885,13 @@ export class Database {
   }
 
   /** All discovered pools containing a token (either side) — for the price oracle / arb. */
+  /** Pools of a given archetype (with meta) — e.g. aerodrome-stable for the local stable-math work. */
+  async poolsByArchetype(chainId: number, archetype: string, limit = 200): Promise<Array<{ address: string; meta: unknown }>> {
+    const r = await this.pool.query<{ address: string; meta: unknown }>(
+      `SELECT address, meta FROM entities WHERE chain_id=$1 AND kind='pool' AND meta->>'archetype'=$2 ORDER BY updated_at DESC LIMIT $3`, [chainId, archetype, limit]
+    );
+    return r.rows;
+  }
   async poolsForToken(chainId: number, token: string): Promise<Array<{ address: string; meta: unknown }>> {
     const r = await this.pool.query<{ address: string; meta: unknown }>(
       `SELECT address, meta FROM entities WHERE chain_id=$1 AND kind='pool' AND (lower(meta->>'token0')=$2 OR lower(meta->>'token1')=$2) LIMIT 40`,
