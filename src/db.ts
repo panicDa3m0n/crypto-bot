@@ -1925,6 +1925,22 @@ export class Database {
     return out;
   }
 
+  /** FULL-GRAPH LOADER source (Item 4.1): every pool of the given archetypes with its latest mirrored state,
+   * in ONE query (entities ⨝ pool_state) — no per-token sampling, no archetype exclusion. length(address)=42
+   * drops V4 bytes32 poolIds (separate path). State may be null (a bare pool not yet priced) — the caller
+   * decides modelability; the loader never hides a pool for arbitrary reasons. */
+  async graphPools(chainId: number, archetypes: string[]): Promise<Array<{ address: string; meta: unknown; r0: bigint | null; r1: bigint | null; sqrtPrice: bigint | null; liquidity: bigint | null; block: number; ageMs: number | null }>> {
+    const r = await this.pool.query<{ address: string; meta: unknown; r0: string | null; r1: string | null; sp: string | null; liq: string | null; bn: string | null; age_ms: string | null }>(
+      `SELECT e.address, e.meta, ps.r0::text r0, ps.r1::text r1, ps.sqrt_price::text sp, ps.liquidity::text liq, ps.block_number::text bn,
+              (EXTRACT(EPOCH FROM (NOW()-ps.updated_at))*1000)::bigint::text AS age_ms
+       FROM entities e LEFT JOIN pool_state ps ON ps.chain_id=e.chain_id AND ps.pool=e.address
+       WHERE e.chain_id=$1 AND e.kind='pool' AND length(e.address)=42 AND e.meta->>'archetype' = ANY($2::text[])`,
+      [chainId, archetypes]
+    );
+    const b = (v: string | null) => (v == null ? null : BigInt(v.split(".")[0]));
+    return r.rows.map((x) => ({ address: x.address, meta: x.meta, r0: b(x.r0), r1: b(x.r1), sqrtPrice: b(x.sp), liquidity: b(x.liq), block: x.bn ? Number(x.bn) : 0, ageMs: x.age_ms ? Number(x.age_ms) : null }));
+  }
+
   /** Idempotently plants the system blacklist (test/synthetic tokens etc.). System rows
    * never overwrite a human/Scarlet edit — ON CONFLICT DO NOTHING. */
   async seedBlacklist(entries: Array<{ scope: "token" | "symbol"; value: string; tier: "exclude" | "secondary"; reason: string }>): Promise<void> {
