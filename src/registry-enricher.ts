@@ -10,7 +10,7 @@ import { UNIV3_MINT, UNIV3_BURN, POOL_CREATED, EVENT_DECODERS, type RawLog } fro
 import { scanTickMap, validateSnapshotVsQuoter, tickStorageProfile } from "./router/tick-storage.js";
 
 const UNIV3_QUOTER_BASE = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a" as Address; // Uniswap V3 QuoterV2 on Base
-const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 3000: 60, 10000: 200 };
+const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 }; // 2500=Pancake tier
 const STORAGE_SCAN_INTERVAL_MS = 15_000; // heavy last-resort path (Pinax reliable lane) — bound its cadence
 
 const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)", "function tickSpacing() view returns (int24)"]);

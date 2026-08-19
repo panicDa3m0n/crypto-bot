@@ -16,7 +16,8 @@ import { createLogger } from "../logger.js";
 import { scanTickMap } from "../router/tick-storage.js";
 import { getSqrtRatioAtTick, getTickAtSqrtRatio, MIN_TICK, MAX_TICK, Q96 } from "../router/tick-math.js";
 
-const UNIV3_QUOTER_BASE = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a" as Address;
+// Quoter defaults to Uniswap V3 Base; override with QUOTER_ADDR to differential-test a fork (e.g. Pancake).
+const UNIV3_QUOTER_BASE = (process.env.QUOTER_ADDR ?? "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a") as Address;
 const QUOTER_ABI = parseAbi([
   "function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)",
 ]);
@@ -149,7 +150,7 @@ async function main() {
   const m = (ent[0]?.meta ?? {}) as { token0?: string; token1?: string; fee?: unknown; tickSpacing?: unknown };
   if (!m.token0 || !m.token1) { console.log("pool not in DB"); process.exit(1); }
   const feePips = Number(m.fee) > 0 ? Number(m.fee) : 500;
-  const tickSpacing = Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : ({ 100: 1, 500: 10, 3000: 60, 10000: 200 }[feePips] ?? 10);
+  const tickSpacing = Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : ({ 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 }[feePips] ?? 10);
   const B = Number(await chain.primary.getBlockNumber().catch(() => 0n)) - 3;
   const snap = await scanTickMap(client, pool, tickSpacing, B);
   if (!snap) { console.log("scan failed"); await db.close(); process.exit(1); }
@@ -179,7 +180,7 @@ async function main() {
     const exact = outD === 0n && sqrtD === 0n;
     if (exact) lastExactCross = w.crossed;
     // print one row per distinct cross-count (the full ladder) + any divergence
-    if (w.crossed !== lastPrintedCross || !exact) { lastPrintedCross = w.crossed; console.log(`  ${String(amountIn).padEnd(24)} ${("c" + w.crossed + "/q" + q.ticksCrossed).padEnd(8)} ${String(outD).padEnd(14)} ${String(sqrtD).padEnd(22)} ${exact ? "EXACT ✓" : "DIVERGE ✗"}`); }
+    if (w.crossed !== lastPrintedCross || !exact) { lastPrintedCross = w.crossed; console.log(`  ${String(amountIn).padEnd(24)} ${("c" + w.crossed + "/q" + q.ticksCrossed).padEnd(8)} ${String(outD).padEnd(14)} ${String(sqrtD).padEnd(22)} ${exact ? "EXACT ✓" : "DIVERGE ✗"}${w.partial ? " [PARTIAL→fail-closed]" : ""}`); }
     if (!exact) { console.log(`  → last EXACT cross-count was ${lastExactCross}; diverges when walk crosses=${w.crossed} (Quoter crossed=${q.ticksCrossed})`); break; }
     if (w.partial) break;
   }

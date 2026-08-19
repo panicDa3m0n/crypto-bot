@@ -34,12 +34,21 @@ export interface TickStorageProfile {
   quoter: Address | null;
 }
 
-/** Resolve a pool's storage profile from its factory. UniV3-classic first; Pancake/Slipstream require ABI
- * verification before we trust their Quoter, so they get `quoter: null` (scan, no certify) until added. */
+// PancakeSwap V3 on Base — a fork of Uniswap V3 sharing the SAME certified core math (TickMath / SwapMath /
+// tickBitmap word-stepping / fee application), verified BIT-EXACT vs its own QuoterV2 across fee tiers 500 &
+// 2500 (spacing 50), both directions, 0..111 crossings (2026-08-19 differential harness). It differs only in
+// factory + Quoter address, so our V3PoolSim certifies it directly. QuoterV2 ABI is identical to Uniswap's.
+const PANCAKE_V3_FACTORY_BASE = "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865";
+const PANCAKE_V3_QUOTER_BASE = "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997" as Address;
+
+/** Resolve a pool's storage profile from its factory. UniV3-classic and its verified fork Pancake certify via
+ * their Quoter; other/unknown forks get `quoter: null` (scan-capable, not certify-capable until differentially
+ * verified — never trust an unproven fork's Quoter). */
 export function tickStorageProfile(factory: string | undefined, cfg: { DEX_FACTORY: string; UNIV3_QUOTER?: string }): TickStorageProfile | null {
   const f = factory?.toLowerCase();
   if (!f) return null;
   if (f === cfg.DEX_FACTORY.toLowerCase()) return { bitmapKind: "univ3", quoter: (cfg.UNIV3_QUOTER as Address | undefined) ?? null };
+  if (f === PANCAKE_V3_FACTORY_BASE) return { bitmapKind: "univ3", quoter: PANCAKE_V3_QUOTER_BASE }; // verified fork
   return { bitmapKind: "univ3", quoter: null }; // unknown v3 fork: scan-capable, not certify-capable yet
 }
 

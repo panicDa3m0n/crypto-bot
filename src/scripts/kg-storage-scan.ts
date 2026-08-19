@@ -18,7 +18,7 @@ import { scanTickMap, validateSnapshotVsQuoter, bitmapWordRange, tickStorageProf
 
 const UNIV3_QUOTER_BASE = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a" as Address; // Uniswap V3 QuoterV2 on Base
 const SPACING_ABI = parseAbi(["function tickSpacing() view returns (int24)"]);
-const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 3000: 60, 10000: 200 };
+const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 }; // 2500=Pancake tier
 
 async function main() {
   const config = loadConfig();

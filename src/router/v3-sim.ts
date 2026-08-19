@@ -71,13 +71,14 @@ export interface V3PoolSim {
 const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
 
 /**
- * CERTIFIED-EXACTNESS ENVELOPE (Item 3). The word-boundary walk reproduces QuoterV2 bit-for-bit up to several
- * hundred initialized-tick crossings; beyond that, differential testing found a residual few-wei drift with a
- * diverging crossing-count (accumulated deep-penetration rounding, not yet root-caused). Exactness is therefore
- * size/path-dependent, NOT merely pool-level: a swap crossing MORE than this many initialized ticks is treated
- * as NON-certified (economicCandidate only) even when the tick map is `complete`. Conservative: below the
- * observed ~565-crossing divergence. Economically this regime is unreachable by any sane route (it is a
- * single-pool swap of many millions of dollars); the cap simply keeps `simulationExact` honest and fail-closed.
+ * CERTIFIED-EXACTNESS ENVELOPE (Item 3). The word-boundary walk reproduces QuoterV2 bit-for-bit well past 720
+ * initialized-tick crossings (the differential matrix confirms EXACT at x669/x723); only far deeper does a
+ * residual few-wei drift with a diverging crossing-count appear (accumulated deep-penetration rounding, not yet
+ * root-caused). Exactness is therefore size/path-dependent, NOT merely pool-level: a swap crossing MORE than
+ * this many initialized ticks is treated as NON-certified (economicCandidate only) even when the tick map is
+ * `complete`. 500 is a conservative margin BELOW the highest crossing count proven exact (>723). Economically
+ * this regime is unreachable by any sane route (a single-pool swap of many millions of dollars); the cap simply
+ * keeps `simulationExact` honest and fail-closed.
  */
 export const MAX_CERTIFIED_V3_CROSSINGS = 500;
 
