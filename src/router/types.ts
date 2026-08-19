@@ -45,6 +45,10 @@ export interface PoolState {
    * normalises reserves by decimals). From the enriched token entities; undefined = can't quote stable. */
   dec0?: bigint;
   dec1?: bigint;
+  /** CONCENTRATED tick-map completeness (Item 3), read from pool_tick_status — NEVER inferred from how many
+   * ticks we happen to have. "complete" = certifiable exact; anything else (incl. undefined) = partial:
+   * usable for discovery/seed/ranking, but a swap through it can't certify `simulationExact`/`executable`. */
+  tickCoverage?: "complete" | "partial";
   // FRESHNESS: the block this state was last updated at, and its wall-clock age (see src/freshness.ts).
   block: number;
   ageMs?: number;

@@ -31,7 +31,7 @@ export function buildPoolSim(p: PoolState, ticks?: Array<{ tick: number; liquidi
     return new StablePoolSim(p.address.toLowerCase(), p.token0, p.token1, p.r0, p.r1, p.dec0, p.dec1, fee / 100, "aerodrome-stable");
   }
   if (p.sqrtPriceX96 == null || p.liquidity == null || p.sqrtPriceX96 <= 0n || p.liquidity <= 0n) return null;
-  return new V3PoolSim(p.address.toLowerCase(), p.token0, p.token1, p.sqrtPriceX96, p.liquidity, getTickAtSqrtRatio(p.sqrtPriceX96), fee || 3000, ticks ?? [], p.archetype);
+  return new V3PoolSim(p.address.toLowerCase(), p.token0, p.token1, p.sqrtPriceX96, p.liquidity, getTickAtSqrtRatio(p.sqrtPriceX96), fee || 3000, ticks ?? [], p.archetype, p.tickCoverage === "complete" ? "complete" : "partial");
 }
 
 /** Assemble an immutable snapshot from PoolSims. */
@@ -56,16 +56,19 @@ export interface PlanResult {
   gasUnits: bigint;
   residual: Array<{ token: AssetId; amount: bigint }>;
   finalNumeraire: bigint;
+  /** Item 3: every leg was certifiably exact (all concentrated legs had complete tick coverage, no floor).
+   * A valid plan with simulationExact=false is a positive-PnL economicCandidate but NOT certifiable executable. */
+  simulationExact: boolean;
 }
 
 /** Run `ops` from `initial` against a fresh fork of `snapshot`; evaluate against `obj`. Pure: `initial`
  * and the snapshot are never mutated (the fork is copy-on-write). */
 export function simulatePlan(snapshot: VenueSnapshot, initial: PortfolioState, ops: Transformation[], obj: SimulationObjective, trace?: SwapTrace[], lending?: LendingSnapshot): PlanResult {
   const startNum = initial.get(obj.numeraire);
-  const s: SimulationState = { version: snapshot.version, portfolio: initial.clone(), venue: snapshot.fork(), gasUnits: 0n, trace, lending: lending?.fork() };
+  const s: SimulationState = { version: snapshot.version, portfolio: initial.clone(), venue: snapshot.fork(), gasUnits: 0n, trace, lending: lending?.fork(), exact: true };
   for (const op of ops) {
     const r = op.apply(s);
-    if (!r.ok) return { valid: false, reason: `${op.kind}: ${r.reason}`, realizedPnl: 0n, gasUnits: s.gasUnits, residual: [], finalNumeraire: s.portfolio.get(obj.numeraire) };
+    if (!r.ok) return { valid: false, reason: `${op.kind}: ${r.reason}`, realizedPnl: 0n, gasUnits: s.gasUnits, residual: [], finalNumeraire: s.portfolio.get(obj.numeraire), simulationExact: false };
   }
   const dust = obj.dust ?? 0n;
   const residual = s.portfolio.nonZero().filter((h) => h.token !== obj.numeraire.toLowerCase() && (h.amount > dust || h.amount < -dust));
@@ -75,7 +78,7 @@ export function simulatePlan(snapshot: VenueSnapshot, initial: PortfolioState, o
   const finalNumeraire = s.portfolio.get(obj.numeraire);
   const realizedPnl = finalNumeraire - startNum;
   if (valid && realizedPnl <= 0n) { valid = false; reason = "non-positive realized PnL"; }
-  return { valid, reason, realizedPnl, gasUnits: s.gasUnits, residual, finalNumeraire };
+  return { valid, reason, realizedPnl, gasUnits: s.gasUnits, residual, finalNumeraire, simulationExact: s.exact };
 }
 
 // ── Cycle sizing ─────────────────────────────────────────────────────────────
@@ -93,6 +96,7 @@ export interface SizedCycle {
   funding: "own" | "flash";
   ops: Transformation[]; // the winning plan (for reference)
   legs: SwapTrace[];     // per-hop exact amounts (for the encoder)
+  simulationExact: boolean; // Item 3: all legs certifiably exact — required before `executable`
 }
 
 /** Build the plan for a cycle at a given input size. Start token = cycle.tokens[0] = numéraire. Each leg
@@ -157,7 +161,7 @@ export function sizeCycle(version: StateVersion, cycle: KGCycle, poolSims: Map<s
   // Recompute at the winner WITH a trace to capture per-hop amounts for the encoder.
   const legs: SwapTrace[] = [];
   const r = simulatePlan(snapshot, initial, ops, obj, legs);
-  return { amountIn: bestX, numeraire, realizedPnl: bestP, gasUnits: r.gasUnits, funding: opts.funding, ops, legs };
+  return { amountIn: bestX, numeraire, realizedPnl: bestP, gasUnits: r.gasUnits, funding: opts.funding, ops, legs, simulationExact: r.simulationExact };
 }
 
 // ── Flash-liquidation as an ordinary plan (F5) — exit is a GENERIC swap route (1..n hops, F5.2) ────

@@ -27,8 +27,10 @@ export interface StateVersion {
   blockHash?: string;
 }
 
-/** Result of one swap: output, input actually consumed, and whether it was a floor (V3 ran out of ticks). */
-export interface SwapOutcome { amountOut: bigint; amountInUsed: bigint; partial: boolean }
+/** Result of one swap: output, input actually consumed, whether it was a floor (V3 ran out of ticks), and
+ * whether it is CERTIFIABLY EXACT (Item 3): constant-product/stable math is always exact; a concentrated
+ * swap is exact only when the pool's tick map is `complete` AND the swap didn't hit a floor (`partial`). */
+export interface SwapOutcome { amountOut: bigint; amountInUsed: bigint; partial: boolean; exact: boolean }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pool simulators — protocol-specific, mutable, cloneable (for COW).
@@ -69,7 +71,7 @@ export class V2PoolSim extends PoolSim {
     const inIs0 = tokenIn.toLowerCase() === this.token0;
     const [rIn, rOut] = inIs0 ? [this.r0, this.r1] : [this.r1, this.r0];
     const out = this.amountOut(rIn, rOut, amountIn);
-    return out > 0n && out < rOut ? { amountOut: out, amountInUsed: amountIn, partial: false } : null;
+    return out > 0n && out < rOut ? { amountOut: out, amountInUsed: amountIn, partial: false, exact: true } : null;
   }
 
   applySwap(tokenIn: string, amountIn: bigint): SwapOutcome | null {
@@ -90,7 +92,8 @@ export class V3PoolSim extends PoolSim {
   constructor(
     readonly poolId: string, readonly token0: string, readonly token1: string,
     public sqrtPriceX96: bigint, public liquidity: bigint, public tick: number, public feePpm: number,
-    readonly ticks: ReadonlyArray<{ tick: number; liquidityNet: bigint }>, readonly archetype: Archetype = "v3"
+    readonly ticks: ReadonlyArray<{ tick: number; liquidityNet: bigint }>, readonly archetype: Archetype = "v3",
+    readonly tickCoverage: "complete" | "partial" = "partial" // Item 3: certified from pool_tick_status, never ticks.length
   ) { super(); }
 
   private sim(tokenIn: string, amountIn: bigint) {
@@ -102,7 +105,7 @@ export class V3PoolSim extends PoolSim {
   quote(tokenIn: string, amountIn: bigint): SwapOutcome | null {
     if (amountIn <= 0n || !this.has(tokenIn)) return null;
     const r = this.sim(tokenIn, amountIn);
-    return r && r.amountOut > 0n ? { amountOut: r.amountOut, amountInUsed: r.amountInUsed, partial: r.partial } : null;
+    return r && r.amountOut > 0n ? { amountOut: r.amountOut, amountInUsed: r.amountInUsed, partial: r.partial, exact: this.tickCoverage === "complete" && !r.partial } : null;
   }
 
   applySwap(tokenIn: string, amountIn: bigint): SwapOutcome | null {
@@ -110,10 +113,10 @@ export class V3PoolSim extends PoolSim {
     const r = this.sim(tokenIn, amountIn);
     if (!r || r.amountOut <= 0n) return null;
     this.sqrtPriceX96 = r.sqrtPriceX96; this.tick = r.tick; this.liquidity = r.liquidity;
-    return { amountOut: r.amountOut, amountInUsed: r.amountInUsed, partial: r.partial };
+    return { amountOut: r.amountOut, amountInUsed: r.amountInUsed, partial: r.partial, exact: this.tickCoverage === "complete" && !r.partial };
   }
 
-  clone(): PoolSim { return new V3PoolSim(this.poolId, this.token0, this.token1, this.sqrtPriceX96, this.liquidity, this.tick, this.feePpm, this.ticks, this.archetype); }
+  clone(): PoolSim { return new V3PoolSim(this.poolId, this.token0, this.token1, this.sqrtPriceX96, this.liquidity, this.tick, this.feePpm, this.ticks, this.archetype, this.tickCoverage); }
   reserveOf(token: string): bigint {
     const Q96 = 2n ** 96n;
     return token.toLowerCase() === this.token0 ? (this.liquidity * Q96) / this.sqrtPriceX96 : (this.liquidity * this.sqrtPriceX96) / Q96;
@@ -138,7 +141,7 @@ export class StablePoolSim extends PoolSim {
     const inIs0 = tokenIn.toLowerCase() === this.token0;
     const out = stableGetAmountOut(amountIn, inIs0, this.r0, this.r1, this.dec0, this.dec1, this.feeBps);
     const rOut = inIs0 ? this.r1 : this.r0;
-    return out > 0n && out < rOut ? { amountOut: out, amountInUsed: amountIn, partial: false } : null;
+    return out > 0n && out < rOut ? { amountOut: out, amountInUsed: amountIn, partial: false, exact: true } : null;
   }
 
   applySwap(tokenIn: string, amountIn: bigint): SwapOutcome | null {
@@ -266,4 +269,7 @@ export interface SimulationState {
   gasUnits: bigint;
   trace?: SwapTrace[];
   lending?: import("./lending.js").LendingFork;
+  /** Item 3: false once ANY leg was not certifiably exact (partial tick coverage / floor). A plan can be a
+   * positive-PnL economicCandidate with exact=false, but it can NEVER be certified executable. */
+  exact: boolean;
 }

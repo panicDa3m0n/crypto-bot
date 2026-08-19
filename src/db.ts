@@ -442,6 +442,46 @@ export class Database {
         synced BOOLEAN NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      -- INDEXER COVERAGE (Item 3): the CONTINUOUSLY-observed block range, distinct from the recovery cursor
+      -- (indexer_state.last_block) and from current freshness (chain_status). coverage_start = the first
+      -- block of the current UNBROKEN ingested sequence (NOT the configured cold-start); continuous_through
+      -- advances as contiguous blocks are processed; generation bumps whenever a gap breaks continuity. A
+      -- tick-map is certifiable "complete" only while its range sits inside an unbroken coverage segment.
+      CREATE TABLE IF NOT EXISTS indexer_coverage (
+        chain_id INTEGER PRIMARY KEY,
+        coverage_start BIGINT NOT NULL,
+        continuous_through BIGINT NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      -- INDEXER GAPS: block ranges the indexer SKIPPED (a pathological cold-start jump) → never observed, so
+      -- any tick-map spanning them is no longer certifiable until repaired. repaired_at set by the 3.3 repair.
+      CREATE TABLE IF NOT EXISTS indexer_gaps (
+        chain_id INTEGER NOT NULL,
+        from_block BIGINT NOT NULL,
+        to_block BIGINT NOT NULL,
+        reason TEXT,
+        detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        repaired_at TIMESTAMPTZ,
+        PRIMARY KEY (chain_id, from_block, to_block)
+      );
+      -- PER-POOL TICK-MAP COMPLETENESS (Item 3): certifiable state of a concentrated pool's tick map. status
+      -- pending|bootstrapping|complete|failed|partial; source live_indexer|historical_logs|storage_scan|
+      -- third_party_seed|mixed. through_block = how far the map is known complete; creation_block = required
+      -- earliest block. complete=true ONLY when through_block back to creation is inside unbroken coverage.
+      CREATE TABLE IF NOT EXISTS pool_tick_status (
+        chain_id INTEGER NOT NULL,
+        pool TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        source TEXT NOT NULL DEFAULT 'live_indexer',
+        creation_block BIGINT,
+        through_block BIGINT,
+        complete BOOLEAN NOT NULL DEFAULT FALSE,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (chain_id, pool)
+      );
       CREATE TABLE IF NOT EXISTS raw_blocks (
         chain_id INTEGER NOT NULL,
         block_number BIGINT NOT NULL,
@@ -1396,6 +1436,49 @@ export class Database {
     const row = r.rows[0];
     return row ? { indexedBlock: Number(row.indexed_block), networkHead: Number(row.network_head_seen), lag: Number(row.lag_blocks), synced: row.synced, ageMs: Number(row.age) } : null;
   }
+  // --- Item 3: indexer coverage / gaps / per-pool tick-map completeness -------
+  async getIndexerCoverage(chainId: number): Promise<{ coverageStart: number; continuousThrough: number; generation: number } | null> {
+    const r = await this.pool.query<{ coverage_start: string; continuous_through: string; generation: number }>(`SELECT coverage_start::text, continuous_through::text, generation FROM indexer_coverage WHERE chain_id=$1`, [chainId]);
+    const row = r.rows[0];
+    return row ? { coverageStart: Number(row.coverage_start), continuousThrough: Number(row.continuous_through), generation: row.generation } : null;
+  }
+  async upsertIndexerCoverage(chainId: number, c: { coverageStart: number; continuousThrough: number; generation: number }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO indexer_coverage(chain_id, coverage_start, continuous_through, generation) VALUES($1,$2,$3,$4)
+       ON CONFLICT (chain_id) DO UPDATE SET coverage_start=$2, continuous_through=$3, generation=$4, updated_at=NOW()`,
+      [chainId, c.coverageStart, c.continuousThrough, c.generation]
+    );
+  }
+  async recordIndexerGap(chainId: number, fromBlock: number, toBlock: number, reason: string): Promise<void> {
+    await this.pool.query(`INSERT INTO indexer_gaps(chain_id, from_block, to_block, reason) VALUES($1,$2,$3,$4) ON CONFLICT (chain_id, from_block, to_block) DO NOTHING`, [chainId, fromBlock, toBlock, reason]);
+  }
+
+  async upsertPoolTickStatus(chainId: number, pool: string, s: { status?: string; source?: string; creationBlock?: number; throughBlock?: number; complete?: boolean }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO pool_tick_status(chain_id, pool, status, source, creation_block, through_block, complete)
+       VALUES($1,$2,COALESCE($3,'pending'),COALESCE($4,'live_indexer'),$5,$6,COALESCE($7,false))
+       ON CONFLICT (chain_id, pool) DO UPDATE SET
+         status=COALESCE($3, pool_tick_status.status), source=COALESCE($4, pool_tick_status.source),
+         creation_block=COALESCE($5, pool_tick_status.creation_block), through_block=COALESCE($6, pool_tick_status.through_block),
+         complete=COALESCE($7, pool_tick_status.complete), updated_at=NOW()`,
+      [chainId, pool.toLowerCase(), s.status ?? null, s.source ?? null, s.creationBlock ?? null, s.throughBlock ?? null, s.complete ?? null]
+    );
+  }
+  /** Tick-map completeness for a set of pools → Map<pool, complete>. The read-side reads this to set
+   * V3PoolSim.tickCoverage (never inferred from ticks.length). Absent ⇒ not certified (treated partial). */
+  async poolTickCompleteBatch(chainId: number, pools: string[]): Promise<Map<string, boolean>> {
+    if (!pools.length) return new Map();
+    const r = await this.pool.query<{ pool: string; complete: boolean }>(`SELECT pool, complete FROM pool_tick_status WHERE chain_id=$1 AND pool = ANY($2::text[])`, [chainId, pools.map((p) => p.toLowerCase())]);
+    const m = new Map<string, boolean>();
+    for (const row of r.rows) m.set(row.pool.toLowerCase(), row.complete);
+    return m;
+  }
+  /** On a continuity-breaking gap: CONSERVATIVELY drop certification for every currently-complete pool (we
+   * can't know which had Mint/Burn in the unobserved range). 3.3 repair restores the ones truly untouched. */
+  async invalidateTickCertification(chainId: number, reason: string): Promise<number> {
+    const r = await this.pool.query(`UPDATE pool_tick_status SET complete=false, status='partial', last_error=$2, updated_at=NOW() WHERE chain_id=$1 AND complete=true`, [chainId, reason]);
+    return r.rowCount ?? 0;
+  }
   async saveRawBlock(chainId: number, block: number, logs: unknown): Promise<void> {
     await this.pool.query(`INSERT INTO raw_blocks(chain_id, block_number, logs) VALUES($1,$2,$3) ON CONFLICT (chain_id, block_number) DO UPDATE SET logs=$3, at=NOW()`, [chainId, block, jsonParam(logs)]);
   }
@@ -1489,7 +1572,7 @@ export class Database {
     const tuples = rows.map((r, i) => { const b = i * 5; values.push(chainId, r[0], r[1], r[2], block); return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},NOW())`; });
     await this.pool.query(
       `INSERT INTO tick_liquidity(chain_id, pool, tick, liquidity_net, block_number, updated_at) VALUES ${tuples.join(",")}
-       ON CONFLICT (chain_id, pool, tick) DO UPDATE SET liquidity_net = tick_liquidity.liquidity_net + EXCLUDED.liquidity_net, block_number = EXCLUDED.block_number, updated_at = NOW()`,
+       ON CONFLICT (chain_id, pool, tick) DO UPDATE SET liquidity_net = tick_liquidity.liquidity_net + EXCLUDED.liquidity_net, block_number = GREATEST(tick_liquidity.block_number, EXCLUDED.block_number), updated_at = NOW()`,
       values
     );
   }

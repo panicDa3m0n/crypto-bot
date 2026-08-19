@@ -44,6 +44,8 @@ type RawRpc = { request: (a: { method: string; params: unknown }) => Promise<unk
 export class BlockIndexer {
   private running = false;
   private cursor = 0;
+  private coverageStart = -1;       // Item 3: start of the current continuous-coverage segment
+  private coverageGeneration = 0;   // bumped whenever a gap breaks continuity
   private ethUsd = 0;
   private ethUsdAt = 0;
   private ticks = 0;
@@ -105,6 +107,10 @@ export class BlockIndexer {
     // (cursor exists) → cover the gap FORWARD, UNLESS it's pathologically large (off for days) → jump near
     // head instead of replaying it (state re-derives forward + the resync buffer refills current data).
     this.cursor = stored == null ? coldStart : (head - stored > this.config.INDEXER_MAX_RESYNC_GAP ? coldStart : stored);
+    // COVERAGE (Item 3): track the CONTINUOUSLY-observed range, separate from the cursor. A pathological
+    // cold-start jump breaks continuity → record the gap, bump generation, and invalidate tick certification
+    // (we didn't observe the skipped Mint/Burn, so no tick-map spanning it is certifiable until repaired).
+    await this.initCoverage(stored, head);
     this.syncedFlag = head - this.cursor <= this.config.INDEXER_RESYNC_LAG; // already fresh? (rare)
     if (this.syncedFlag) await this.markSynced();
     await this.refreshAnchor();
@@ -197,6 +203,29 @@ export class BlockIndexer {
    * touch the cursor (indexer_state) — pure telemetry, never drives cold-start/resync. */
   private async writeChainStatus(): Promise<void> {
     await this.db.upsertChainStatus({ chainId: this.config.CHAIN_ID, indexedBlock: this.cursor, networkHead: this.headBlock, synced: this.syncedFlag }).catch(() => undefined);
+    // Advance the continuous coverage watermark (Item 3) — the cursor moved contiguously this tick.
+    if (this.coverageStart >= 0) await this.db.upsertIndexerCoverage(this.config.CHAIN_ID, { coverageStart: this.coverageStart, continuousThrough: this.cursor, generation: this.coverageGeneration }).catch(() => undefined);
+  }
+
+  /** Establish the current continuous-coverage segment at startup. Continue the prior segment on a normal
+   * resume; on a pathological cold-start JUMP, record the skipped gap, start a NEW segment, and invalidate
+   * every pool's tick certification (conservative — 3.3 repair restores the untouched ones). */
+  private async initCoverage(stored: number | null, head: number): Promise<void> {
+    const cid = this.config.CHAIN_ID;
+    const prev = await this.db.getIndexerCoverage(cid).catch(() => null);
+    if (stored != null && head - stored > this.config.INDEXER_MAX_RESYNC_GAP && this.cursor > stored + 1) {
+      // JUMP: [stored+1, cursor-1] was never observed.
+      await this.db.recordIndexerGap(cid, stored + 1, this.cursor - 1, `cold-start jump (gap ${head - stored} > ${this.config.INDEXER_MAX_RESYNC_GAP})`).catch(() => undefined);
+      const invalidated = await this.db.invalidateTickCertification(cid, `indexer gap ${stored + 1}-${this.cursor - 1}`).catch(() => 0);
+      this.coverageStart = this.cursor;
+      this.coverageGeneration = (prev?.generation ?? 0) + 1;
+      this.logger.warn({ gap: [stored + 1, this.cursor - 1], generation: this.coverageGeneration, invalidatedTickPools: invalidated }, "indexer cold-start JUMP → gap recorded, tick certification invalidated");
+    } else if (stored != null && prev) {
+      this.coverageStart = prev.coverageStart; this.coverageGeneration = prev.generation; // continuous resume
+    } else {
+      this.coverageStart = this.cursor; this.coverageGeneration = (prev?.generation ?? -1) + 1; // fresh (or pre-Item-3 data) → new segment from here
+    }
+    await this.db.upsertIndexerCoverage(cid, { coverageStart: this.coverageStart, continuousThrough: this.cursor, generation: this.coverageGeneration }).catch(() => undefined);
   }
 
   /** At head. Sets the live `synced` flag every time (Scarlet's per-cycle freshness gate). The FIRST time,
@@ -334,6 +363,9 @@ export class BlockIndexer {
       if (e.tickSpacing != null) meta.tickSpacing = e.tickSpacing;
       if (e.hooks) meta.hooks = e.hooks;
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.pool, kind: "pool", meta, source: "indexer", block }).catch(() => undefined);
+      // Item 3: a CONCENTRATED pool created live (origin=created) has a COMPLETE tick map from birth — we
+      // observe every Mint/Burn from creation. Certify it (invalidated later if a gap ever breaks continuity).
+      if (e.archetype === "v3" || e.archetype === "v4") await this.db.upsertPoolTickStatus(this.config.CHAIN_ID, e.pool, { status: "complete", source: "live_indexer", creationBlock: block, throughBlock: block, complete: true }).catch(() => undefined);
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t0, kind: "token", source: "indexer", block }).catch(() => undefined);
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t1, kind: "token", source: "indexer", block }).catch(() => undefined);
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.factory, kind: "dex", meta: { role: "factory", discoveredBy: "indexer" }, source: "indexer", block }).catch(() => undefined);

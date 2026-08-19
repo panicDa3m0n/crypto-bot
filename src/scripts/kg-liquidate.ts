@@ -112,6 +112,8 @@ async function main() {
       const st = states.get(address);
       out.push({ address, archetype: arch, token0: t0, token1: t1, feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0, factory: m.factory?.toLowerCase(), r0: st?.r0 ?? null, r1: st?.r1 ?? null, sqrtPriceX96: st?.sqrtPrice ?? null, liquidity: st?.liquidity ?? null, block: st?.block ?? 0, tickSpacing: Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : undefined });
     }
+    const conc = out.filter((p) => CONC.has(p.archetype)).map((p) => p.address);
+    if (conc.length) { const tc = await db.poolTickCompleteBatch(cid, conc).catch(() => new Map<string, boolean>()); for (const p of out) if (CONC.has(p.archetype)) p.tickCoverage = tc.get(p.address) ? "complete" : "partial"; }
     return out;
   }
   const simForPool = async (ps: PoolState): Promise<PoolSim | null> => { let ticks: Array<{ tick: number; liquidityNet: bigint }> | undefined; if (CONC.has(ps.archetype)) { ticks = tickCache.get(ps.address) ?? await db.tickLiquidity(cid, ps.address).catch(() => []); tickCache.set(ps.address, ticks); } return buildPoolSim(ps, ticks); };

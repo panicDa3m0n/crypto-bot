@@ -75,6 +75,10 @@ async function main() {
     const st = states.get(address);
     poolStates.set(address, { address, archetype, token0: m.token0.toLowerCase(), token1: m.token1.toLowerCase(), feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0, factory: m.factory?.toLowerCase(), r0: st?.r0 ?? null, r1: st?.r1 ?? null, sqrtPriceX96: st?.sqrtPrice ?? null, liquidity: st?.liquidity ?? null, block: st?.block ?? 0, ageMs: st?.ageMs, tickSpacing: Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : undefined });
   }
+  // Item 3: certified tick-map completeness (from pool_tick_status) → PoolState.tickCoverage.
+  const concIds = [...poolStates.values()].filter((p) => CONC.has(p.archetype)).map((p) => p.address);
+  const tickComplete = await db.poolTickCompleteBatch(cid, concIds).catch(() => new Map<string, boolean>());
+  for (const p of poolStates.values()) if (CONC.has(p.archetype)) p.tickCoverage = tickComplete.get(p.address) ? "complete" : "partial";
   const cycles = findNegativeCycles([...poolStates.values()], { minGrossBps: minBps, limit: 40 });
 
   // Freshness from the MIRROR (DB-first): the indexer publishes indexed_block/head/lag/synced to

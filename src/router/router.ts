@@ -155,6 +155,9 @@ export class LocalRouter extends Aggregator {
         block: st?.block ?? 0, ageMs: st?.ageMs
       });
     }
+    // Item 3: certified tick-map completeness for concentrated pools (from pool_tick_status, never ticks.length).
+    const conc = pools.filter((p) => p.archetype === "v3" || p.archetype === "v4" || p.archetype === "slipstream").map((p) => p.address);
+    if (conc.length) { const tc = await this.database.poolTickCompleteBatch(cid, conc).catch(() => new Map<string, boolean>()); for (const p of pools) if (conc.includes(p.address)) p.tickCoverage = tc.get(p.address) ? "complete" : "partial"; }
     return pools;
   }
 

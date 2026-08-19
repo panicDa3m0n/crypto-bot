@@ -73,7 +73,8 @@ export function evaluateExecutable(sized: SizedCycle, ctx: GateContext): Executa
 
   // Gates (order = most fundamental first). economicEdge is already true (sizeCycle only returns >0 gross).
   let executable = true, rejectionReason: string | undefined;
-  if (ctx.lag > ctx.maxLagBlocks) { executable = false; rejectionReason = `indexer lag ${ctx.lag} > ${ctx.maxLagBlocks} blocks (stale mirror)`; }
+  if (!sized.simulationExact) { executable = false; rejectionReason = "simulation not exact (partial tick coverage) — economicCandidate only"; } // Item 3 fail-closed
+  else if (ctx.lag > ctx.maxLagBlocks) { executable = false; rejectionReason = `indexer lag ${ctx.lag} > ${ctx.maxLagBlocks} blocks (stale mirror)`; }
   else if (!ctx.flashFundable.has(num)) { executable = false; rejectionReason = "numéraire not flash-fundable"; }
   else if (numUsd == null || grossPnlUsd == null) { executable = false; rejectionReason = "numéraire unpriceable (no exit valuation)"; }
   else if (netPnlUsd == null || netPnlUsd <= ctx.minNetUsd) { executable = false; rejectionReason = `net $${(netPnlUsd ?? 0).toFixed(4)} ≤ threshold $${ctx.minNetUsd}`; }
