@@ -76,3 +76,14 @@ export function stableGetAmountOut(amountIn: bigint, inIsToken0: boolean, r0: bi
   const y = reserveB - _getY(amtN + reserveA, xy, reserveB);
   return (y * (inIsToken0 ? dec1 : dec0)) / E18;
 }
+
+/** Marginal raw rate (wei out per wei in) at the current reserves, via a tiny probe — for the cycle-finder
+ * SEED. The stable curve's reserve RATIO is NOT the marginal price, so we probe ~1e-6 of the input reserve
+ * and read the exact output. Returns {inWei, outWei} (both raw wei) or null. */
+export function stableProbe(r0: bigint, r1: bigint, dec0: bigint, dec1: bigint, feeBps: number, inIsToken0: boolean): { inWei: bigint; outWei: bigint } | null {
+  if (r0 <= 0n || r1 <= 0n) return null;
+  const rIn = inIsToken0 ? r0 : r1;
+  const probe = rIn / 1_000_000n > 0n ? rIn / 1_000_000n : 1n;
+  const out = stableGetAmountOut(probe, inIsToken0, r0, r1, dec0, dec1, feeBps);
+  return out > 0n ? { inWei: probe, outWei: out } : null;
+}

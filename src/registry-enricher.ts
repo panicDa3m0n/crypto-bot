@@ -7,6 +7,8 @@ import type { Etherscan } from "./etherscan.js";
 import type { Blockscout } from "./blockscout.js";
 
 const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)", "function tickSpacing() view returns (int24)"]);
+const AERO_STABLE_ABI = parseAbi(["function stable() view returns (bool)"]);
+const AERO_FACTORY_FEE_ABI = parseAbi(["function getFee(address pool, bool stable) view returns (uint256)"]);
 const ERC20_META_ABI = parseAbi(["function symbol() view returns (string)", "function name() view returns (string)", "function decimals() view returns (uint8)"]);
 const FAST_MS = 400;      // there's a backlog → drain quickly
 const BACKOFF_MS = 6_000; // the enrichment RPC threw a rate-limit → let the buffer WAIT, then resume
@@ -73,8 +75,9 @@ export class RegistryEnricher {
       const pools = await this.enrichPools(block);
       const toks = await this.enrichTokens(block);
       const facs = await this.enrichFactories(block);
-      did = pools.done + toks.done + facs.done;
-      rateLimited = pools.rateLimited || toks.rateLimited || facs.rateLimited;
+      const aero = await this.enrichAeroStable(block);
+      did = pools.done + toks.done + facs.done + aero.done;
+      rateLimited = pools.rateLimited || toks.rateLimited || facs.rateLimited || aero.rateLimited;
       // Etherscan verified/proxy signal — only when the fast queue is idle and not more than once per interval.
       if (!did && this.etherscan.available && Date.now() - this.lastVerifiedAt > this.config.ENRICH_INTERVAL_MS) { await this.enrichVerified(); this.lastVerifiedAt = Date.now(); }
     } finally {
@@ -145,6 +148,36 @@ export class RegistryEnricher {
     // Backfill USD price for the freshly-decimalled tokens from the stored pool_state (no RPC).
     if (gotDecimals.length && this.reprice) await this.reprice(gotDecimals).catch(() => undefined);
     if (done) this.logger.info({ filled: done, backfilled: gotDecimals.length }, "tokens enriched (dedicated RPC)");
+    return { done, rateLimited: false };
+  }
+
+  /** Classify Aerodrome pools stable vs volatile — pools discovered via Sync are labelled generically
+   * "aerodrome" (the Sync event can't tell them apart). Reads the IMMUTABLE stable() flag ONCE and, for
+   * stable pools, the factory fee (getFee(pool,true), which the exact stable math needs), then corrects
+   * entities.meta.archetype + meta.fee (ppm = bps×100). `stableChecked` marks it done. This lets the
+   * read-side/KG include stable pools DB-first (no live stable()/getFee at reasoning time). NOTE: the
+   * factory fee is DYNAMIC per pool → a REFRESHABLE-enrichment candidate (roadmap item 4); read once here. */
+  private async enrichAeroStable(block: number | null): Promise<{ done: number; rateLimited: boolean }> {
+    const batch = await this.db.poolsNeedingStableCheck(this.config.CHAIN_ID, this.config.ENRICH_BATCH).catch(() => [] as string[]);
+    if (!batch.length) return { done: 0, rateLimited: false };
+    let done = 0;
+    for (const pool of batch) {
+      try {
+        const isStable = await this.chain.enrichment.readContract({ address: pool as Address, abi: AERO_STABLE_ABI, functionName: "stable" }) as boolean;
+        if (isStable) {
+          const factory = ((await this.chain.enrichment.readContract({ address: pool as Address, abi: POOL_META_ABI, functionName: "factory" })) as string).toLowerCase();
+          const feeRaw = await this.chain.enrichment.readContract({ address: factory as Address, abi: AERO_FACTORY_FEE_ABI, functionName: "getFee", args: [pool as Address, true] }) as bigint;
+          await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "aerodrome-stable", fee: Number(feeRaw) * 100, factory, stableChecked: block ?? 0 }).catch(() => undefined);
+        } else {
+          await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "aerodrome", stableChecked: block ?? 0 }).catch(() => undefined);
+        }
+        done += 1;
+      } catch (e) {
+        if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done, rateLimited: true }; }
+        await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { stableChecked: block ?? 0 }).catch(() => undefined); // mark so we don't retry forever
+      }
+      await this.pace();
+    }
     return { done, rateLimited: false };
   }
 

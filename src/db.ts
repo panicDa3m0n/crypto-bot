@@ -1078,6 +1078,15 @@ export class Database {
   /** RECONCILIATION: pool entities missing `meta.factory` — old/bare pools discovered before we stored the
    * factory (own-execution routes each pool to ITS dex's router by factory). The manual re-sync backfills it.
    * `factoryCheckedAt` guards pools whose factory() couldn't be read, so a re-run doesn't loop on them. */
+  /** Aerodrome pools not yet stable/volatile-classified — discovered via Sync (which can't tell them apart)
+   * so labelled generically "aerodrome". The enricher reads the immutable stable() flag once to fix them. */
+  async poolsNeedingStableCheck(chainId: number, limit = 200): Promise<string[]> {
+    const r = await this.pool.query<{ address: string }>(
+      `SELECT address FROM entities WHERE chain_id=$1 AND kind='pool' AND meta->>'archetype' IN ('aerodrome','aerodrome-stable') AND NOT (meta ? 'stableChecked') ORDER BY updated_at DESC LIMIT $2`,
+      [chainId, limit]
+    );
+    return r.rows.map((x) => x.address);
+  }
   async poolsMissingFactory(chainId: number, limit = 200): Promise<string[]> {
     const r = await this.pool.query<{ address: string }>(
       `SELECT address FROM entities WHERE chain_id=$1 AND kind='pool' AND NOT (meta ? 'factory') AND NOT (meta ? 'factoryCheckedAt') ORDER BY updated_at DESC LIMIT $2`,

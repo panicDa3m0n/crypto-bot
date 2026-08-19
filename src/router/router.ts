@@ -7,6 +7,7 @@ import { Aggregator, isNative, type Quote } from "../aggregator.js";
 import { freshness, freshnessLog } from "../freshness.js";
 import { ConstantProductAdapter } from "./adapters/constant-product.js";
 import { V3Adapter } from "./adapters/v3.js";
+import { StableAdapter } from "./adapters/solidly.js";
 import { bestRoute } from "./graph.js";
 import { buildExec } from "./execution.js";
 import type { Archetype, PoolState, VenueAdapter } from "./types.js";
@@ -44,7 +45,7 @@ export interface LocalExecPlan {
  */
 
 export class LocalRouter extends Aggregator {
-  private readonly adapters: VenueAdapter[] = [new ConstantProductAdapter(), new V3Adapter()];
+  private readonly adapters: VenueAdapter[] = [new ConstantProductAdapter(), new V3Adapter(), new StableAdapter()];
   private head = { block: 0, at: 0 }; // short-TTL cache of the indexer cursor (avoid a DB hit per quote)
   private readonly factoryCache = new Map<string, string>(); // pool → factory (immutable), avoids re-reads
   private readonly tickSpacingCache = new Map<string, number>(); // slipstream pool → tickSpacing (immutable)
@@ -133,18 +134,24 @@ export class LocalRouter extends Aggregator {
     }
     if (!raw.size) return [];
     const states = await this.database.poolStateBatch(cid, [...raw.keys()]).catch(() => new Map());
+    // Token decimal SCALES (10**decimals) for the stable math — DB-first (never a live read/guess).
+    const tokenSet = new Set<string>();
+    for (const { meta } of raw.values()) { const m = meta as { token0?: string; token1?: string }; if (m?.token0) tokenSet.add(m.token0.toLowerCase()); if (m?.token1) tokenSet.add(m.token1.toLowerCase()); }
+    const decs = await this.database.tokenMeta(cid, [...tokenSet]).catch(() => new Map());
+    const scale = (t: string): bigint | undefined => { const d = decs.get(t.toLowerCase())?.decimals; return d != null ? 10n ** BigInt(d) : undefined; };
     const pools: PoolState[] = [];
     for (const [address, { meta }] of raw) {
       const m = (meta ?? {}) as { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string; tickSpacing?: unknown };
       if (!m.token0 || !m.token1) continue;
       const archetype = (m.archetype ?? "v3") as Archetype;
-      if (archetype === "aerodrome-stable") continue; // stable invariant + no pool_state → not locally quotable
+      const t0 = m.token0.toLowerCase(), t1 = m.token1.toLowerCase();
       const st = states.get(address);
       pools.push({
-        address, archetype, token0: m.token0.toLowerCase(), token1: m.token1.toLowerCase(),
+        address, archetype, token0: t0, token1: t1,
         feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0, factory: m.factory?.toLowerCase(),
         r0: st?.r0 ?? null, r1: st?.r1 ?? null, sqrtPriceX96: st?.sqrtPrice ?? null, liquidity: st?.liquidity ?? null,
         tickSpacing: Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : undefined,
+        dec0: scale(t0), dec1: scale(t1), // for aerodrome-stable; StableAdapter/buildPoolSim fail-closed if absent
         block: st?.block ?? 0, ageMs: st?.ageMs
       });
     }

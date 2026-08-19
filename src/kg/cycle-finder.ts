@@ -1,4 +1,5 @@
 import type { PoolState, Archetype } from "../router/types.js";
+import { stableProbe } from "../router/solidly-math.js";
 
 /**
  * KG CYCLE-FINDER (Liquidity-Graph, phase F1 — the detector). We model the mirrored pool universe as a
@@ -66,12 +67,23 @@ export function buildEdges(pools: PoolState[]): KGEdge[] {
   const edges: KGEdge[] = [];
   for (const p of pools) {
     if (!p.token0 || !p.token1) continue;
-    const rr = rawReserves(p);
-    if (!rr) continue;
     const t0 = p.token0.toLowerCase(), t1 = p.token1.toLowerCase();
     const fee = p.feePpm;
-    edges.push({ pool: p.address.toLowerCase(), archetype: p.archetype, from: t0, to: t1, feePpm: fee, lnRate: lnMarginal(rr.r0, rr.r1, fee), state: p });
-    edges.push({ pool: p.address.toLowerCase(), archetype: p.archetype, from: t1, to: t0, feePpm: fee, lnRate: lnMarginal(rr.r1, rr.r0, fee), state: p });
+    const id = p.address.toLowerCase();
+    if (p.archetype === "aerodrome-stable") {
+      // Stable curve: reserve ratio ≠ marginal rate → probe the exact math. FAIL-CLOSED without dec/fee.
+      if (p.r0 == null || p.r1 == null || p.r0 <= 0n || p.r1 <= 0n || p.dec0 == null || p.dec1 == null || fee <= 0) continue;
+      const bps = fee / 100;
+      const a = stableProbe(p.r0, p.r1, p.dec0, p.dec1, bps, true);
+      const b = stableProbe(p.r0, p.r1, p.dec0, p.dec1, bps, false);
+      if (a) edges.push({ pool: id, archetype: p.archetype, from: t0, to: t1, feePpm: fee, lnRate: lnBig(a.outWei) - lnBig(a.inWei), state: p });
+      if (b) edges.push({ pool: id, archetype: p.archetype, from: t1, to: t0, feePpm: fee, lnRate: lnBig(b.outWei) - lnBig(b.inWei), state: p });
+      continue;
+    }
+    const rr = rawReserves(p);
+    if (!rr) continue;
+    edges.push({ pool: id, archetype: p.archetype, from: t0, to: t1, feePpm: fee, lnRate: lnMarginal(rr.r0, rr.r1, fee), state: p });
+    edges.push({ pool: id, archetype: p.archetype, from: t1, to: t0, feePpm: fee, lnRate: lnMarginal(rr.r1, rr.r0, fee), state: p });
   }
   return edges;
 }

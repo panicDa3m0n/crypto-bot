@@ -402,11 +402,16 @@ export class BlockIndexer {
     for (const e of priced) {
       const pool = e.pool;
       const info = pools.get(pool);
-      if (info?.archetype === "aerodrome-stable") continue; // stablecoin-pair curve — x·y=k pricing is invalid; skip
       const isSwap = e.kind === "swap_v3";
+      // ALWAYS persist observed reserves — even aerodrome-stable (the read-side needs them for the exact
+      // stable math). poolInfo.archetype prevails over the event's generic "aerodrome" (Sync can't tell
+      // stable from volatile), so a classified stable pool keeps its archetype in pool_state.
       if (isSwap) { if (e.sqrtPrice > 0n) state.set(pool, { pool, archetype: "v3", sqrtPrice: e.sqrtPrice, liquidity: e.liquidity ?? undefined, block }); }
-      else { state.set(pool, { pool, archetype: e.archetype, r0: e.r0, r1: e.r1, block }); }
+      else { state.set(pool, { pool, archetype: info?.archetype ?? e.archetype, r0: e.r0, r1: e.r1, block }); }
 
+      // But the x·y=k reserve-ratio pricing below is INVALID for the stable curve → skip pricing only (the
+      // read-side prices stable pools with the exact solidly math, not this reducer).
+      if (info?.archetype === "aerodrome-stable") continue;
       if (!info?.token0 || !info.token1) continue; // unknown pool — discovery adds it; priced next time
       const t0 = info.token0.toLowerCase(), t1 = info.token1.toLowerCase();
       const d0 = dec(t0), d1 = dec(t1);
