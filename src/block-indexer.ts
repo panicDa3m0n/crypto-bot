@@ -113,6 +113,7 @@ export class BlockIndexer {
     this.unwatch = this.chain.watchHeads(() => void this.tick().catch((e) => this.logger.error({ err: e }, "indexer tick failed")), (err) => this.logger.warn({ err: err.message }, "indexer heads WS error"));
     this.timer = setInterval(() => void this.tick().catch((e) => this.logger.error({ err: e }, "indexer tick failed")), this.config.INDEXER_POLL_MS);
     this.logger.info({ cursor: this.cursor, head, ethUsd: this.ethUsd, source: this.config.BLOCK_SOURCE }, "block-indexer started");
+    await this.writeChainStatus(); // seed freshness telemetry at boot
   }
 
   stop(): void { if (this.timer) clearInterval(this.timer); if (this.unwatch) this.unwatch(); }
@@ -188,7 +189,14 @@ export class BlockIndexer {
       if (this.headBlock - this.cursor <= this.config.INDEXER_RESYNC_LAG) await this.markSynced();
     } finally {
       this.running = false;
+      await this.writeChainStatus(); // DB-first freshness telemetry (read-side reads this, never getBlockNumber)
     }
+  }
+
+  /** Persist the mirror's observable freshness for the read-side. WRITER = this indexer only. Does NOT
+   * touch the cursor (indexer_state) — pure telemetry, never drives cold-start/resync. */
+  private async writeChainStatus(): Promise<void> {
+    await this.db.upsertChainStatus({ chainId: this.config.CHAIN_ID, indexedBlock: this.cursor, networkHead: this.headBlock, synced: this.syncedFlag }).catch(() => undefined);
   }
 
   /** At head. Sets the live `synced` flag every time (Scarlet's per-cycle freshness gate). The FIRST time,

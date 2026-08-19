@@ -68,20 +68,21 @@ async function main() {
   const states = await db.poolStateBatch(cid, [...raw.keys()]).catch(() => new Map());
   const poolStates = new Map<string, PoolState>();
   for (const [address, { meta }] of raw) {
-    const m = (meta ?? {}) as { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string };
+    const m = (meta ?? {}) as { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string ; tickSpacing?: unknown };
     if (!m.token0 || !m.token1) continue;
     const archetype = (m.archetype ?? "v3") as Archetype;
     if (archetype === "aerodrome-stable") continue;
     const st = states.get(address);
-    poolStates.set(address, { address, archetype, token0: m.token0.toLowerCase(), token1: m.token1.toLowerCase(), feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0, factory: m.factory?.toLowerCase(), r0: st?.r0 ?? null, r1: st?.r1 ?? null, sqrtPriceX96: st?.sqrtPrice ?? null, liquidity: st?.liquidity ?? null, block: st?.block ?? 0, ageMs: st?.ageMs });
+    poolStates.set(address, { address, archetype, token0: m.token0.toLowerCase(), token1: m.token1.toLowerCase(), feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0, factory: m.factory?.toLowerCase(), r0: st?.r0 ?? null, r1: st?.r1 ?? null, sqrtPriceX96: st?.sqrtPrice ?? null, liquidity: st?.liquidity ?? null, block: st?.block ?? 0, ageMs: st?.ageMs, tickSpacing: Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : undefined });
   }
   const cycles = findNegativeCycles([...poolStates.values()], { minGrossBps: minBps, limit: 40 });
 
-  // Freshness: indexer lag vs chain tip (AMM reserves are valid until the next swap, so the real staleness
-  // risk is the indexer being behind the tip — not a pool's last-update block).
-  const head = (await db.getIndexerCursor(cid).catch(() => null)) ?? 0;
-  const tip = Number(await chain.primary.getBlockNumber().catch(() => BigInt(head)));
-  const lag = tip - head;
+  // Freshness from the MIRROR (DB-first): the indexer publishes indexed_block/head/lag/synced to
+  // chain_status; the read-side reads THAT, never getBlockNumber. AMM reserves are valid until the next
+  // swap, so the real staleness risk is the indexer being behind — captured by lag/synced here.
+  const cs = await db.getChainStatus(cid).catch(() => null);
+  const head = cs?.indexedBlock ?? (await db.getIndexerCursor(cid).catch(() => null)) ?? 0;
+  const lag = cs && cs.synced ? cs.lag : 999_999; // not synced ⇒ treat as stale (gate rejects)
 
   // Valuation refs.
   let ethUsd = 0;
@@ -96,7 +97,7 @@ async function main() {
     minNetUsd: 0.01, safetyUsd: 0.005, flashFeeBps: 0,
     execMinProfitBps: EXEC_MIN_PROFIT_BPS, lag, maxLagBlocks: MAX_EXECUTION_LAG_BLOCKS
   };
-  console.log(`[kg-run] head=${head} tip=${tip} lag=${lag} pools=${poolStates.size} cycles=${cycles.length} ethUsd≈${ethUsd.toFixed(2)} gas=${gasPriceWei} kg=${kg}`);
+  console.log(`[kg-run] head=${head} lag=${lag} synced=${cs?.synced ?? "n/a"} pools=${poolStates.size} cycles=${cycles.length} ethUsd≈${ethUsd.toFixed(2)} gas=${gasPriceWei} kg=${kg}`);
 
   const tickCache = new Map<string, Array<{ tick: number; liquidityNet: bigint }>>();
   const simFor = async (ps: PoolState): Promise<PoolSim | null> => { let ticks: Array<{ tick: number; liquidityNet: bigint }> | undefined; if (CONC.has(ps.archetype)) { ticks = tickCache.get(ps.address) ?? await db.tickLiquidity(cid, ps.address).catch(() => []); tickCache.set(ps.address, ticks); } return buildPoolSim(ps, ticks); };
@@ -133,9 +134,9 @@ async function main() {
       if (EXECUTE && opp.executable) {
         // Freshness re-gate at broadcast time: our mirror was block N; if the chain has run ahead beyond
         // the lag budget, do NOT trust the sized amounts — skip (a live engine would resimulate).
-        const head2 = (await db.getIndexerCursor(cid).catch(() => null)) ?? head;
-        const tip2 = Number(await chain.primary.getBlockNumber().catch(() => BigInt(head2)));
-        if (tip2 - head2 > MAX_EXECUTION_LAG_BLOCKS) { console.log(`         send SKIPPED: lag ${tip2 - head2} > ${MAX_EXECUTION_LAG_BLOCKS} at broadcast — mirror stale, resimulate.`); continue; }
+        const cs2 = await db.getChainStatus(cid).catch(() => null);
+        const lag2 = cs2 && cs2.synced ? cs2.lag : 999_999;
+        if (lag2 > MAX_EXECUTION_LAG_BLOCKS) { console.log(`         send SKIPPED: mirror lag ${lag2} > ${MAX_EXECUTION_LAG_BLOCKS} (or de-synced) — resimulate.`); continue; }
         // Execution calldata carries the real on-chain minProfit floor; re-simulate coherence at CURRENT state.
         const execData = encodeFunctionData({ abi: FLASH_ABI, functionName: "flashExecute", args: [0, num as Address, sized.amountIn, opp.minProfitNumeraire, tuples] });
         try {
@@ -159,12 +160,22 @@ async function main() {
   // eth_call must revert "profit below min" — proving the full path runs (a "call failed" would be a bug).
   if (simulated === 0) {
     console.log(`[kg-run] no real cycle proved the path → running WETH→USDC→WETH self-test…`);
-    const wu: PoolState[] = [];
-    for (const p of poolStates.values()) { const set = new Set([p.token0, p.token1]); if (set.has(weth) && set.has(usdc)) wu.push(p); }
+    // Source WETH/USDC pools directly (poolsForToken has no ORDER BY, so the arb-centric universe may not
+    // include the deep executable pools). Dedup by address.
+    const wuMap = new Map<string, PoolState>();
+    for (const p of poolStates.values()) { const set = new Set([p.token0, p.token1]); if (set.has(weth) && set.has(usdc)) wuMap.set(p.address, p); }
+    for (const t of [weth, usdc]) for (const row of await db.poolsForToken(cid, t).catch(() => [])) {
+      const m = (row.meta ?? {}) as { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string; tickSpacing?: unknown };
+      if (!m.token0 || !m.token1) continue; const set = new Set([m.token0.toLowerCase(), m.token1.toLowerCase()]);
+      if (!(set.has(weth) && set.has(usdc)) || wuMap.has(row.address.toLowerCase())) continue;
+      const arch = (m.archetype ?? "v3") as Archetype; if (arch === "aerodrome-stable") continue;
+      const st = (await db.poolStateBatch(cid, [row.address.toLowerCase()]).catch(() => new Map())).get(row.address.toLowerCase());
+      wuMap.set(row.address.toLowerCase(), { address: row.address.toLowerCase(), archetype: arch, token0: m.token0.toLowerCase(), token1: m.token1.toLowerCase(), feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0, factory: m.factory?.toLowerCase(), r0: st?.r0 ?? null, r1: st?.r1 ?? null, sqrtPriceX96: st?.sqrtPrice ?? null, liquidity: st?.liquidity ?? null, block: st?.block ?? 0, tickSpacing: Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : undefined });
+    }
     const amountIn = 10n ** 15n; // 0.001 WETH
     const legPool: Array<{ ps: PoolState; sim: PoolSim }> = [];
-    for (const ps of wu) { const s = await simFor(ps); if (!s) continue; const enc = await router.encodeLeg(ps, weth as Address, usdc as Address, amountIn, 0n, kg).catch(() => null); if (enc) legPool.push({ ps, sim: s }); if (legPool.length >= 2) break; }
-    if (legPool.length < 2) { console.log(`[kg-run] self-test: <2 own-executable WETH/USDC pools (${legPool.length}) — cannot build round-trip`); }
+    for (const ps of wuMap.values()) { const s = await simFor(ps); if (!s) continue; const enc = await router.encodeLeg(ps, weth as Address, usdc as Address, amountIn, 0n, kg).catch(() => null); if (enc) legPool.push({ ps, sim: s }); if (legPool.length >= 2) break; }
+    if (legPool.length < 2) { console.log(`[kg-run] self-test: <2 own-executable WETH/USDC pools among ${wuMap.size} candidates (harness pool-selection limit, not a routing failure)`); }
     else {
       const [A, B] = legPool;
       const q1 = A.sim.quote(weth, amountIn);

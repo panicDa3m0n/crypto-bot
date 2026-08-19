@@ -42,8 +42,6 @@ export interface LocalExecPlan {
  * single-tick V3 quote UNDER-states large trades (conservative) → safe for decision quotes; execution
  * exactness (preflight eth_call) is enforced in Phase 3.
  */
-const FACTORY_ABI = parseAbi(["function factory() view returns (address)"]);
-const TICKSPACING_ABI = parseAbi(["function tickSpacing() view returns (int24)"]);
 
 export class LocalRouter extends Aggregator {
   private readonly adapters: VenueAdapter[] = [new ConstantProductAdapter(), new V3Adapter()];
@@ -96,33 +94,20 @@ export class LocalRouter extends Aggregator {
     if (unknown.length) this.log.warn({ count: unknown.length, top: unknown.slice(0, 12).map((a) => ({ factory: a.factory, archetype: a.archetype, freshPools: a.fresh, pools: a.pools })) }, "UNKNOWN active DEXes — pools ingested + quotable but NOT own-executable; curate factory→router (+encoder if a distinct-ABI fork) in the network profile to cover");
   }
 
-  /** Resolve the pool's factory (stored meta → cache → live read) and map it to an executable router.
-   * null = we can't own-execute this pool (unknown/unsupported fork). */
-  private async resolveExec(pool: PoolState): Promise<{ router: Address; venue: Archetype } | null> {
-    let factory = pool.factory?.toLowerCase() ?? this.factoryCache.get(pool.address);
-    if (!factory && this.chain) {
-      // Read lanes only (precision/primary/fallback) — NOT the dedicated indexer (drpc) lane, so a factory
-      // resolution can't steal the indexer's block-ingestion budget. Enrichment fills factory in the DB anyway.
-      for (const client of [this.chain.precision, this.chain.primary, this.chain.fallback]) {
-        try { factory = (await client.readContract({ address: pool.address as Address, abi: FACTORY_ABI, functionName: "factory" }) as string).toLowerCase(); break; }
-        catch { /* lane down → next */ }
-      }
-      if (factory) this.factoryCache.set(pool.address, factory);
-    }
-    if (!factory) return null;
+  /** Resolve the pool's factory (DB/meta → cache) and map it to an executable router. DB-FIRST: NO live
+   * chain read — a pool whose factory the enricher hasn't filled yet is simply "not executable yet" (null),
+   * and the RegistryEnricher backfills factory into entities.meta on its own lane. This keeps the read-side
+   * quote/exec-plan path off the network entirely. null = unknown fork OR factory not-yet-enriched. */
+  private resolveExec(pool: PoolState): { router: Address; venue: Archetype } | null {
+    const factory = pool.factory?.toLowerCase() ?? this.factoryCache.get(pool.address);
+    if (!factory) return null; // enrichment pending → not own-executable yet (no RPC fallback)
     return this.execVenues().get(factory) ?? null;
   }
 
-  /** SlipStream pools key by tickSpacing (immutable) — read it ONCE on a READ lane (never the dedicated
-   * indexer lane), cached. null = unresolved → can't own-execute this pool (caller falls back). */
-  private async resolveTickSpacing(pool: string): Promise<number | null> {
-    const c = this.tickSpacingCache.get(pool); if (c != null) return c;
-    if (!this.chain) return null;
-    for (const client of [this.chain.precision, this.chain.primary, this.chain.fallback]) {
-      try { const ts = Number(await client.readContract({ address: pool as Address, abi: TICKSPACING_ABI, functionName: "tickSpacing" })); if (Number.isFinite(ts) && ts !== 0) { this.tickSpacingCache.set(pool, ts); return ts; } }
-      catch { /* lane down → next */ }
-    }
-    return null;
+  /** SlipStream tickSpacing (immutable) — DB-FIRST: read from the pool's enriched meta (PoolState.tickSpacing),
+   * NEVER live from chain. null = not yet enriched → not own-executable yet (caller falls back). */
+  private resolveTickSpacing(pool: PoolState): number | null {
+    return pool.tickSpacing ?? this.tickSpacingCache.get(pool.address) ?? null;
   }
 
   /** The indexer cursor (our head), cached ~1 block so the firehose doesn't re-read it every quote. */
@@ -150,7 +135,7 @@ export class LocalRouter extends Aggregator {
     const states = await this.database.poolStateBatch(cid, [...raw.keys()]).catch(() => new Map());
     const pools: PoolState[] = [];
     for (const [address, { meta }] of raw) {
-      const m = (meta ?? {}) as { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string };
+      const m = (meta ?? {}) as { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string; tickSpacing?: unknown };
       if (!m.token0 || !m.token1) continue;
       const archetype = (m.archetype ?? "v3") as Archetype;
       if (archetype === "aerodrome-stable") continue; // stable invariant + no pool_state → not locally quotable
@@ -159,6 +144,7 @@ export class LocalRouter extends Aggregator {
         address, archetype, token0: m.token0.toLowerCase(), token1: m.token1.toLowerCase(),
         feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0, factory: m.factory?.toLowerCase(),
         r0: st?.r0 ?? null, r1: st?.r1 ?? null, sqrtPriceX96: st?.sqrtPrice ?? null, liquidity: st?.liquidity ?? null,
+        tickSpacing: Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : undefined,
         block: st?.block ?? 0, ageMs: st?.ageMs
       });
     }
@@ -231,7 +217,7 @@ export class LocalRouter extends Aggregator {
     // we can't own-execute this pool → fall back to the aggregator.
     let tickSpacing: number | undefined;
     if (venue === "slipstream") {
-      const ts = await this.resolveTickSpacing(pool.address);
+      const ts = this.resolveTickSpacing(pool);
       if (ts == null) { this.log.debug({ pool: pool.address }, "slipstream tickSpacing unresolved → aggregator fallback"); return null; }
       tickSpacing = ts;
     }
@@ -260,7 +246,7 @@ export class LocalRouter extends Aggregator {
     if (!r) return null;
     const { router, venue } = r;
     let tickSpacing: number | undefined;
-    if (venue === "slipstream") { const ts = await this.resolveTickSpacing(pool.address); if (ts == null) return null; tickSpacing = ts; }
+    if (venue === "slipstream") { const ts = this.resolveTickSpacing(pool); if (ts == null) return null; tickSpacing = ts; }
     const weth = this.cfg.WBERA_ADDRESS as Address;
     const call = buildExec({
       venue: venue as "v3" | "aerodrome" | "v2" | "slipstream", router, weth,

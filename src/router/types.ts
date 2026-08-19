@@ -38,6 +38,9 @@ export interface PoolState {
   // concentrated liquidity (v3), raw:
   sqrtPriceX96?: bigint | null;
   liquidity?: bigint | null;
+  /** SlipStream pools key by int24 tickSpacing (not fee) for own-execution. DB-first: filled by the
+   * enricher into entities.meta.tickSpacing; the router NEVER reads it live. undefined = not yet enriched. */
+  tickSpacing?: number;
   // FRESHNESS: the block this state was last updated at, and its wall-clock age (see src/freshness.ts).
   block: number;
   ageMs?: number;

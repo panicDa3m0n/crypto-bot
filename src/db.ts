@@ -430,6 +430,18 @@ export class Database {
         last_block BIGINT NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      -- DB-FIRST BOUNDARY: observable freshness telemetry of the mirror, written ONLY by the BlockIndexer,
+      -- read by everyone (the read-side must NEVER call getBlockNumber to compute lag). This is DISTINCT
+      -- from indexer_state.last_block, which is the recovery/continuity CURSOR — chain_status is pure
+      -- telemetry and never drives cold-start/resync. synced mirrors the indexer's syncedFlag.
+      CREATE TABLE IF NOT EXISTS chain_status (
+        chain_id INTEGER PRIMARY KEY,
+        indexed_block BIGINT NOT NULL,
+        network_head_seen BIGINT NOT NULL,
+        lag_blocks BIGINT NOT NULL,
+        synced BOOLEAN NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
       CREATE TABLE IF NOT EXISTS raw_blocks (
         chain_id INTEGER NOT NULL,
         block_number BIGINT NOT NULL,
@@ -1349,6 +1361,24 @@ export class Database {
   async indexerCursorAgeMs(chainId: number): Promise<number | null> {
     const r = await this.pool.query<{ age: string }>(`SELECT (EXTRACT(EPOCH FROM (NOW()-updated_at))*1000)::bigint::text AS age FROM indexer_state WHERE chain_id=$1`, [chainId]);
     return r.rows[0] ? Number(r.rows[0].age) : null;
+  }
+  /** DB-first freshness telemetry. WRITER = BlockIndexer ONLY. The read-side reads this instead of ever
+   * calling getBlockNumber() to compute lag. Separate from the cursor (indexer_state). */
+  async upsertChainStatus(s: { chainId: number; indexedBlock: number; networkHead: number; synced: boolean }): Promise<void> {
+    const lag = Math.max(0, s.networkHead - s.indexedBlock);
+    await this.pool.query(
+      `INSERT INTO chain_status(chain_id, indexed_block, network_head_seen, lag_blocks, synced) VALUES($1,$2,$3,$4,$5)
+       ON CONFLICT (chain_id) DO UPDATE SET indexed_block=$2, network_head_seen=$3, lag_blocks=$4, synced=$5, updated_at=NOW()`,
+      [s.chainId, s.indexedBlock, s.networkHead, lag, s.synced]
+    );
+  }
+  /** Read-side freshness gate source: {indexedBlock, networkHead, lag, synced, ageMs}. null if unseeded. */
+  async getChainStatus(chainId: number): Promise<{ indexedBlock: number; networkHead: number; lag: number; synced: boolean; ageMs: number } | null> {
+    const r = await this.pool.query<{ indexed_block: string; network_head_seen: string; lag_blocks: string; synced: boolean; age: string }>(
+      `SELECT indexed_block::text, network_head_seen::text, lag_blocks::text, synced, (EXTRACT(EPOCH FROM (NOW()-updated_at))*1000)::bigint::text AS age FROM chain_status WHERE chain_id=$1`, [chainId]
+    );
+    const row = r.rows[0];
+    return row ? { indexedBlock: Number(row.indexed_block), networkHead: Number(row.network_head_seen), lag: Number(row.lag_blocks), synced: row.synced, ageMs: Number(row.age) } : null;
   }
   async saveRawBlock(chainId: number, block: number, logs: unknown): Promise<void> {
     await this.pool.query(`INSERT INTO raw_blocks(chain_id, block_number, logs) VALUES($1,$2,$3) ON CONFLICT (chain_id, block_number) DO UPDATE SET logs=$3, at=NOW()`, [chainId, block, jsonParam(logs)]);

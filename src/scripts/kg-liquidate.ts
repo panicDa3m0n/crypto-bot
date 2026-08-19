@@ -70,12 +70,12 @@ async function main() {
     const states = await db.poolStateBatch(cid, [...raw.keys()]).catch(() => new Map());
     const out: PoolState[] = [];
     for (const [address, { meta }] of raw) {
-      const m = (meta ?? {}) as { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string };
+      const m = (meta ?? {}) as { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string ; tickSpacing?: unknown };
       if (!m.token0 || !m.token1) continue;
       const arch = (m.archetype ?? "v3") as Archetype;
       if (arch === "aerodrome-stable") continue;
       const st = states.get(address);
-      out.push({ address, archetype: arch, token0: m.token0.toLowerCase(), token1: m.token1.toLowerCase(), feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0, factory: m.factory?.toLowerCase(), r0: st?.r0 ?? null, r1: st?.r1 ?? null, sqrtPriceX96: st?.sqrtPrice ?? null, liquidity: st?.liquidity ?? null, block: st?.block ?? 0 });
+      out.push({ address, archetype: arch, token0: m.token0.toLowerCase(), token1: m.token1.toLowerCase(), feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0, factory: m.factory?.toLowerCase(), r0: st?.r0 ?? null, r1: st?.r1 ?? null, sqrtPriceX96: st?.sqrtPrice ?? null, liquidity: st?.liquidity ?? null, block: st?.block ?? 0, tickSpacing: Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : undefined });
     }
     return out;
   }

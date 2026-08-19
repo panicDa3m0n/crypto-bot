@@ -6,7 +6,7 @@ import type { BerachainClients } from "./chain.js";
 import type { Etherscan } from "./etherscan.js";
 import type { Blockscout } from "./blockscout.js";
 
-const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)"]);
+const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)", "function tickSpacing() view returns (int24)"]);
 const ERC20_META_ABI = parseAbi(["function symbol() view returns (string)", "function name() view returns (string)", "function decimals() view returns (uint8)"]);
 const FAST_MS = 400;      // there's a backlog → drain quickly
 const BACKOFF_MS = 6_000; // the enrichment RPC threw a rate-limit → let the buffer WAIT, then resume
@@ -96,11 +96,13 @@ export class RegistryEnricher {
           this.chain.enrichment.readContract({ address: p.address as Address, abi: POOL_META_ABI, functionName: "token1" }) as Promise<string>
         ]);
         const token0 = t0.toLowerCase(), token1 = t1.toLowerCase();
-        const [fee, factory] = await Promise.all([
+        const [fee, factory, tickSpacing] = await Promise.all([
           p.archetype === "v3" ? this.chain.enrichment.readContract({ address: p.address as Address, abi: POOL_META_ABI, functionName: "fee" }).then(Number).catch(() => undefined) : Promise.resolve(undefined),
-          this.chain.enrichment.readContract({ address: p.address as Address, abi: POOL_META_ABI, functionName: "factory" }).then((f) => (f as string).toLowerCase()).catch(() => undefined) // own-execution routes each pool to ITS dex router
+          this.chain.enrichment.readContract({ address: p.address as Address, abi: POOL_META_ABI, functionName: "factory" }).then((f) => (f as string).toLowerCase()).catch(() => undefined), // own-execution routes each pool to ITS dex router
+          // tickSpacing (int24) — filled DB-first for concentrated pools so LocalRouter never reads it live (SlipStream keys by it).
+          p.archetype === "v3" ? this.chain.enrichment.readContract({ address: p.address as Address, abi: POOL_META_ABI, functionName: "tickSpacing" }).then((t) => Number(t)).catch(() => undefined) : Promise.resolve(undefined)
         ]);
-        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: p.address, kind: "pool", meta: { token0, token1, fee, ...(factory ? { factory } : {}) }, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: p.address, kind: "pool", meta: { token0, token1, fee, ...(factory ? { factory } : {}), ...(tickSpacing ? { tickSpacing } : {}) }, source: "enricher", block: block ?? undefined }).catch(() => undefined);
         // Ensure the two tokens exist as entities so they enter the buffer for decimals enrichment next.
         await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token0, kind: "token", source: "enricher", block: block ?? undefined }).catch(() => undefined);
         await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token1, kind: "token", source: "enricher", block: block ?? undefined }).catch(() => undefined);
