@@ -44,6 +44,8 @@ export abstract class PoolSim {
   abstract applySwap(tokenIn: string, amountIn: bigint): SwapOutcome | null;
   /** Deep-enough copy for copy-on-write (immutable sub-structures may be shared). */
   abstract clone(): PoolSim;
+  /** Reserve (real for cp, in-range virtual for concentrated) of `token`, raw wei — for sizing bounds. */
+  abstract reserveOf(token: string): bigint;
   has(token: string): boolean { const t = token.toLowerCase(); return t === this.token0 || t === this.token1; }
   other(token: string): string { return token.toLowerCase() === this.token0 ? this.token1 : this.token0; }
 }
@@ -78,6 +80,7 @@ export class V2PoolSim extends PoolSim {
   }
 
   clone(): PoolSim { return new V2PoolSim(this.poolId, this.token0, this.token1, this.r0, this.r1, this.feePpm, this.archetype); }
+  reserveOf(token: string): bigint { return token.toLowerCase() === this.token0 ? this.r0 : this.r1; }
 }
 
 /** Concentrated liquidity (Uniswap-V3 / V4 / Slipstream). Tick-crossing exact via v3-sim; the tick array
@@ -110,6 +113,10 @@ export class V3PoolSim extends PoolSim {
   }
 
   clone(): PoolSim { return new V3PoolSim(this.poolId, this.token0, this.token1, this.sqrtPriceX96, this.liquidity, this.tick, this.feePpm, this.ticks, this.archetype); }
+  reserveOf(token: string): bigint {
+    const Q96 = 2n ** 96n;
+    return token.toLowerCase() === this.token0 ? (this.liquidity * Q96) / this.sqrtPriceX96 : (this.liquidity * this.sqrtPriceX96) / Q96;
+  }
 
   static tickFromSqrt(sqrtPriceX96: bigint): number { return getTickAtSqrtRatio(sqrtPriceX96); }
 }
