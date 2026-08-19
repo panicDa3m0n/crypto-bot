@@ -73,6 +73,7 @@ export interface V3SwapResult {
   sqrtPriceX96: bigint;   // price after the swap
   tick: number;           // current tick after the swap
   liquidity: bigint;      // in-range liquidity after the swap
+  ticksCrossed: number;   // INITIALIZED ticks the swap crossed — QuoterV2's independent validation signal
 }
 
 /**
@@ -92,6 +93,7 @@ export function simulateExactInputStateful(pool: V3PoolSim, zeroForOne: boolean,
   let tick = pool.tick ?? getTickAtSqrtRatio(sqrtP);
   let remaining = amountIn;
   let amountOut = 0n;
+  let ticksCrossed = 0;
 
   for (let guard = 0; remaining > 0n && L > 0n && guard < 100_000; guard++) {
     // Next initialized tick in the swap direction (zeroForOne=down → ≤ tick; up → > tick).
@@ -111,12 +113,13 @@ export function simulateExactInputStateful(pool: V3PoolSim, zeroForOne: boolean,
       if (zeroForOne) net = -net;
       L += net;
       tick = zeroForOne ? nextTick - 1 : nextTick;
+      ticksCrossed += 1; // crossed an initialized tick boundary
     } else {
       // Partial fill inside the range, or ran past the last indexed tick → stop. Tick tracks the price.
-      return { amountOut, amountInUsed: amountIn - (remaining > 0n ? remaining : 0n), partial: nextTick == null && remaining > 0n, sqrtPriceX96: sqrtP, tick: getTickAtSqrtRatio(sqrtP), liquidity: L };
+      return { amountOut, amountInUsed: amountIn - (remaining > 0n ? remaining : 0n), partial: nextTick == null && remaining > 0n, sqrtPriceX96: sqrtP, tick: getTickAtSqrtRatio(sqrtP), liquidity: L, ticksCrossed };
     }
   }
-  return { amountOut, amountInUsed: amountIn - (remaining > 0n ? remaining : 0n), partial: remaining > 0n, sqrtPriceX96: sqrtP, tick, liquidity: L };
+  return { amountOut, amountInUsed: amountIn - (remaining > 0n ? remaining : 0n), partial: remaining > 0n, sqrtPriceX96: sqrtP, tick, liquidity: L, ticksCrossed };
 }
 
 /**
