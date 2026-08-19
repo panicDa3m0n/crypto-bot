@@ -66,6 +66,12 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
   const gas = await db.getGasState(cid).catch(() => null);
   const gasStale = !gas || gas.ageMs > gasMaxAgeMs;
   const gasPriceWei = gas?.gasPriceWei ?? 0n;
+  // Executability-layer token quality (Item 4.4): a token is exec-quality only if it's a flash numéraire OR
+  // it's ENRICHED (known decimals) AND not blacklisted. Unenriched/blacklisted tokens still appear in the
+  // graph (economic layer) but never make a candidate `executable` — the preflight/learning loop populates
+  // the blacklist from behavior mismatches. Keeps model-mismatch signals visible without pretending they trade.
+  const bl = await db.listBlacklist().catch(() => [] as Array<{ scope: string; value: string }>);
+  const blacklisted = new Set(bl.filter((b) => b.scope === "token").map((b) => b.value.toLowerCase()));
 
   const ctx: GateContext = {
     flashFundable: new Set([weth, usdc]),
@@ -101,9 +107,16 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
     const unenc = capability ? legPools.filter((p) => !capability(p)) : [];
     const routeEncodable = unenc.length === 0;
     const econPositive = opp.executable; // the OLD gate (exact ∧ fresh ∧ flash-fundable ∧ net>threshold)
-    let isExec = econPositive && routeEncodable;
+    // Token exec-quality: block ONLY on a CERTAIN-bad token (blacklisted, incl. those the learning loop flagged
+    // from a behavior mismatch). A round-trip's PnL is numéraire-in/out, so an intermediate token's decimals
+    // don't affect it — an unenriched token is NOT blocked here; it reaches preflight once, and if it misbehaves
+    // the loop blacklists it. Certain-bad only, never guess.
+    const badToks = cycle.tokens.map((t) => t.toLowerCase()).filter((t) => !ctx.flashFundable.has(t) && blacklisted.has(t));
+    const tokenQuality = badToks.length === 0;
+    let isExec = econPositive && routeEncodable && tokenQuality;
     let reason = opp.rejectionReason;
     if (econPositive && !routeEncodable) reason = `route not encodable: ${unenc.length} hop(s) on unsupported fork`;
+    else if (econPositive && routeEncodable && !tokenQuality) reason = `route token blacklisted (exec layer): ${badToks.map((t) => t.slice(0, 10)).join(",")}`;
     if (gasStale && isExec) { isExec = false; reason = "gas_state unavailable/stale — net not trustable"; }
 
     if (opp.economicEdge) economic++;

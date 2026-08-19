@@ -42,6 +42,7 @@ async function main() {
   const db = new Database(config.DATABASE_URL);
   const chain = new BerachainClients(config, logger);
   const cid = config.CHAIN_ID;
+  const weth = config.WBERA_ADDRESS.toLowerCase(), usdc = config.USDC_E_ADDRESS.toLowerCase();
   const router = new LocalRouter(config, logger, db, chain);
 
   const g = await loadLiquidityGraph(db, cid);
@@ -74,7 +75,17 @@ async function main() {
       const tuples = calls.map((x) => ({ target: x.target, value: x.value, data: x.data }));
       try { await chain.primary.call({ account: owner, to: kg, data: encodeFunctionData({ abi: FLASH_ABI, functionName: "flashExecute", args: [0, c.numeraire as Address, c.amountIn, c.minProfitNumeraire, tuples] }) });
         pass++; await record("pass"); console.log(`   ${c.route.padEnd(22)} PASS ✓ net=$${(c.netUsd ?? 0).toFixed(4)} holds at head ${g.head}`);
-      } catch (e) { const cl = classify(revertReason(e)); await record(cl); console.log(`   ${c.route.padEnd(22)} ${cl}`); }
+      } catch (e) {
+        const cl = classify(revertReason(e)); await record(cl); console.log(`   ${c.route.padEnd(22)} ${cl}`);
+        // LEARNING LOOP: a behavior mismatch means our ERC20-standard model is wrong for a route token → add
+        // its intermediate tokens to the blacklist. They stay VISIBLE in the graph (economic/model-mismatch
+        // signal) but the executability gate will skip them next cycle. Only for behavior mismatches, never
+        // PROFIT_MOVED (that's a legit edge that merely decayed).
+        if (/BEHAVIOR_MISMATCH/.test(cl)) {
+          const toks = new Set(c.legs.flatMap((l) => [l.tokenIn.toLowerCase(), l.tokenOut.toLowerCase()]));
+          for (const t of toks) if (t !== weth && t !== usdc) await db.addBlacklist({ scope: "token", value: t, tier: "secondary", source: "system", reason: `kg preflight ${cl}` }).catch(() => undefined);
+        }
+      }
     }
     console.log(`[kg-observe] PRECISION: ${pass}/${exe.length} chain-executable (${exe.length ? (100 * pass / exe.length).toFixed(0) : 0}%)  outcomes=${JSON.stringify(outcomes)}`);
   }
