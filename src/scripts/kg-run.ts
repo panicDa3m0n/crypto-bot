@@ -23,6 +23,9 @@ import { evaluateExecutable, type GateContext } from "../kg/opportunity.js";
 import { encodeCycle } from "../kg/encode.js";
 
 const CONC = new Set<Archetype>(["v3", "v4", "slipstream"]);
+// Execution-risk params (env-overridable; move to config when wired into the live engine).
+const MAX_EXECUTION_LAG_BLOCKS = Number(process.env.KG_MAX_EXECUTION_LAG_BLOCKS ?? 3);
+const EXEC_MIN_PROFIT_BPS = Number(process.env.KG_EXEC_MIN_PROFIT_BPS ?? 7000); // keep ≥70% of predicted gross on-chain
 const FLASH_ABI = parseAbi(["function flashExecute(uint8 provider, address loanToken, uint256 amount, uint256 minProfit, (address target,uint256 value,bytes data)[] calls)"]);
 const REVERT_STRINGS = parseAbi(["error Error(string)"]);
 const EXECUTE = process.argv.includes("--execute");
@@ -90,7 +93,8 @@ async function main() {
     gasPriceWei, ethUsd,
     numeraireUsd: (t) => t === usdc ? 1 : t === weth ? ethUsd : null,
     decimalsOf: (t) => t === weth ? 18 : t === usdc ? 6 : (decs.get(t)?.decimals ?? 18),
-    minNetUsd: 0.01, safetyUsd: 0.005, flashFeeBps: 0
+    minNetUsd: 0.01, safetyUsd: 0.005, flashFeeBps: 0,
+    execMinProfitBps: EXEC_MIN_PROFIT_BPS, lag, maxLagBlocks: MAX_EXECUTION_LAG_BLOCKS
   };
   console.log(`[kg-run] head=${head} tip=${tip} lag=${lag} pools=${poolStates.size} cycles=${cycles.length} ethUsd≈${ethUsd.toFixed(2)} gas=${gasPriceWei} kg=${kg}`);
 
@@ -119,16 +123,28 @@ async function main() {
     const calls = await encodeCycle(router, poolStates, sized.legs, kg).catch(() => null);
     if (!calls) { console.log(`         encode: NOT own-executable (a hop is on an unknown fork)`); continue; }
     encoded++;
-    const data = encodeFunctionData({ abi: FLASH_ABI, functionName: "flashExecute", args: [0, num as Address, sized.amountIn, 0n, calls.map((x) => ({ target: x.target, value: x.value, data: x.data }))] });
+    const tuples = calls.map((x) => ({ target: x.target, value: x.value, data: x.data }));
+    // Validity eth_call uses minProfit=0 (prove the route technically executes). Execution uses the REAL floor.
+    const simData = encodeFunctionData({ abi: FLASH_ABI, functionName: "flashExecute", args: [0, num as Address, sized.amountIn, 0n, tuples] });
     try {
-      await chain.primary.call({ account: owner, to: kg, data });
+      await chain.primary.call({ account: owner, to: kg, data: simData });
       simulated++;
       console.log(`         eth_call: SUCCESS (${calls.length} calls) — full path executes & repays at minProfit=0`);
       if (EXECUTE && opp.executable) {
-        const gp = await chain.primary.getGasPrice();
-        const h = await chain.wallet!.sendTransaction({ to: kg, data, gas: 2_000_000n, gasPrice: gp });
-        const r = await chain.waitReceipt({ hash: h, confirmations: 1, timeout: 120_000 });
-        console.log(`         flashExecute → ${r.status} tx=${h}`);
+        // Freshness re-gate at broadcast time: our mirror was block N; if the chain has run ahead beyond
+        // the lag budget, do NOT trust the sized amounts — skip (a live engine would resimulate).
+        const head2 = (await db.getIndexerCursor(cid).catch(() => null)) ?? head;
+        const tip2 = Number(await chain.primary.getBlockNumber().catch(() => BigInt(head2)));
+        if (tip2 - head2 > MAX_EXECUTION_LAG_BLOCKS) { console.log(`         send SKIPPED: lag ${tip2 - head2} > ${MAX_EXECUTION_LAG_BLOCKS} at broadcast — mirror stale, resimulate.`); continue; }
+        // Execution calldata carries the real on-chain minProfit floor; re-simulate coherence at CURRENT state.
+        const execData = encodeFunctionData({ abi: FLASH_ABI, functionName: "flashExecute", args: [0, num as Address, sized.amountIn, opp.minProfitNumeraire, tuples] });
+        try {
+          await chain.primary.call({ account: owner, to: kg, data: execData }); // must still clear the REAL minProfit at current head
+          const gp = await chain.primary.getGasPrice();
+          const h = await chain.wallet!.sendTransaction({ to: kg, data: execData, gas: 2_000_000n, gasPrice: gp });
+          const r = await chain.waitReceipt({ hash: h, confirmations: 1, timeout: 120_000 });
+          console.log(`         flashExecute(minProfit=${opp.minProfitNumeraire}) → ${r.status} tx=${h}`);
+        } catch (e2) { console.log(`         send ABORTED: pre-send eth_call at real minProfit reverted "${revertReason(e2)}" — state moved, NOT broadcasting.`); }
       }
     } catch (err) {
       const reason = revertReason(err);

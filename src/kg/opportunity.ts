@@ -23,6 +23,9 @@ export interface GateContext {
   minNetUsd: number;                          // executability threshold
   safetyUsd: number;                          // margin subtracted (adverse selection / slippage buffer)
   flashFeeBps: number;                        // provider fee (Morpho = 0)
+  execMinProfitBps: number;                   // on-chain minProfit floor as a fraction of predicted gross (e.g. 7000 = keep ≥70%)
+  lag: number;                                // indexer head vs chain tip (blocks behind)
+  maxLagBlocks: number;                       // HARD freshness gate: reject if lag exceeds this
 }
 
 export interface ExecutableOpportunity {
@@ -34,6 +37,11 @@ export interface ExecutableOpportunity {
   gasUnits: bigint;
   gasCostUsd: number;
   netPnlUsd: number | null;
+  /** The on-chain safety floor for the EXECUTION calldata (numéraire wei). NOT 0 — set so an adverse
+   * state move between sim and inclusion reverts the tx instead of executing a degraded/unprofitable
+   * trade. = max(predicted gross × execMinProfitBps, gas+safety in numéraire) → guarantees net-positive
+   * if it lands. eth_call validity checks still use minProfit=0; execution uses THIS. */
+  minProfitNumeraire: bigint;
   economicEdge: boolean;   // kernel said profitable
   executable: boolean;     // passes all executability gates
   rejectionReason?: string;
@@ -53,11 +61,22 @@ export function evaluateExecutable(sized: SizedCycle, ctx: GateContext): Executa
   const flashCostUsd = numUsd != null ? amountHuman * numUsd * (ctx.flashFeeBps / 10_000) : 0;
   const netPnlUsd = grossPnlUsd != null ? grossPnlUsd - gasCostUsd - flashCostUsd - ctx.safetyUsd : null;
 
+  // On-chain minProfit floor for the EXECUTION calldata: keep ≥ execMinProfitBps of predicted gross, but
+  // never below (gas + safety) valued in the numéraire — so if it lands, net is still positive.
+  let minProfitNumeraire = 0n;
+  if (numUsd != null && numUsd > 0) {
+    const toNumWei = (usd: number) => BigInt(Math.ceil((usd / numUsd) * 10 ** dec));
+    const keep = (sized.realizedPnl * BigInt(Math.max(0, Math.min(10_000, Math.round(ctx.execMinProfitBps))))) / 10_000n;
+    const floor = toNumWei(gasCostUsd + flashCostUsd + ctx.safetyUsd);
+    minProfitNumeraire = keep > floor ? keep : floor;
+  }
+
   // Gates (order = most fundamental first). economicEdge is already true (sizeCycle only returns >0 gross).
   let executable = true, rejectionReason: string | undefined;
-  if (!ctx.flashFundable.has(num)) { executable = false; rejectionReason = "numéraire not flash-fundable"; }
+  if (ctx.lag > ctx.maxLagBlocks) { executable = false; rejectionReason = `indexer lag ${ctx.lag} > ${ctx.maxLagBlocks} blocks (stale mirror)`; }
+  else if (!ctx.flashFundable.has(num)) { executable = false; rejectionReason = "numéraire not flash-fundable"; }
   else if (numUsd == null || grossPnlUsd == null) { executable = false; rejectionReason = "numéraire unpriceable (no exit valuation)"; }
   else if (netPnlUsd == null || netPnlUsd <= ctx.minNetUsd) { executable = false; rejectionReason = `net $${(netPnlUsd ?? 0).toFixed(4)} ≤ threshold $${ctx.minNetUsd}`; }
 
-  return { numeraire: num, amountIn: sized.amountIn, grossPnl: sized.realizedPnl, grossPnlUsd, flashCostUsd, gasUnits: sized.gasUnits, gasCostUsd, netPnlUsd, economicEdge: sized.realizedPnl > 0n, executable, rejectionReason, sized };
+  return { numeraire: num, amountIn: sized.amountIn, grossPnl: sized.realizedPnl, grossPnlUsd, flashCostUsd, gasUnits: sized.gasUnits, gasCostUsd, netPnlUsd, minProfitNumeraire, economicEdge: sized.realizedPnl > 0n, executable, rejectionReason, sized };
 }
