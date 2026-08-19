@@ -1532,6 +1532,48 @@ export class Database {
   async certifyPoolTickComplete(chainId: number, pool: string, generation: number, source: string): Promise<void> {
     await this.pool.query(`UPDATE pool_tick_status SET complete=true, status='complete', source=$3, coverage_generation=$4, updated_at=NOW() WHERE chain_id=$1 AND pool=$2`, [chainId, pool.toLowerCase(), source, generation]);
   }
+  /** Storage-scan worklist (Item 3.4): concentrated pools not tick-complete — INCLUDING status='failed'
+   * (historical bootstrap gave up → storage snapshot is the fallback). Priority ASC (P0 first). */
+  async poolsForStorageScan(chainId: number, limit = 4): Promise<Array<{ pool: string; factory: string | null; tickSpacing: number | null; fee: number | null; token0: string | null; token1: string | null }>> {
+    const r = await this.pool.query<{ address: string; factory: string | null; ts: string | null; fee: string | null; t0: string | null; t1: string | null }>(
+      `SELECT e.address, e.meta->>'factory' factory, e.meta->>'tickSpacing' ts, e.meta->>'fee' fee, e.meta->>'token0' t0, e.meta->>'token1' t1
+       FROM entities e LEFT JOIN pool_tick_status pts ON pts.chain_id=e.chain_id AND pts.pool=e.address
+       WHERE e.chain_id=$1 AND e.kind='pool' AND e.meta->>'archetype'='v3' AND length(e.address)=42
+         AND (pts.complete IS NULL OR pts.complete=false)
+       ORDER BY COALESCE(pts.priority,3) ASC, (pts.status='failed') DESC, pts.updated_at ASC NULLS FIRST LIMIT $2`, [chainId, limit]);
+    return r.rows.map((x) => ({ pool: x.address, factory: x.factory, tickSpacing: x.ts != null ? Number(x.ts) : null, fee: x.fee != null ? Number(x.fee) : null, token0: x.t0, token1: x.t1 }));
+  }
+
+  /** ATOMIC SNAPSHOT REPLACE (Item 3.4) — storage bootstrap is a STATE SNAPSHOT, NOT additive: a complete
+   * tick map read at block B summarises all prior history, so it REPLACES the pool's tick_liquidity (never
+   * sums, or every already-incorporated Mint/Burn would double). Optional `replayDeltas` are the
+   * indexer-observed Mint/Burn in [B+1, throughBlock] applied additively ON TOP (the disjoint-range replay),
+   * all in ONE transaction. Sets status='snapshot' (NOT complete — the Quoter-validation gate certifies). */
+  async replaceTickMapSnapshot(chainId: number, pool: string, snapshotBlock: number, snapshotTicks: Array<{ tick: number; liquidityNet: bigint }>, throughBlock: number, replayDeltas: Array<{ tickLower: number; tickUpper: number; liquidityDelta: bigint }> = []): Promise<{ ok: boolean; reason?: string }> {
+    const p = pool.toLowerCase();
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`INSERT INTO pool_tick_status(chain_id, pool, status) VALUES($1,$2,'snapshot') ON CONFLICT (chain_id, pool) DO NOTHING`, [chainId, p]);
+      await client.query(`SELECT 1 FROM pool_tick_status WHERE chain_id=$1 AND pool=$2 FOR UPDATE`, [chainId, p]);
+      await client.query(`DELETE FROM tick_liquidity WHERE chain_id=$1 AND pool=$2`, [chainId, p]);
+      // Net the snapshot with the replay deltas (both keyed by tick) → one authoritative set.
+      const net = new Map<number, bigint>();
+      for (const t of snapshotTicks) if (t.liquidityNet !== 0n) net.set(t.tick, (net.get(t.tick) ?? 0n) + t.liquidityNet);
+      for (const d of replayDeltas) { net.set(d.tickLower, (net.get(d.tickLower) ?? 0n) + d.liquidityDelta); net.set(d.tickUpper, (net.get(d.tickUpper) ?? 0n) - d.liquidityDelta); }
+      const rows = [...net.entries()].filter(([, v]) => v !== 0n);
+      if (rows.length) {
+        const values: unknown[] = [];
+        const tuples = rows.map(([tick, v], i) => { const b = i * 5; values.push(chainId, p, tick, v.toString(), throughBlock); return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},NOW())`; });
+        await client.query(`INSERT INTO tick_liquidity(chain_id,pool,tick,liquidity_net,block_number,updated_at) VALUES ${tuples.join(",")}`, values); // plain INSERT — rows were just deleted, no conflict
+      }
+      await client.query(`UPDATE pool_tick_status SET status='snapshot', source='storage_scan', through_block=$3, bootstrap_through=$3, creation_block=COALESCE(creation_block,$4), updated_at=NOW() WHERE chain_id=$1 AND pool=$2`, [chainId, p, throughBlock, snapshotBlock]);
+      await client.query("COMMIT");
+      return { ok: true };
+    } catch (e) { await client.query("ROLLBACK").catch(() => undefined); return { ok: false, reason: e instanceof Error ? e.message : String(e) }; }
+    finally { client.release(); }
+  }
+
   /** RESTART-SAFE bootstrap step: in ONE transaction, assert the chunk is contiguous (from == through+1, or
    * == creation_block for the first), additively apply its Mint/Burn deltas, and advance bootstrap_through —
    * so a crash either applies both or neither (exactly-once, independent of chunk boundaries). */
