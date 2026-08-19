@@ -2,7 +2,7 @@ import type { Database } from "../db.js";
 import type { Config } from "../config.js";
 import type { Archetype } from "../router/types.js";
 import type { LiquidityGraph } from "./graph-loader.js";
-import { PoolSim } from "./state.js";
+import { PoolSim, type SwapTrace } from "./state.js";
 import { buildPoolSim, sizeCycle } from "./kernel.js";
 import { findNegativeCycles, type KGCycle, type KGEdge } from "./cycle-finder.js";
 import { evaluateExecutable, type GateContext } from "./opportunity.js";
@@ -25,6 +25,8 @@ export interface Candidate {
   ckey: string; numeraire: string; route: string; pools: string[];
   amountIn: bigint; grossUsd: number | null; gasUnits: bigint; gasUsd: number; netUsd: number | null;
   simulationExact: boolean; executable: boolean; rejectionReason?: string;
+  legs: SwapTrace[];            // per-hop exact amounts — lets the shadow-preflight re-encode without re-sizing
+  minProfitNumeraire: bigint;   // the on-chain minProfit floor the execution calldata would carry
 }
 export interface ObserveStats {
   detectors: Record<string, number>; sized: number; executable: number; economic: number;
@@ -91,6 +93,7 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
       detector, ckey, numeraire: num, route: cycle.tokens.map(sym).join("→"), pools,
       amountIn: sizedCyc.amountIn, grossUsd: opp.grossPnlUsd, gasUnits: sizedCyc.gasUnits, gasUsd: opp.gasCostUsd,
       netUsd: opp.netPnlUsd, simulationExact: sizedCyc.simulationExact, executable: isExec, rejectionReason: reason,
+      legs: sizedCyc.legs, minProfitNumeraire: opp.minProfitNumeraire,
     };
     candidates.push(cand);
     await db.upsertCandidate({ chainId: cid, ckey, detector, numeraire: num, route: cand.route, pools, amountIn: cand.amountIn, grossUsd: cand.grossUsd, gasUnits: cand.gasUnits, gasUsd: cand.gasUsd, netUsd: cand.netUsd, simulationExact: cand.simulationExact, executable: isExec, rejectionReason: reason, block: graph.head }).catch(() => undefined);
