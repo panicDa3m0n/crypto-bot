@@ -59,6 +59,8 @@ export interface PlanResult {
   /** Item 3: every leg was certifiably exact (all concentrated legs had complete tick coverage, no floor).
    * A valid plan with simulationExact=false is a positive-PnL economicCandidate but NOT certifiable executable. */
   simulationExact: boolean;
+  /** When simulationExact is false, WHY (first non-exact leg): partial coverage / floor / crossing-envelope. */
+  inexactReason?: string;
 }
 
 /** Run `ops` from `initial` against a fresh fork of `snapshot`; evaluate against `obj`. Pure: `initial`
@@ -78,7 +80,7 @@ export function simulatePlan(snapshot: VenueSnapshot, initial: PortfolioState, o
   const finalNumeraire = s.portfolio.get(obj.numeraire);
   const realizedPnl = finalNumeraire - startNum;
   if (valid && realizedPnl <= 0n) { valid = false; reason = "non-positive realized PnL"; }
-  return { valid, reason, realizedPnl, gasUnits: s.gasUnits, residual, finalNumeraire, simulationExact: s.exact };
+  return { valid, reason, realizedPnl, gasUnits: s.gasUnits, residual, finalNumeraire, simulationExact: s.exact, inexactReason: s.inexactReason };
 }
 
 // ── Cycle sizing ─────────────────────────────────────────────────────────────
@@ -97,6 +99,7 @@ export interface SizedCycle {
   ops: Transformation[]; // the winning plan (for reference)
   legs: SwapTrace[];     // per-hop exact amounts (for the encoder)
   simulationExact: boolean; // Item 3: all legs certifiably exact — required before `executable`
+  inexactReason?: string;   // why not exact (partial coverage / floor / crossing-envelope), for the gate/telemetry
 }
 
 /** Build the plan for a cycle at a given input size. Start token = cycle.tokens[0] = numéraire. Each leg
@@ -161,7 +164,7 @@ export function sizeCycle(version: StateVersion, cycle: KGCycle, poolSims: Map<s
   // Recompute at the winner WITH a trace to capture per-hop amounts for the encoder.
   const legs: SwapTrace[] = [];
   const r = simulatePlan(snapshot, initial, ops, obj, legs);
-  return { amountIn: bestX, numeraire, realizedPnl: bestP, gasUnits: r.gasUnits, funding: opts.funding, ops, legs, simulationExact: r.simulationExact };
+  return { amountIn: bestX, numeraire, realizedPnl: bestP, gasUnits: r.gasUnits, funding: opts.funding, ops, legs, simulationExact: r.simulationExact, inexactReason: r.inexactReason };
 }
 
 // ── Flash-liquidation as an ordinary plan (F5) — exit is a GENERIC swap route (1..n hops, F5.2) ────

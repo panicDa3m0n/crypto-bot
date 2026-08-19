@@ -1,5 +1,5 @@
 import type { Archetype } from "../router/types.js";
-import { simulateExactInputStateful } from "../router/v3-sim.js";
+import { simulateExactInputStateful, MAX_CERTIFIED_V3_CROSSINGS } from "../router/v3-sim.js";
 import { getTickAtSqrtRatio } from "../router/tick-math.js";
 import { stableGetAmountOut } from "../router/solidly-math.js";
 
@@ -30,7 +30,7 @@ export interface StateVersion {
 /** Result of one swap: output, input actually consumed, whether it was a floor (V3 ran out of ticks), and
  * whether it is CERTIFIABLY EXACT (Item 3): constant-product/stable math is always exact; a concentrated
  * swap is exact only when the pool's tick map is `complete` AND the swap didn't hit a floor (`partial`). */
-export interface SwapOutcome { amountOut: bigint; amountInUsed: bigint; partial: boolean; exact: boolean }
+export interface SwapOutcome { amountOut: bigint; amountInUsed: bigint; partial: boolean; exact: boolean; inexactReason?: string }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pool simulators — protocol-specific, mutable, cloneable (for COW).
@@ -103,10 +103,21 @@ export class V3PoolSim extends PoolSim {
     return r;
   }
 
+  /** Certifiable exactness (Item 3) is SIZE/PATH-dependent, not merely pool-level: it holds only when the tick
+   * map is `complete`, the swap didn't hit a liquidity floor (`partial`), AND it stayed inside the validated
+   * crossing envelope. Beyond that the swap is a positive-PnL economicCandidate but NOT certifiable executable. */
+  private outcome(r: NonNullable<ReturnType<typeof simulateExactInputStateful>>): SwapOutcome {
+    let inexactReason: string | undefined;
+    if (this.tickCoverage !== "complete") inexactReason = "partial tick coverage";
+    else if (r.partial) inexactReason = "swap hit indexed-liquidity floor";
+    else if (r.ticksCrossed > MAX_CERTIFIED_V3_CROSSINGS) inexactReason = `v3 crossing count ${r.ticksCrossed} exceeds certified math envelope (${MAX_CERTIFIED_V3_CROSSINGS})`;
+    return { amountOut: r.amountOut, amountInUsed: r.amountInUsed, partial: r.partial, exact: inexactReason === undefined, inexactReason };
+  }
+
   quote(tokenIn: string, amountIn: bigint): SwapOutcome | null {
     if (amountIn <= 0n || !this.has(tokenIn)) return null;
     const r = this.sim(tokenIn, amountIn);
-    return r && r.amountOut > 0n ? { amountOut: r.amountOut, amountInUsed: r.amountInUsed, partial: r.partial, exact: this.tickCoverage === "complete" && !r.partial } : null;
+    return r && r.amountOut > 0n ? this.outcome(r) : null;
   }
 
   applySwap(tokenIn: string, amountIn: bigint): SwapOutcome | null {
@@ -114,7 +125,7 @@ export class V3PoolSim extends PoolSim {
     const r = this.sim(tokenIn, amountIn);
     if (!r || r.amountOut <= 0n) return null;
     this.sqrtPriceX96 = r.sqrtPriceX96; this.tick = r.tick; this.liquidity = r.liquidity;
-    return { amountOut: r.amountOut, amountInUsed: r.amountInUsed, partial: r.partial, exact: this.tickCoverage === "complete" && !r.partial };
+    return this.outcome(r);
   }
 
   clone(): PoolSim { return new V3PoolSim(this.poolId, this.token0, this.token1, this.sqrtPriceX96, this.liquidity, this.tick, this.feePpm, this.ticks, this.archetype, this.tickCoverage, this.tickSpacing); }
@@ -273,4 +284,6 @@ export interface SimulationState {
   /** Item 3: false once ANY leg was not certifiably exact (partial tick coverage / floor). A plan can be a
    * positive-PnL economicCandidate with exact=false, but it can NEVER be certified executable. */
   exact: boolean;
+  /** Why the plan is not certifiably exact (first non-exact leg's reason) — surfaced by the gate for observability. */
+  inexactReason?: string;
 }
