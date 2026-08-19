@@ -18,7 +18,7 @@ export const ACTION_TOOLS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "open_position",
-      description: "Apri una posizione: COMPRA un token. NON scegli la size in dollari — il sistema la DIMENSIONA come un trader umano, in base al RISCHIO: rischia una % del NAV, e la size = rischio / distanza-dello-stop (stop stretto → size maggiore). Poi la limita per concentrazione (qualità/liquidità del token) e per il CALORE totale di portafoglio (quante posizioni-a-rischio hai già aperte). Tu dai: stopLossPct (OBBLIGATORIO — definisce la size), takeProfitPct, e conviction (low|medium|high = quanto osare). Il sistema fa rotta/slippage/gas/approve/wrap, verifica l'anti-honeypot, gestisce stop/target, e ti dice la size calcolata + il perché. limitPrice opzionale.",
+      description: "Apri una posizione: COMPRA un token. NON scegli la size in dollari — la DIMENSIONA il sistema, e DIPENDE dallo Stato Operativo attivo: in **bluechip** è risk-based (rischi una % del NAV, size = rischio / distanza-stop, stop stretto → size maggiore); in **launchtoken** è un BIGLIETTO della lotteria (una size minuscola, anche pochi centesimi — l'intero ticket è il rischio, lo stop NON guida la size perché una memecoin crolla oltre ogni stop). In entrambi limita per liquidità e per il CALORE totale di portafoglio. Tu dai: stopLossPct (OBBLIGATORIO — in bluechip guida la size; in launchtoken serve alla gestione), takeProfitPct, e conviction (low|medium|high = quanto osare). Il sistema fa rotta/slippage/gas/approve/wrap, verifica l'anti-honeypot, gestisce stop/target, e ti dice la size + il perché. limitPrice opzionale.",
       parameters: { type: "object", additionalProperties: false, properties: {
         token: { type: "string", description: "indirizzo del token da comprare (0x…)" },
         stopLossPct: { type: "number", description: "OBBLIGATORIO: stop-loss in % sotto l'entry (es. 30). Definisce la size dal rischio." },
@@ -89,37 +89,56 @@ export async function dispatchActionTool(name: string, args: Record<string, unkn
       if (!check.buyable) return { error: `non comprabile ora: ${check.reasons.join("; ") || "nessuna rotta"} — se transitorio, riprova.` };
       if (!check.canSell) return { refused: true, reason: "HONEYPOT — nessuna rotta di vendita mentre l'acquisto è possibile. Non apro.", detail: check.reasons };
 
-      // HUMAN-STYLE SIZING. size = risk / stop-distance; then cap by concentration (token quality), by
-      // pool liquidity (clean exit), by absolute ceiling, and by total portfolio HEAT (open risk budget).
+      // STRATEGY-AWARE SIZING — the two states have OPPOSITE risk natures, so they size differently.
       const stats = await deps.db.tokenStats(chainId, token).catch(() => null);
       const liq = stats?.liqUsd ?? null;
       const isFresh = liq == null || liq < 150_000; // thin/low-liq = fresh-launch risk regime; deep = quality
       const stopFrac = stopLossPct / 100;
-      const riskUsd = nav * (cfg.POSITION_RISK_PCT / 100) * convMult;
-      let size = riskUsd / stopFrac;
+      const state = (await deps.db.latestScarletState().catch(() => undefined))?.state ?? "bluechip";
+      const isLaunch = state === "launchtoken";
       const caps: string[] = [];
-      const concCap = nav * ((isFresh ? cfg.POSITION_MAX_NAV_PCT_FRESH : cfg.POSITION_MAX_NAV_PCT_QUALITY) / 100);
-      if (size > concCap) { size = concCap; caps.push(`concentrazione ${isFresh ? "fresh 15%" : "quality 30%"} NAV`); }
-      if (liq != null && liq > 0) { const liqCap = liq * (cfg.POSITION_MAX_LIQ_PCT / 100); if (size > liqCap) { size = liqCap; caps.push(`≤${cfg.POSITION_MAX_LIQ_PCT}% liquidità`); } }
-      if (size > cfg.POSITION_MAX_USD) { size = cfg.POSITION_MAX_USD; caps.push(`tetto assoluto $${cfg.POSITION_MAX_USD}`); }
-      const openRisk = openPlans.reduce((s, p) => s + (p.entryAmountUsd || 0) * ((p.stopLossPct ?? 100) / 100), 0);
-      const heatBudget = nav * (cfg.PORTFOLIO_HEAT_PCT / 100);
-      if (openRisk + size * stopFrac > heatBudget) { size = Math.max(0, (heatBudget - openRisk) / stopFrac); caps.push("calore di portafoglio"); }
+      let size: number, riskUsd: number, why: string;
+      if (isLaunch) {
+        // LAUNCHTOKEN = lottery ticket: a TINY fixed bet (small % of NAV × conviction). The WHOLE ticket is
+        // the risk — a memecoin dumps past any stop, so size is NOT driven by the stop. Many small tickets.
+        size = nav * (cfg.LAUNCH_TICKET_PCT / 100) * convMult;
+        riskUsd = size; // full ticket at risk
+        if (liq != null && liq > 0) { const liqCap = liq * (cfg.POSITION_MAX_LIQ_PCT / 100); if (size > liqCap) { size = liqCap; caps.push(`≤${cfg.POSITION_MAX_LIQ_PCT}% liquidità`); } }
+        if (size > cfg.LAUNCH_MAX_USD) { size = cfg.LAUNCH_MAX_USD; caps.push(`tetto lancio $${cfg.LAUNCH_MAX_USD}`); }
+        why = `biglietto lancio ${cfg.LAUNCH_TICKET_PCT}%×${conviction} del NAV (l'intero ticket è il rischio)`;
+      } else {
+        // BLUECHIP = risk-based, patient: size = risk / stop-distance; cap by concentration, liquidity, ceiling.
+        riskUsd = nav * (cfg.POSITION_RISK_PCT / 100) * convMult;
+        size = riskUsd / stopFrac;
+        const concCap = nav * ((isFresh ? cfg.POSITION_MAX_NAV_PCT_FRESH : cfg.POSITION_MAX_NAV_PCT_QUALITY) / 100);
+        if (size > concCap) { size = concCap; caps.push(`concentrazione ${isFresh ? "fresh 15%" : "quality 30%"} NAV`); }
+        if (liq != null && liq > 0) { const liqCap = liq * (cfg.POSITION_MAX_LIQ_PCT / 100); if (size > liqCap) { size = liqCap; caps.push(`≤${cfg.POSITION_MAX_LIQ_PCT}% liquidità`); } }
+        if (size > cfg.POSITION_MAX_USD) { size = cfg.POSITION_MAX_USD; caps.push(`tetto assoluto $${cfg.POSITION_MAX_USD}`); }
+        why = `${cfg.POSITION_RISK_PCT}%×${conviction} del NAV rischiato / stop ${stopLossPct}%`;
+      }
+      // PER-CATEGORY BUDGET: this strategy's deployed capital can't exceed its bucket (of NAV). The rest of the
+      // NAV is the stable/native RESERVE. She organizes WITHIN the bucket; when it's full, she must rotate.
+      const budgetPct = isLaunch ? cfg.LAUNCH_BUDGET_PCT : cfg.BLUECHIP_BUDGET_PCT;
+      const catBudget = nav * (budgetPct / 100);
+      const usedByStrat = await deps.db.usedBudgetByStrategy(chainId).catch(() => ({} as Record<string, number>));
+      const usedCat = usedByStrat[state] ?? 0;
+      if (usedCat + size > catBudget) { size = Math.max(0, catBudget - usedCat); caps.push(`budget ${isLaunch ? "lanci" : "bluechip"} ${budgetPct}% NAV`); }
       size = Math.round(size * 100) / 100;
-      if (size < cfg.POSITION_MIN_USD) return { error: `budget di rischio quasi esaurito (rischio aperto ~$${openRisk.toFixed(1)} su $${heatBudget.toFixed(1)}). Chiudi una posizione, oppure usa conviction più alta / stop più stretto.` };
+      if (size < cfg.POSITION_MIN_USD) return { error: `budget ${isLaunch ? "lanci" : "bluechip"} esaurito (usato ~$${usedCat.toFixed(2)} su $${catBudget.toFixed(2)} = ${budgetPct}% del NAV). Chiudi/ruota una posizione di questa categoria prima di aprirne un'altra.` };
 
       const meta = (await deps.db.tokenMeta(chainId, [token]).catch(() => new Map())).get(token) as { symbol: string | null } | undefined;
       const entryKind = numOrNull(args.limitPrice) ? "limit" : "now";
       const id = await deps.db.createPositionPlan({
         chainId, token, symbol: meta?.symbol ?? null, baseToken: (cfg.WBERA_ADDRESS as string).toLowerCase(),
         entryKind, entryPrice: numOrNull(args.limitPrice), entryAmountUsd: size,
-        stopLossPct, takeProfitPct, partials: [], note: `Scarlet (${conviction})`
+        stopLossPct, takeProfitPct, partials: [], note: `Scarlet (${conviction})`, strategy: state
       }).catch((e) => ({ error: (e instanceof Error && e.message) ? e.message : String(e || "errore DB sconosciuto") }));
       if (typeof id !== "number") return { error: `creazione posizione fallita: ${(id as { error: string }).error || "errore sconosciuto"}` };
       return { ok: true, positionId: id, symbol: meta?.symbol ?? null, sizeUsd: size, conviction,
-        tier: isFresh ? "fresh" : "quality", riskUsd: Math.round(riskUsd * 100) / 100,
+        strategy: state, tier: isLaunch ? "launch-ticket" : (isFresh ? "fresh" : "quality"), riskUsd: Math.round(riskUsd * 100) / 100,
         entry: entryKind === "now" ? "subito" : `limit ≤ $${numOrNull(args.limitPrice)}`, stopLossPct, takeProfitPct,
-        message: `Size $${size} = ${cfg.POSITION_RISK_PCT}%×${conviction} del NAV rischiato / stop ${stopLossPct}%${caps.length ? `, limitata da: ${caps.join(", ")}` : ""}. Il sistema esegue e gestisce stop/target.` };
+        budget: { categoria: state, budgetUsd: Math.round(catBudget * 100) / 100, usatoDopoQuesta: Math.round((usedCat + size) * 100) / 100, pctNav: budgetPct },
+        message: `Size $${size} = ${why}${caps.length ? `, limitata da: ${caps.join(", ")}` : ""}. Budget ${isLaunch ? "lanci" : "bluechip"}: usato ~$${(usedCat + size).toFixed(2)}/$${catBudget.toFixed(2)}. Il sistema esegue e gestisce stop/target.` };
     }
 
     case "close_position": {

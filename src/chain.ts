@@ -32,6 +32,9 @@ const erc20Abi = parseAbi([
 
 export class BerachainClients {
   readonly primary;
+  readonly indexer;    // dedicated block-indexer lane (never the shared read pool)
+  readonly enrichment; // dedicated enrichment lane (bursty metadata reads; isolated so it never blocks the indexer)
+  readonly tools;      // Scarlet's tool reads (probe/balance/allowance); aligned with the indexer lane by default
   readonly secondary;
   /** Precision lane: the RPC the oracle / liquidation reads use — deliberately OFF the sensor
    * firehose (primary) so it never starves on shared rate-limits. */
@@ -40,13 +43,22 @@ export class BerachainClients {
   readonly fallback;
   readonly heads?: PublicClient<WebSocketTransport, ReturnType<typeof chainFrom>>;
   readonly wallet;
+  /** EXECUTION read lane — a PUBLIC client on the SAME RPC the signer broadcasts through. The WHOLE tx
+   * lifecycle rides one node: preflight (simulate) + baseFee + receipt wait all read here, so the send
+   * sees exactly the state the preflight simulated (no cross-node lag, no approval-visibility race), on
+   * the reliable MEV-protected endpoint. Only `preflightSecondary` deliberately uses a DIFFERENT node. */
+  readonly exec;
   readonly primaryRpc: string;
+  readonly indexerRpc: string;
+  readonly enrichmentRpc: string;
+  readonly toolsRpc: string;
   readonly secondaryRpc: string;
   readonly precisionRpc: string;
   readonly fallbackRpc: string;
   readonly executionRpc: string;
   private readonly rl = new Map<string, { n: number; at: number }>();
   private readonly priceCache = new Map<string, number>();
+  private readonly balCache = new Map<string, bigint>(); // last-known base-asset balances → portfolio never throws on a flaky read
   // Concurrency governor for the precision lane: cap in-flight reads so a burst (232 positions ×
   // several pools) can't trip the RPC's rate-limit in the first place. Excess reads queue.
   private readonly PRECISION_CONCURRENCY = 6;
@@ -66,7 +78,16 @@ export class BerachainClients {
     this.precisionRpc = config.PRECISION_RPC_HTTP_URL ?? config.SECONDARY_RPC_HTTP_URL;
     this.fallbackRpc = config.FALLBACK_RPC_HTTP_URL ?? config.PRIMARY_RPC_HTTP_URL;
     this.executionRpc = config.EXECUTION_RPC_HTTP_URL ?? this.fallbackRpc;
+    this.indexerRpc = config.INDEXER_RPC_HTTP_URL;
+    this.enrichmentRpc = config.ENRICHMENT_RPC_HTTP_URL;
+    this.toolsRpc = config.TOOLS_RPC_HTTP_URL ?? this.indexerRpc; // aligned with the indexer lane by default
     this.primary = createPublicClient({ chain, transport: http(config.PRIMARY_RPC_HTTP_URL, { timeout: 12_000, retryCount: 1 }) });
+    // Dedicated indexer lane — ONLY the block-indexer uses this client, so its getLogs/metadata reads never
+    // contend with the shared read pool (and vice-versa). retryCount handles transient blips without skipping a block.
+    this.indexer = createPublicClient({ chain, transport: http(this.indexerRpc, { timeout: 12_000, retryCount: 2 }) });
+    // Dedicated enrichment lane (bursty) + Scarlet-tools lane (aligned with indexer unless overridden).
+    this.enrichment = createPublicClient({ chain, transport: http(this.enrichmentRpc, { timeout: 12_000, retryCount: 1 }) });
+    this.tools = this.toolsRpc === this.indexerRpc ? this.indexer : createPublicClient({ chain, transport: http(this.toolsRpc, { timeout: 12_000, retryCount: 1 }) });
     this.secondary = createPublicClient({ chain, transport: http(config.SECONDARY_RPC_HTTP_URL, { timeout: 12_000, retryCount: 1 }) });
     this.precision = createPublicClient({ chain, transport: http(this.precisionRpc, { timeout: 12_000, retryCount: 0, batch: true }) });
     this.fallback = createPublicClient({ chain, transport: http(this.fallbackRpc, { timeout: 12_000, retryCount: 1, batch: true }) });
@@ -79,7 +100,18 @@ export class BerachainClients {
     this.wallet = account
       ? createWalletClient({ chain, account, transport: http(this.executionRpc, { timeout: 12_000, retryCount: 1 }) })
       : undefined;
-    this.logger?.info({ primary: this.primaryRpc, secondary: this.secondaryRpc, precision: this.precisionRpc, fallback: this.fallbackRpc, execution: this.executionRpc, dedicatedExecution: this.executionRpc !== this.primaryRpc }, "RPC lanes");
+    // Public read client on the EXECUTION RPC — the tx lifecycle (preflight/baseFee/receipt) reads here.
+    this.exec = createPublicClient({ chain, transport: http(this.executionRpc, { timeout: 12_000, retryCount: 1 }) });
+    // TRACEABILITY: one authoritative line mapping every purpose → its endpoint, so we always know which
+    // RPC is used for what (and can swap any via env). Grep "RPC lanes" to audit.
+    this.logger?.info({ indexer: this.indexerRpc, enrichment: this.enrichmentRpc, tools: this.toolsRpc, execution: this.executionRpc, primary: this.primaryRpc, secondary: this.secondaryRpc, precision: this.precisionRpc, fallback: this.fallbackRpc, dedicatedExecution: this.executionRpc !== this.primaryRpc, dedicatedIndexer: this.indexerRpc !== this.primaryRpc, toolsAlignedWithIndexer: this.toolsRpc === this.indexerRpc }, "RPC lanes");
+  }
+
+  /** Log an RPC lane failure AT THE MOMENT it happens (rule: no status polling — surface KO on error).
+   * `lane` is the purpose (indexer/enrichment/tools/execution), so offline phases are visible in logs. */
+  laneError(lane: string, err: unknown): void {
+    const endpoint = lane === "indexer" ? this.indexerRpc : lane === "enrichment" ? this.enrichmentRpc : lane === "tools" ? this.toolsRpc : lane === "execution" ? this.executionRpc : this.primaryRpc;
+    this.logger?.warn({ lane, endpoint, err: err instanceof Error ? err.message : String(err) }, "RPC lane KO");
   }
 
   /** Rate-limit meter: counts per-lane 429/limit hits and logs (throttled ≤1/30s per lane) so we can
@@ -168,16 +200,34 @@ export class BerachainClients {
     return watch({ poll: false, onBlockNumber: onBlock, onError });
   }
 
-  async portfolio(dailyLossUsd: number, dataHealthy: boolean): Promise<PortfolioSnapshot> {
+  /** `known` (db-first): pre-read ERC-20 balances (lowercased token → raw) from wallet_token_balances so
+   * NAV is derived from the indexer's DB, not RPC. Native + any missing token still read on-chain (best-
+   * effort, last-known cache). Callers without DB balances pass nothing → the pure-RPC path (unchanged). */
+  async portfolio(dailyLossUsd: number, dataHealthy: boolean, known?: Map<string, bigint>): Promise<PortfolioSnapshot> {
     if (!this.config.WALLET_ADDRESS) {
       return { observedAt: new Date().toISOString(), bera: 0, wbera: 0, usdcE: 0, honey: 0, baseAsset: this.config.BASE_ASSET, baseAssetBalance: 0, estimatedNavUsd: 0, beraUsd: 0, honeyUsd: 0, dailyLossUsd, lockedUsd: 0, dataHealthy };
     }
     const address = this.config.WALLET_ADDRESS as Address;
+    // Portfolio/NAV is ACCOUNTING (+ the gas-floor check) — it must NEVER abort a transaction. Read on the
+    // reliable execution lane (not the rate-limited general-reads lane), and make every read best-effort:
+    // on failure fall back to the last-known value (a stale NAV is fine; a thrown read killing a send is not).
+    // TODO(DB-first): derive these balances from indexed Transfers instead of RPC (see rpc-lane-assignment).
+    const resilient = async (key: string, fn: () => Promise<bigint>): Promise<bigint> => {
+      try { const v = await fn(); this.balCache.set(key, v); return v; }
+      catch { return this.balCache.get(key) ?? 0n; }
+    };
+    // DB-first per ERC-20: use the indexed balance when the caller provided it; RPC only for the ones the DB
+    // doesn't have (and always for native, which has no Transfer log). Keeps the last-known cache resilience.
+    const erc20Bal = (key: string, token: string): Promise<bigint> => {
+      const dbBal = known?.get(token.toLowerCase());
+      if (dbBal != null) { this.balCache.set(key, dbBal); return Promise.resolve(dbBal); }
+      return resilient(key, () => this.exec.readContract({ address: token as Address, abi: erc20Abi, functionName: "balanceOf", args: [address] }) as Promise<bigint>);
+    };
     const [beraRaw, wberaRaw, usdcRaw, honeyRaw] = await Promise.all([
-      this.primary.getBalance({ address }),
-      this.primary.readContract({ address: this.config.WBERA_ADDRESS as Address, abi: erc20Abi, functionName: "balanceOf", args: [address] }),
-      this.primary.readContract({ address: this.config.USDC_E_ADDRESS as Address, abi: erc20Abi, functionName: "balanceOf", args: [address] }),
-      this.primary.readContract({ address: this.config.HONEY_ADDRESS as Address, abi: erc20Abi, functionName: "balanceOf", args: [address] })
+      resilient("native", () => this.exec.getBalance({ address })),
+      erc20Bal("wbera", this.config.WBERA_ADDRESS),
+      erc20Bal("usdc", this.config.USDC_E_ADDRESS),
+      erc20Bal("honey", this.config.HONEY_ADDRESS)
     ]);
     const bera = Number(beraRaw) / 1e18;
     const wbera = Number(wberaRaw) / 1e18;
@@ -245,7 +295,9 @@ export class BerachainClients {
   }
 
   async preflight(request: { to: Address; data: Hex; value: bigint; account?: Address }): Promise<{ gas: bigint; gasPriceWei: bigint; blockNumber: bigint }> {
-    return this.preflightWith(this.primary, request);
+    // Simulate on the EXECUTION lane — the same node that will broadcast → the send sees the exact state
+    // the preflight validated (allowance/balance/gas), on the reliable MEV endpoint. No cross-node lag.
+    return this.preflightWith(this.exec, request);
   }
 
   async preflightSecondary(request: { to: Address; data: Hex; value: bigint; account?: Address }): Promise<{ gas: bigint; gasPriceWei: bigint; blockNumber: bigint }> {
@@ -277,15 +329,39 @@ export class BerachainClients {
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
+  /** Local nonce sequencer so a rapid sequence (buy → approve → sell) never reuses a nonce even when the
+   * exec node's pending count hasn't caught up (publicnode's MEV-protected mempool lags, which reported
+   * "replacement transaction underpriced" on the second tx). Cleared on any send error → resynced from chain. */
+  private trackedNonce?: number;
+  private async nextNonce(): Promise<number> {
+    const address = this.config.WALLET_ADDRESS as Address;
+    const chainCount = await this.exec.getTransactionCount({ address, blockTag: "pending" }).catch(() => this.trackedNonce ?? 0);
+    return this.trackedNonce != null ? Math.max(chainCount, this.trackedNonce) : chainCount;
+  }
+
   async send(to: Address, data: Hex, value: bigint, gas: bigint, gasPriceWei: bigint): Promise<Hex> {
     if (!this.wallet) throw new Error("Wallet signer is unavailable");
-    try { return await this.wallet.sendTransaction({ to, data, value, gas, gasPrice: gasPriceWei }); }
-    catch (err) { if (isTransientOrRateLimit(err)) this.noteRateLimit("execution", this.executionRpc); throw err; }
+    const nonce = await this.nextNonce();
+    try { const hash = await this.wallet.sendTransaction({ to, data, value, gas, gasPrice: gasPriceWei, nonce }); this.trackedNonce = nonce + 1; return hash; }
+    catch (err) { this.trackedNonce = undefined; if (isTransientOrRateLimit(err)) this.noteRateLimit("execution", this.executionRpc); throw err; }
+  }
+
+  /** Receipt confirmation for a sent tx. Prefers the EXECUTION lane, but is RESILIENT: some RPCs (e.g.
+   * publicnode) reject viem's receipt-polling with "Invalid parameters" — the tx is still mined, so we
+   * fall back to the indexer/general lanes. Any lane can find a mined tx; post-send there's no consistency
+   * requirement. Returns the full viem receipt (callers read status/gasUsed/logs). */
+  async waitReceipt(args: { hash: Hex; confirmations?: number; timeout?: number }) {
+    let lastErr: unknown;
+    for (const client of [this.exec, this.indexer, this.primary, this.fallback]) {
+      try { return await client.waitForTransactionReceipt(args); }
+      catch (e) { lastErr = e; } // this lane can't serve receipt polling → try the next
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
   /** Current base fee per gas (EIP-1559) from the latest block. 0n if unavailable (pre-1559 / RPC gap). */
   async baseFee(): Promise<bigint> {
-    const block = await this.primary.getBlock({ blockTag: "latest" });
+    const block = await this.exec.getBlock({ blockTag: "latest" }); // gas for the tx → execution lane
     return block.baseFeePerGas ?? 0n;
   }
 
@@ -293,8 +369,9 @@ export class BerachainClients {
    * for block inclusion. `maxFeePerGas` must already include base-fee headroom + the priority tip. */
   async sendEip1559(to: Address, data: Hex, value: bigint, gas: bigint, maxFeePerGas: bigint, maxPriorityFeePerGas: bigint): Promise<Hex> {
     if (!this.wallet) throw new Error("Wallet signer is unavailable");
-    try { return await this.wallet.sendTransaction({ to, data, value, gas, maxFeePerGas, maxPriorityFeePerGas }); }
-    catch (err) { if (isTransientOrRateLimit(err)) this.noteRateLimit("execution", this.executionRpc); throw err; }
+    const nonce = await this.nextNonce();
+    try { const hash = await this.wallet.sendTransaction({ to, data, value, gas, maxFeePerGas, maxPriorityFeePerGas, nonce }); this.trackedNonce = nonce + 1; return hash; }
+    catch (err) { this.trackedNonce = undefined; if (isTransientOrRateLimit(err)) this.noteRateLimit("execution", this.executionRpc); throw err; }
   }
 }
 

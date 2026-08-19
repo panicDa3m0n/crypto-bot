@@ -11,7 +11,8 @@ import type { Database } from "./db.js";
 import type { Decision, ExecutionRequest, PortfolioSnapshot } from "./domain.js";
 import type { GuardedExecutor } from "./executor.js";
 import type { PositionService } from "./positions.js";
-import type { Aggregator } from "./aggregator.js";
+import { isNative, NATIVE_ETH, type Aggregator } from "./aggregator.js";
+import type { LocalExecPlan } from "./router/router.js";
 
 const previewAbi = parseAbi(["function previewDeposit(uint256 assets) view returns (uint256 shares)"]);
 
@@ -29,6 +30,16 @@ function extractRevertData(err: unknown): string | null {
   }
   const m = String((err as { message?: string })?.message ?? "").match(/0x[0-9a-fA-F]{8,}/);
   return m ? m[0] : null;
+}
+
+/** True when a V3 sell-leg revert reason looks like a transfer-BLOCKING honeypot (buy ok, sell blocked at
+ * the token's transfer/transferFrom), vs a mere routing/liquidity failure. A transfer-block would also fail
+ * the aggregator's REAL execution (though not its quote), so we must reject it hard rather than fall through.
+ * An empty/undecodable revert is treated as suspicious (blocking) — classic custom-error honeypots hide there. */
+function isTransferBlockRevert(reason?: string): boolean {
+  if (!reason) return false;
+  if (/^(revert vuoto|vendita reverta \(honeypot\?\)|revert non decodificabile)$/i.test(reason)) return true;
+  return /transfer_from_failed|\bstf\b|transfer.?fail|blacklist|not.?whitelist|trading.?(not|disabled)|cannot.?(sell|transfer)|sell.?(disabled|blocked)|max.?(tx|wallet)|bot|cooldown/i.test(reason);
 }
 
 /**
@@ -101,14 +112,14 @@ export class Primitives {
   private async ensureAllowance(token: Address, spender: Address, amount: bigint, spenderCodeHash?: `0x${string}`): Promise<void> {
     const owner = this.owner();
     if (!owner) throw new Error("no wallet configured");
-    const current = await this.chain.primary.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [owner, spender] });
+    const current = await this.chain.exec.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [owner, spender] }); // tx-cycle read → execution lane
     if (current >= amount) return;
     const plan = await this.allowance.prepareIfNeeded(token, owner, spender, amount, spenderCodeHash);
     if (!plan) return;
     const hash = await this.execute("approve_exact", plan, { kind: "agent_action", maxEconomicLossUsd: 0 });
     // The dependent action reads allowance from chain state, so wait for the
     // approval to be mined before proceeding.
-    await this.chain.primary.waitForTransactionReceipt({ hash: hash as `0x${string}`, confirmations: 1, timeout: 120_000 });
+    await this.chain.waitReceipt({ hash: hash as `0x${string}`, confirmations: 1, timeout: 120_000 });
   }
 
   // --- lend / redeem (ERC-4626) ----------------------------------------------
@@ -219,7 +230,7 @@ export class Primitives {
       if (!this.chain.wallet) throw new Error("no signer");
       const gasPrice = await this.chain.primary.getGasPrice();
       const hash = await this.chain.wallet.sendTransaction({ data: bytecode, value: valueWei, gas: gas * 12n / 10n, gasPrice });
-      const receipt = await this.chain.primary.waitForTransactionReceipt({ hash, confirmations: 1, timeout: 120_000 });
+      const receipt = await this.chain.waitReceipt({ hash, confirmations: 1, timeout: 120_000 });
       await this.ledgerDeployGas(hash, receipt.gasUsed, receipt.effectiveGasPrice, "deploy_contract");
       this.logger.warn({ hash, address: receipt.contractAddress }, "Scarlet deployed a contract on mainnet");
       return { ok: true, mode: "executed", primitive: "deploy_contract", txHash: hash, detail: { deployedAddress: receipt.contractAddress, status: receipt.status } };
@@ -246,7 +257,7 @@ export class Primitives {
       if (!this.chain.wallet) throw new Error("no signer");
       const gasPrice = await this.chain.primary.getGasPrice();
       const hash = await this.chain.wallet.sendTransaction({ data: deployData, gas: gas * 12n / 10n, gasPrice });
-      const receipt = await this.chain.primary.waitForTransactionReceipt({ hash, confirmations: 1, timeout: 120_000 });
+      const receipt = await this.chain.waitReceipt({ hash, confirmations: 1, timeout: 120_000 });
       if (receipt.status !== "success" || !receipt.contractAddress) return { ok: false, primitive: "deploy_organ", stage: "execute", reason: "organ deployment reverted" };
       await this.db.saveOrgan("atomic-executor", receipt.contractAddress, hash);
       await this.ledgerDeployGas(hash, receipt.gasUsed, receipt.effectiveGasPrice, "deploy_organ");
@@ -329,7 +340,7 @@ export class Primitives {
     const args = encodeAbiParameters([{ type: "address" }, { type: "address" }, { type: "address" }, { type: "uint24[]" }], [token, weth, router, [100, 500, 2500, 3000, 10000]]);
     const initcode = (HONEYPOT_PROBE_BYTECODE + args.slice(2)) as `0x${string}`;
     try {
-      await (this.chain.fallback as unknown as { request: (a: unknown) => Promise<unknown> }).request({ method: "eth_call", params: [{ from: owner, data: initcode, value: "0x" + probe.toString(16) }, "latest", { [owner]: { balance: "0x" + (probe + 10n ** 18n).toString(16) } }] });
+      await (this.chain.tools as unknown as { request: (a: unknown) => Promise<unknown> }).request({ method: "eth_call", params: [{ from: owner, data: initcode, value: "0x" + probe.toString(16) }, "latest", { [owner]: { balance: "0x" + (probe + 10n ** 18n).toString(16) } }] });
       return { buyable: true, sellable: false, reason: "probe non ha revertato (inatteso)" };
     } catch (err) {
       const data = extractRevertData(err);
@@ -351,43 +362,44 @@ export class Primitives {
     }
   }
 
-  /** Safety gate before buying a token. PRIMARY oracle = a REAL round-trip sim (buy+sell via eth_call) —
-   * the only reliable way to catch transfer-blocking honeypots that fool quote-based checks. If the token
-   * has NO V3 route at all, fall back to the cross-venue aggregator quote (best-effort for V4/Aerodrome). */
+  /** Safety gate before buying a token. PRIMARY oracle = the cross-venue AGGREGATOR round-trip (buy
+   * NATIVE→token, then sell token→NATIVE at the bought size) — this is what execution ACTUALLY does, so it
+   * admits every venue (Uniswap V2/V3/V4, Aerodrome, Curve, …) instead of only WETH↔token V3 pools. A V3
+   * honeypot PROBE is kept as a cheap veto: if it can buy on V3 but the sell is transfer-BLOCKED, we reject
+   * even when the aggregator quote looks sellable (a quote can't see a transfer block). The empirical
+   * `sellBlocked` memory is the final backstop for time/transfer honeypots that fool the quote. */
   async checkToken(token: Address): Promise<{ token: string; safe: boolean; canSell: boolean; buyable: boolean; poolFeeBps?: number; reasons: string[] }> {
     const reasons: string[] = [];
-    const base = this.config.WBERA_ADDRESS as Address;
-    const probe = 10n ** 15n;
-    // 0) EMPIRICAL memory: a token whose REAL sell already reverted (STF/time-based honeypot the atomic
-    // probe can't see) is flagged sell-blocked forever. Refuse it — never get stuck in it twice.
+    const probe = 10n ** 15n; // ~0.001 ETH
+    // 0) EMPIRICAL memory: a token whose REAL sell already reverted is flagged sell-blocked forever.
     const ent = (await this.db.getEntity(this.config.CHAIN_ID, token).catch(() => []))[0];
     if (ent && (ent.meta as { sellBlocked?: boolean } | null)?.sellBlocked) {
       reasons.push("token già risultato INVENDIBILE in una vendita reale (sell-block/honeypot) — rifiutato definitivamente");
       return { token, safe: false, canSell: false, buyable: true, reasons };
     }
-    // 1) REAL round-trip (V3). The hard sellability guarantee.
-    const rt = await this.honeypotProbe(token).catch(() => null);
-    if (rt && rt.buyable) {
-      if (rt.sellable) {
-        if (rt.sellTaxPct != null && rt.sellTaxPct > 25) reasons.push(`⚠️ sell-tax ~${rt.sellTaxPct}%`);
-        reasons.push("round-trip reale OK: comprabile e vendibile (V3, verificato eseguendo il giro)");
-        return { token, safe: true, canSell: true, buyable: true, poolFeeBps: rt.feeBps, reasons };
-      }
-      reasons.push(`HONEYPOT: la VENDITA reale reverta (${rt.reason}) — NON comprare`);
-      return { token, safe: false, canSell: false, buyable: true, reasons };
-    }
-    // 2) No V3 route → aggregator quote (best-effort; V4/Aerodrome tokens can't be round-trip-sim'd here).
-    if (!this.aggregator) { reasons.push("nessuna rotta V3 e aggregatore non disponibile"); return { token, safe: false, canSell: false, buyable: false, reasons }; }
-    const buy = await this.aggQuoteRetry(base, token, probe);
+    if (!this.aggregator) { reasons.push("aggregatore non disponibile"); return { token, safe: false, canSell: false, buyable: false, reasons }; }
+    // 1) Aggregator round-trip = the real executable route. Buy NATIVE→token, then sell the bought amount back.
+    const buy = await this.aggQuoteRetry(NATIVE_ETH, token, probe);
     if (buy.status !== "ok" || !buy.quote || buy.quote.amountOut <= 0n) {
       reasons.push(buy.status === "error" ? "quote di acquisto transitorio — riprova (NON è honeypot)" : "nessuna rotta di acquisto su alcun venue");
-      return { token, safe: false, canSell: false, buyable: false, reasons };
+      return { token, safe: false, canSell: false, buyable: buy.status === "error", reasons };
     }
-    const sell = await this.aggQuoteRetry(token, base, buy.quote.amountOut);
+    const sell = await this.aggQuoteRetry(token, NATIVE_ETH, buy.quote.amountOut);
     const canSell = sell.status === "ok" && !!sell.quote && sell.quote.amountOut > 0n;
-    if (!canSell) reasons.push(sell.status === "error" ? "quote di vendita transitorio — riprova" : "ACQUISTO ma non VENDITA (aggregatore) — forte segnale HONEYPOT");
-    else reasons.push("solo-aggregatore (no pool V3): rotta buy+sell cross-venue OK, ma vendibilità NON garantita al 100% — size piccola");
-    return { token, safe: canSell, canSell, buyable: true, reasons };
+    // 2) Transfer-block VETO: if the V3 probe can buy but its sell is transfer-blocked, it's a real honeypot
+    //    the aggregator QUOTE can't see. (For non-V3 tokens the probe simply can't buy → no veto, no false reject.)
+    const rt = await this.honeypotProbe(token).catch(() => null);
+    if (rt && rt.buyable && !rt.sellable && isTransferBlockRevert(rt.reason)) {
+      reasons.push(`HONEYPOT: la vendita è bloccata dal trasferimento (${rt.reason}) — NON comprare`);
+      return { token, safe: false, canSell: false, buyable: true, reasons };
+    }
+    if (!canSell) {
+      reasons.push(sell.status === "error" ? "quote di vendita transitorio — riprova" : "ACQUISTO ma non VENDITA (aggregatore) — forte segnale HONEYPOT");
+      return { token, safe: false, canSell: false, buyable: true, reasons };
+    }
+    if (rt?.sellTaxPct != null && rt.sellTaxPct > 25) reasons.push(`⚠️ sell-tax ~${rt.sellTaxPct}%`);
+    reasons.push("rotta reale cross-venue OK (aggregatore): comprabile e vendibile");
+    return { token, safe: true, canSell: true, buyable: true, poolFeeBps: rt?.feeBps, reasons };
   }
 
   /** Aggregator quote with retry: only a persistent no-route is real; a transient 'error' is retried,
@@ -443,7 +455,7 @@ export class Primitives {
     const detail = { tokenIn, tokenOut, feeBps: bestFee, amountIn: amountIn.toString(), expectedOut: bestOut.toString(), minOut: minOut.toString(), note: "best fee tier auto-selected; allowance handled on execute" };
     if (!act) return { ok: true, mode: "simulated", primitive: "swap", detail };
     if (!this.config.EXECUTION_ENABLED) return { ok: false, primitive: "swap", stage: "disabled", reason: "execution is disabled; only simulation is available" };
-    const guard = await this.preSendGuard(); if (!guard.ok) return { ok: false, primitive: "swap", stage: "execute", reason: guard.reason };
+    const guard = await this.preSendGuard(this.isExitSwap(tokenOut)); if (!guard.ok) return { ok: false, primitive: "swap", stage: "execute", reason: guard.reason };
     try {
       await this.approveDirect(tokenIn, router, amountIn);
       const data = encodeFunctionData({ abi: swapAbi, functionName: "exactInputSingle", args: [{ tokenIn, tokenOut, fee: bestFee, recipient: owner, amountIn, amountOutMinimum: minOut, sqrtPriceLimitX96: 0n }] });
@@ -462,22 +474,33 @@ export class Primitives {
     }
   }
 
-  /** Best-route swap: Uniswap V3 first (direct, proven), and ONLY when V3 has no pool for the pair,
-   * fall back to the cross-venue aggregator (KyberSwap) — so a token that lives on V4/Aerodrome/etc.
-   * (which the gate now admits) is still executable. A non-routing failure (disabled/execute) is NOT
-   * retried on the aggregator (never risk a double broadcast). */
+  /** Best-route swap. OWN EXECUTION is primary (db-first convergence): our local single-hop venue-router
+   * route (Uniswap V3 / Aerodrome / Uniswap V2, from the DB-mirror quote) is tried first and broadcast by
+   * us. The external aggregator is the FALLBACK — reached only when our path fails BEFORE broadcasting (no
+   * local route, or a preflight revert we LOG as an anomaly to fix), covering multi-hop / venues we don't
+   * yet execute + native-ETH buys. A post-broadcast failure returns stage "execute" and we stop (never a
+   * double-broadcast). Kyber calldata is thus only the safety net now, not the default path. */
   async swapBest(tokenIn: Address, tokenOut: Address, amountIn: bigint, maxSlippagePct: number, act: boolean): Promise<ActionOutcome> {
-    const v3 = await this.swapV3(tokenIn, tokenOut, amountIn, maxSlippagePct, act);
-    if (v3.ok) return v3;
-    // Fall back to the aggregator when V3 has NO ROUTE (build) OR REVERTS (execute) — a revert (STF /
-    // SafeERC20 / insufficient) means fee-on-transfer or V4-only liquidity AND that no funds moved, so a
-    // retry is safe. A non-revert execute failure (RPC mid-broadcast, uncertain) is NEVER retried.
-    const v3reason = "reason" in v3 ? v3.reason : "";
-    const safeToRetry = v3.stage === "build" || (v3.stage === "execute" && /revert|STF|SafeERC20|insufficient|transfer|TF\b/i.test(v3reason));
-    if (!safeToRetry) return v3;
+    // OWN EXECUTION first (Phase 3, flag-gated): our best SINGLE-HOP local route via the venue router
+    // (Uniswap V3 / Aerodrome / Uniswap V2). We fall through to the external aggregator ONLY when it
+    // failed BEFORE broadcasting (stage build/disabled) — a post-broadcast failure returns stage
+    // "execute" and we stop, so there is never a double-broadcast.
+    if (this.config.LOCAL_EXECUTION_ENABLED) {
+      const local = await this.swapViaLocalExec(tokenIn, tokenOut, amountIn, maxSlippagePct, act);
+      if (local.ok) return local;
+      if (("stage" in local ? local.stage : "build") === "execute") return local;
+    }
     const agg = await this.swapViaAggregator(tokenIn, tokenOut, amountIn, maxSlippagePct, act);
     if (agg.ok) return agg;
-    return { ok: false, primitive: "swap", stage: "reason" in agg ? agg.stage : "build", reason: `V3 (${v3reason.slice(0, 40)}); aggregatore: ${"reason" in agg ? agg.reason : "fallito"}` };
+    const aggReason = "reason" in agg ? agg.reason : "";
+    const aggStage = "stage" in agg ? agg.stage : "build";
+    // Retry on V3 ONLY when the aggregator failed before broadcasting (build/quote) AND the pair is
+    // V3-eligible (no native sentinel — the V3 router handles WETH, not native ETH).
+    const safeToRetry = aggStage === "build" && !isNative(tokenIn) && !isNative(tokenOut);
+    if (!safeToRetry) return agg;
+    const v3 = await this.swapV3(tokenIn, tokenOut, amountIn, maxSlippagePct, act);
+    if (v3.ok) return v3;
+    return { ok: false, primitive: "swap", stage: "reason" in v3 ? v3.stage : "build", reason: `aggregatore: ${aggReason.slice(0, 50)}; V3: ${"reason" in v3 ? v3.reason : "fallito"}` };
   }
 
   /** Cross-venue swap via the aggregator: quote → build calldata → approve → send. Same execution
@@ -491,18 +514,23 @@ export class Primitives {
     const detail = { tokenIn, tokenOut, amountIn: amountIn.toString(), expectedOut: q.quote.amountOut.toString(), via: "aggregator" };
     if (!act) return { ok: true, mode: "simulated", primitive: "swap", detail };
     if (!this.config.EXECUTION_ENABLED) return { ok: false, primitive: "swap", stage: "disabled", reason: "execution is disabled; only simulation is available" };
-    const guard = await this.preSendGuard(); if (!guard.ok) return { ok: false, primitive: "swap", stage: "execute", reason: guard.reason };
+    const guard = await this.preSendGuard(this.isExitSwap(tokenOut)); if (!guard.ok) return { ok: false, primitive: "swap", stage: "execute", reason: guard.reason };
     const slippageBps = Math.round(Math.max(0.1, Math.min(50, maxSlippagePct)) * 100);
     const built = await this.aggregator.swapCalldata(tokenIn, tokenOut, amountIn, owner, slippageBps);
     if (!built) { this.logger.warn({ tokenIn, tokenOut }, "aggregator swapCalldata build returned null"); return { ok: false, primitive: "swap", stage: "build", reason: "aggregator calldata build failed" }; }
     try {
-      await this.approveDirect(tokenIn, built.router, amountIn);
-      const pf = await this.chain.preflight({ to: built.router, data: built.calldata, value: 0n, account: owner });
+      // NATIVE-ETH input (buys): the router is paid via msg.value — NO approval, NO transferFrom, NO wrap.
+      // This removes the entire buy-side failure class (missing approval / insufficient WETH). ERC20 input
+      // (sells): approve the router MAX once (subsequent sells of that token skip it).
+      const native = isNative(tokenIn);
+      const value = native ? (built.value > 0n ? built.value : amountIn) : 0n;
+      if (!native) await this.approveDirect(tokenIn, built.router, amountIn);
+      const pf = await this.chain.preflight({ to: built.router, data: built.calldata, value, account: owner });
       const portfolio = await this.positions.reconcile(await this.chain.portfolio(await this.db.dailyLossUsd(), true));
       const decisionId = randomUUID();
       await this.db.saveDecision(decisionId, { action: "ENTER", strategyId: `agg:${tokenIn}->${tokenOut}`, rationale: `aggregator swap ${amountIn} ${tokenIn} -> ${tokenOut}`, confidence: 1, riskUsd: 0, expectedNetProfitUsd: 0, capitalUsd: 0, expiresAt: new Date(Date.now() + 300_000).toISOString(), evidence: [], needsResearch: [] }, "agent_action", { primitive: "swap", intent: detail }, portfolio, { primitive: "swap", intent: detail }, null);
-      const txHash = await this.chain.send(built.router, built.calldata, 0n, pf.gas * 125n / 100n, pf.gasPriceWei);
-      await this.db.recordExecution({ decisionId, protocolId: `agg:${tokenIn.toLowerCase()}:${tokenOut.toLowerCase()}`, txHash, target: built.router, calldata: built.calldata, valueWei: 0n, gasLimit: pf.gas, beraUsdAtSubmission: portfolio.beraUsd, status: "submitted" });
+      const txHash = await this.chain.send(built.router, built.calldata, value, pf.gas * 125n / 100n, pf.gasPriceWei);
+      await this.db.recordExecution({ decisionId, protocolId: `agg:${tokenIn.toLowerCase()}:${tokenOut.toLowerCase()}`, txHash, target: built.router, calldata: built.calldata, valueWei: value, gasLimit: pf.gas, beraUsdAtSubmission: portfolio.beraUsd, status: "submitted" });
       await this.db.updateDecision(decisionId, "submitted", { hash: txHash });
       this.logger.warn({ tokenIn, tokenOut, router: built.router, txHash }, "Scarlet aggregator swap broadcast");
       void this.settleDirect(txHash, portfolio);
@@ -513,16 +541,80 @@ export class Primitives {
     }
   }
 
+  /** OWN EXECUTION: broadcast OUR local single-hop route via the venue router (no aggregator calldata).
+   * Native ETH is handled by the router's native path (buy = value, no approval; sell = receive ETH).
+   * A failure BEFORE broadcast returns stage "build" (swapBest falls back to the aggregator); a failure
+   * AT/AFTER broadcast returns stage "execute" (swapBest stops — no double-broadcast). Same execution
+   * accounting (decision + execution record + settle) as the other swap paths. */
+  async swapViaLocalExec(tokenIn: Address, tokenOut: Address, amountIn: bigint, maxSlippagePct: number, act: boolean): Promise<ActionOutcome> {
+    const owner = this.owner();
+    if (!owner) return { ok: false, primitive: "swap", stage: "build", reason: "no wallet configured" };
+    const router = this.aggregator as unknown as { execPlan?: (tokenIn: Address, tokenOut: Address, amountIn: bigint, recipient: Address, maxSlippagePct: number) => Promise<LocalExecPlan | null> };
+    if (typeof router?.execPlan !== "function") return { ok: false, primitive: "swap", stage: "build", reason: "local execution unavailable" };
+    const plan = await router.execPlan(tokenIn, tokenOut, amountIn, owner, maxSlippagePct);
+    if (!plan) return { ok: false, primitive: "swap", stage: "build", reason: "no local single-hop route" };
+    const detail = { tokenIn, tokenOut, amountIn: amountIn.toString(), expectedOut: plan.expectedOut.toString(), minOut: plan.minOut.toString(), venue: plan.venue, via: "local" };
+    if (!act) return { ok: true, mode: "simulated", primitive: "swap", detail };
+    if (!this.config.EXECUTION_ENABLED) return { ok: false, primitive: "swap", stage: "disabled", reason: "execution is disabled; only simulation is available" };
+    const guard = await this.preSendGuard(this.isExitSwap(tokenOut)); if (!guard.ok) return { ok: false, primitive: "swap", stage: "execute", reason: guard.reason };
+    // Approve (sells / ERC20 input) + preflight BEFORE broadcasting. Any revert here is PRE-broadcast →
+    // stage "build" so swapBest safely falls back to the aggregator (the preflight eth_call is exactly
+    // what catches a mis-encode or a too-tight minOut without spending anything).
+    let pf: { gas: bigint; gasPriceWei: bigint; blockNumber: bigint };
+    try {
+      if (!plan.nativeIn) await this.approveDirect(tokenIn, plan.router, amountIn);
+      pf = await this.chain.preflight({ to: plan.router, data: plan.calldata, value: plan.value, account: owner });
+    } catch (error) {
+      // Log WHY we fall back — a local-exec preflight revert is a bug in OUR path to fix, not silent noise.
+      const reason = error instanceof Error ? error.message : String(error);
+      this.logger.warn({ tokenIn, tokenOut, venue: plan.venue, router: plan.router, pool: plan.poolAddress, reason: reason.slice(0, 300) }, "local exec preflight reverted → aggregator fallback");
+      return { ok: false, primitive: "swap", stage: "build", reason: `local preflight: ${reason}` };
+    }
+    try {
+      const portfolio = await this.positions.reconcile(await this.chain.portfolio(await this.db.dailyLossUsd(), true));
+      const decisionId = randomUUID();
+      await this.db.saveDecision(decisionId, { action: "ENTER", strategyId: `local:${tokenIn}->${tokenOut}`, rationale: `local-router swap ${amountIn} ${tokenIn} -> ${tokenOut} (${plan.venue})`, confidence: 1, riskUsd: 0, expectedNetProfitUsd: 0, capitalUsd: 0, expiresAt: new Date(Date.now() + 300_000).toISOString(), evidence: [], needsResearch: [] }, "agent_action", { primitive: "swap", intent: detail }, portfolio, { primitive: "swap", intent: detail }, null);
+      const txHash = await this.chain.send(plan.router, plan.calldata, plan.value, pf.gas * 125n / 100n, pf.gasPriceWei);
+      await this.db.recordExecution({ decisionId, protocolId: `local:${tokenIn.toLowerCase()}:${tokenOut.toLowerCase()}`, txHash, target: plan.router, calldata: plan.calldata, valueWei: plan.value, gasLimit: pf.gas, beraUsdAtSubmission: portfolio.beraUsd, status: "submitted" });
+      await this.db.updateDecision(decisionId, "submitted", { hash: txHash });
+      this.logger.warn({ tokenIn, tokenOut, venue: plan.venue, router: plan.router, txHash }, "Scarlet local-router swap broadcast");
+      void this.settleDirect(txHash, portfolio);
+      return { ok: true, mode: "executed", primitive: "swap", txHash, detail };
+    } catch (error) {
+      // Past preflight: a broadcast may or may not have landed → treat as execute (no fallback).
+      return { ok: false, primitive: "swap", stage: "execute", reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   /** Direct exact approval to a spender (no allowlist), waiting for it to mine. Used by
    * swapV3 so it works for ANY token (a fresh snipe target has no allowlisted spender). */
   private async approveDirect(token: Address, spender: Address, amount: bigint): Promise<void> {
     const owner = this.owner(); if (!owner) throw new Error("no wallet configured");
-    const current = await this.chain.primary.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [owner, spender] });
-    if (current >= amount) return;
-    const data = encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, amount] });
+    // Read the allowance on the EXECUTION lane — the SAME node the approve+swap broadcast through — so
+    // there's no cross-node lag with the tx. (fallback as a resilience net; if all fail, assume 0 and
+    // approve anyway — a redundant approve is cheap, a skipped one is fatal.)
+    let current: bigint | undefined;
+    for (const client of [this.chain.exec, this.chain.fallback]) {
+      try { current = await client.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [owner, spender] }); break; }
+      catch { /* down → next lane */ }
+    }
+    if (current != null && current >= amount) return;
+    // Approve MAX so the (token, spender) pair is approved ONCE; every later trade skips this step,
+    // removing the per-trade approve→swap race that compounded the rate-limit failures.
+    const data = encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, maxUint256] });
     const pf = await this.chain.preflight({ to: token, data, value: 0n, account: owner });
     const hash = await this.chain.send(token, data, 0n, pf.gas * 125n / 100n, pf.gasPriceWei);
-    await this.chain.primary.waitForTransactionReceipt({ hash: hash as `0x${string}`, confirmations: 1, timeout: 120_000 });
+    // Confirm on the primary lane, falling back to another read lane if it's rate-limited.
+    try { await this.chain.waitReceipt({ hash: hash as `0x${string}`, confirmations: 1, timeout: 120_000 }); }
+    catch { await this.chain.fallback.waitForTransactionReceipt({ hash: hash as `0x${string}`, confirmations: 1, timeout: 120_000 }); }
+    // Belt-and-suspenders confirm on the EXECUTION lane. (The old cross-lane approval-visibility race is
+    // GONE now that approve-send, this read, and the swap preflight all ride the SAME execution node —
+    // after the receipt above, the allowance is already visible to the swap's preflight.)
+    for (let i = 0; i < 8; i++) {
+      const seen = await this.chain.exec.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [owner, spender] }).catch(() => 0n);
+      if (seen >= amount) return;
+      await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+    }
   }
 
   // --- shared build/simulate/execute engine -----------------------------------
@@ -574,7 +666,7 @@ export class Primitives {
    * Mirrors the GuardedExecutor's settle so the dashboard P&L is complete. */
   private async settleDirect(txHash: string, before: PortfolioSnapshot): Promise<void> {
     try {
-      const receipt = await this.chain.primary.waitForTransactionReceipt({ hash: txHash as `0x${string}`, confirmations: 1, timeout: 120_000 });
+      const receipt = await this.chain.waitReceipt({ hash: txHash as `0x${string}`, confirmations: 1, timeout: 120_000 });
       await this.db.settleExecution(txHash, { status: receipt.status, gasUsed: receipt.gasUsed, effectiveGasPriceWei: receipt.effectiveGasPrice, receipt, beraUsdAtSubmission: before.beraUsd, outcome: { txHash, receiptStatus: receipt.status, gasUsed: receipt.gasUsed.toString(), settledAt: new Date().toISOString() } });
       const after = await this.positions.reconcile(await this.chain.portfolio(await this.db.dailyLossUsd(), true));
       const gasUsd = Number(receipt.gasUsed * receipt.effectiveGasPrice) / 1e18 * before.beraUsd;
@@ -598,12 +690,24 @@ export class Primitives {
     }
   }
 
-  private async preSendGuard(): Promise<{ ok: true } | { ok: false; reason: string }> {
+  /** A swap whose OUTPUT is the numéraire (native ETH or WETH) is an EXIT — it turns a token back into
+   * cash, i.e. reduces risk. Buys (output = a token) are risk-on. */
+  private isExitSwap(tokenOut: Address): boolean {
+    return isNative(tokenOut) || tokenOut.toLowerCase() === (this.config.WBERA_ADDRESS as string).toLowerCase();
+  }
+
+  /** Pre-broadcast risk gate. `isExit` = this send REDUCES risk (selling a position back to native/cash):
+   * a loss-limit must stop opening NEW risk but must NEVER trap an open position — an exit always has to be
+   * allowed (a token you can't exit is unsellable-by-policy, and a losing bag only gets worse). The gas
+   * floor still applies to everything (you need gas to send even the sell). */
+  private async preSendGuard(isExit = false): Promise<{ ok: true } | { ok: false; reason: string }> {
     const portfolio = await this.chain.portfolio(await this.db.dailyLossUsd(), true).catch(() => undefined);
     if (!portfolio) return { ok: true }; // never block on a transient read failure
     if (portfolio.bera < this.config.MIN_BERA_RESERVE) return { ok: false, reason: `native gas reserve below floor (${this.config.MIN_BERA_RESERVE}) — keep gas to keep acting` };
-    const effLimit = Math.min(this.config.DAILY_LOSS_LIMIT_USD, portfolio.estimatedNavUsd * 0.25);
-    if (portfolio.dailyLossUsd >= effLimit) return { ok: false, reason: `daily loss budget $${effLimit.toFixed(2)} reached — pause until tomorrow or reassess` };
+    // NO daily/total loss cap here (it froze the agent for a whole day). Exposure — and therefore max loss —
+    // is governed by the PER-CATEGORY budgets (launch/bluechip buckets of NAV) enforced at open_position, plus
+    // the gas floor above. She organizes her capital within those buckets.
+    void isExit; // exits were already exempt from the (removed) cap; the gas floor applies to every send.
     return { ok: true };
   }
 

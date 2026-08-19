@@ -83,7 +83,13 @@ export class MonadSignals {
     let sellable = false;
     try {
       let dec = this.decimalsCache.get(collateral.toLowerCase());
-      if (dec === undefined) { dec = Number(await this.chain.primary.readContract({ address: collateral, abi: DECIMALS_ABI, functionName: "decimals" }).catch(() => 18)); this.decimalsCache.set(collateral.toLowerCase(), dec); }
+      if (dec === undefined) {
+        // DB-FIRST: decimals from the registry; only a genuinely-unknown token reads on the enrichment lane.
+        const m = await this.db.tokenMeta(this.config.CHAIN_ID, [collateral.toLowerCase()]).catch(() => new Map<string, { symbol: string | null; decimals: number | null }>());
+        const md = m.get(collateral.toLowerCase())?.decimals ?? null;
+        dec = md ?? Number(await this.chain.enrichment.readContract({ address: collateral, abi: DECIMALS_ABI, functionName: "decimals" }).catch(() => 18));
+        this.decimalsCache.set(collateral.toLowerCase(), dec);
+      }
       const amountIn = 10n ** BigInt(dec); // 1 whole token — enough to confirm a route
       const q = await this.aggregator.quote(collateral, loan, amountIn);
       sellable = q !== null && q.amountOut > 0n; // routable across ALL venues

@@ -80,13 +80,27 @@ function normalizeAddr(v: unknown): string | null {
   try { return getAddress(String(v ?? "").trim()).toLowerCase(); } catch { return null; }
 }
 
+// Security verdicts are CACHED on the entity, but they go stale two ways: (1) the gate LOGIC changes (a new
+// version must re-verify everything — a bumped SECURITY_VERSION invalidates old caches), and (2) real
+// sellability/liquidity DRIFTS over time (re-verify after SECURITY_TTL_MS). Both are handled at read time.
+const SECURITY_VERSION = 2;               // bump whenever checkToken's logic changes → old caches recompile
+const SECURITY_TTL_MS = 6 * 3_600_000;    // 6h — re-verify a token's security at most this often
+
 /** Run the on-chain honeypot/sellability check and persist it onto the entity (system-authoritative). */
 async function compileSecurity(deps: ToolDeps, addr: string): Promise<Record<string, unknown> | { error: string }> {
   const check = await deps.primitives.checkToken(addr as Address).catch((e) => ({ error: e instanceof Error ? e.message : String(e) }) as { error: string });
   if ("error" in check) return check;
-  const security = { safe: check.safe, canSell: check.canSell, buyable: check.buyable, poolFeeBps: check.poolFeeBps ?? null, reasons: check.reasons, checkedAt: nowIso() };
+  const security = { safe: check.safe, canSell: check.canSell, buyable: check.buyable, poolFeeBps: check.poolFeeBps ?? null, reasons: check.reasons, checkedAt: nowIso(), v: SECURITY_VERSION };
   await deps.db.setTokenSecurity(deps.config.CHAIN_ID, addr, security).catch(() => undefined);
   return security;
+}
+
+/** A cached security verdict is stale if it's from an older gate version OR older than the TTL. */
+function securityStale(security: { checkedAt?: string; v?: number } | undefined): boolean {
+  if (!security) return true;
+  if ((security.v ?? 0) !== SECURITY_VERSION) return true;
+  const at = security.checkedAt ? Date.parse(security.checkedAt) : 0;
+  return !(at > 0) || Date.now() - at > SECURITY_TTL_MS;
 }
 
 /** Assemble the full dossier for a token (all layers), compiling security lazily if never checked. */
@@ -124,10 +138,10 @@ async function buildDossier(deps: ToolDeps, addr: string): Promise<unknown> {
   const meta = (token?.meta ?? {}) as Record<string, unknown>;
   const p = (prices as Map<string, { priceUsd: number | null; source: string; updatedAt: string }>).get(addr);
 
-  // Security: system fact. Compile lazily on first sight; read the stored value otherwise.
-  let security = meta.security as Record<string, unknown> | undefined;
+  // Security: system fact. (Re)compile when absent, from an older gate version, or past the TTL; else serve cache.
+  let security = meta.security as (Record<string, unknown> & { checkedAt?: string; v?: number }) | undefined;
   let securityJustCompiled = false;
-  if (!security) { const s = await compileSecurity(deps, addr); if (!("error" in s)) { security = s; securityJustCompiled = true; } }
+  if (securityStale(security)) { const s = await compileSecurity(deps, addr); if (!("error" in s)) { security = s; securityJustCompiled = true; } }
 
   const anns = annotations as Array<{ at: string; verdict: string; note: string | null; tags: string[] }>;
   const acts = activity as Array<{ direction: string; valueRaw: string; at: string; txHash: string }>;

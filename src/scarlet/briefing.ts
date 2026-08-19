@@ -20,6 +20,7 @@ export type TradingBriefing = {
   gains: unknown;
   self: unknown;
   temperament: SelfState["temperament"];
+  budget: unknown;
   positions: unknown;
   plans: unknown;
   watchlist: unknown;
@@ -82,11 +83,11 @@ export async function buildTradingBriefing(db: Database, positionsSvc: PositionS
     justLaunched: justLaunched.length ? justLaunched.map((p) => ({ symbol: p.newSymbol, token: p.newToken, dex: p.dex, liquidityUsd: p.liquidityUsd, at: p.discoveredAt, note: "appena creato — potrebbe non aver ancora tradato (nessuna stat)" })) : "nessun lancio recentissimo"
   };
 
-  // Memory: recent decisions + saved-notes index.
-  const recentDecisions = (await db.recentDecisions(5).catch(() => [])).map((d) => ({ action: (d as { decision?: { action?: string } }).decision?.action, strategy: (d as { decision?: { strategyId?: string } }).decision?.strategyId, status: (d as { status?: string }).status }));
+  // Memory: saved-notes index. (The legacy `decisions` table is NOT read here — the state-machine agent
+  // never writes it, so it would only leak stale cross-system noise; her real recent actions come from
+  // her own journal via the chronicle.)
   const notebook = await db.memoryIndex(80).catch(() => []);
   const memory = {
-    recentDecisions,
     notebook: notebook.length
       ? { note: "Le tue note salvate — apri con recall(key); salva/aggiorna con remember(key, content, category).", index: notebook.map((m) => ({ key: m.key, category: m.category })) }
       : "Notebook vuoto. Usa remember(key, content) per salvare token, indirizzi, idee e tesi."
@@ -107,6 +108,20 @@ export async function buildTradingBriefing(db: Database, positionsSvc: PositionS
   const milestones = config.PROFIT_MILESTONES.split(",").map((m) => Number(m.trim())).filter((n) => n > 0);
   const gains = computeGains(currentNav, baseline.navUsd, ledger.netUsd, milestones);
 
+  // BUDGET per categoria — il capitale è organizzato in bucket del NAV. Ogni strategia schiera fino al suo
+  // budget; il resto è riserva stable/nativa. Scarlet lo vede e ci lavora dentro (rotazione quando è pieno).
+  const usedByStrat = await db.usedBudgetByStrategy(config.CHAIN_ID).catch(() => ({} as Record<string, number>));
+  const navUsd = self.netWorthHoney;
+  const launchBudget = navUsd * (config.LAUNCH_BUDGET_PCT / 100), bluechipBudget = navUsd * (config.BLUECHIP_BUDGET_PCT / 100);
+  const usedLaunch = usedByStrat["launchtoken"] ?? 0, usedBluechip = usedByStrat["bluechip"] ?? 0;
+  const budget = {
+    note: "Il tuo capitale è in CATEGORIE (bucket del NAV). Ogni strategia schiera fino al SUO budget; il resto è RISERVA stable/nativa (mantenimento; in futuro LP per fee). Lavora DENTRO il bucket: quando è pieno, ruota (chiudi una posizione debole) prima di aprirne un'altra.",
+    navUsd: r2(navUsd),
+    lanci: { budgetUsd: r2(launchBudget), usatoUsd: r2(usedLaunch), liberoUsd: r2(Math.max(0, launchBudget - usedLaunch)), pctNav: config.LAUNCH_BUDGET_PCT },
+    bluechip: { budgetUsd: r2(bluechipBudget), usatoUsd: r2(usedBluechip), liberoUsd: r2(Math.max(0, bluechipBudget - usedBluechip)), pctNav: config.BLUECHIP_BUDGET_PCT },
+    riservaStable: { pctNav: Math.max(0, 100 - config.LAUNCH_BUDGET_PCT - config.BLUECHIP_BUDGET_PCT), note: "non schierata a rischio token — mantenimento (futuro: LP per fee)" }
+  };
+
   const guidance = self.temperament === "exploit"
     ? "Sei affamata (net worth basso). Prendi le azioni più sicure a net positivo per ricostruirlo; spendi poca energia sulla frontiera."
     : self.temperament === "explore"
@@ -123,5 +138,5 @@ export async function buildTradingBriefing(db: Database, positionsSvc: PositionS
     fresh: justLaunched.map((p) => p.newToken).sort()
   });
 
-  return { fingerprint, chainHead, gains, self: selfContext(self), temperament: self.temperament, positions, plans, watchlist, discovery, memory, registry, guidance };
+  return { fingerprint, chainHead, gains, self: selfContext(self), temperament: self.temperament, budget, positions, plans, watchlist, discovery, memory, registry, guidance };
 }

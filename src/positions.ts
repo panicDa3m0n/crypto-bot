@@ -133,13 +133,27 @@ export class PositionService {
   // --- valuation readers ------------------------------------------------------
 
   private async readToken(token: Address, owner: Address): Promise<{ balanceRaw: bigint; balance: number; decimals: number; priceUsd: number; valueUsd: number }> {
-    const [balanceRaw, decimals] = await Promise.all([
-      this.chain.primary.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] }),
-      this.chain.primary.readContract({ address: token, abi: erc20Abi, functionName: "decimals" })
+    // DB-FIRST (db-first convergence): our OWN balance + decimals come from the system — the indexed
+    // wallet balances (network ground-truth, kept by WalletHoldings) + the token registry. RPC only when
+    // the DB doesn't have them yet. (The tx-critical exact balance right before a SELL stays RPC elsewhere.)
+    const [meta, bals] = await Promise.all([
+      this.db.tokenMeta(this.config.CHAIN_ID, [token.toLowerCase()]).catch(() => new Map()),
+      this.db.walletTokenBalances(this.config.CHAIN_ID, owner.toLowerCase()).catch(() => [])
     ]);
+    const dbDec = meta.get(token.toLowerCase())?.decimals ?? null;
+    const dbBalRaw = bals.find((b) => b.token.toLowerCase() === token.toLowerCase())?.balanceRaw;
+    let balanceRaw: bigint, decimals: number;
+    if (dbDec != null && dbBalRaw != null) { balanceRaw = BigInt(dbBalRaw); decimals = dbDec; }
+    else {
+      const [b, d] = await Promise.all([
+        this.chain.primary.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] }) as Promise<bigint>,
+        this.chain.primary.readContract({ address: token, abi: erc20Abi, functionName: "decimals" }) as Promise<number | bigint>
+      ]);
+      balanceRaw = b; decimals = Number(d);
+    }
     const priceUsd = await this.chain.tokenPrice(token).catch(() => 0);
-    const balance = Number(balanceRaw) / 10 ** Number(decimals);
-    return { balanceRaw, balance, decimals: Number(decimals), priceUsd, valueUsd: balance * priceUsd };
+    const balance = Number(balanceRaw) / 10 ** decimals;
+    return { balanceRaw, balance, decimals, priceUsd, valueUsd: balance * priceUsd };
   }
 
   private async readErc4626(vault: Address, expectedAsset: Address, owner: Address): Promise<{ sharesRaw: bigint; assetsRaw: bigint; assetDecimals: number; assetPriceUsd: number; valueUsd: number }> {

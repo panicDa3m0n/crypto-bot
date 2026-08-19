@@ -7,23 +7,30 @@ import type { Database } from "./db.js";
 /**
  * WalletHoldings — the wallet, computed the RIGHT way and kept entirely in the DB.
  *
- * Movements are the source: an INCREMENTAL `getLogs` Transfer scan on the dedicated WALLET_LOGS_RPC
- * (backfill once, then only the NEW tail via a cursor — never re-request saved history) records every
- * ERC-20 transfer touching the wallet into `wallet_transactions`. A transfer only changes the tokens
- * it touched, so we refresh the ground-truth balance (RPC `balanceOf` multicall) for JUST those tokens
- * and store it in `wallet_token_balances`. The dashboard/holdings are then a pure DB triangulation:
- * wallet balances × the token registry (symbol/decimals/tagging) × token_prices (value, or $0). No
+ * TRANSFERS (the movement history / which tokens we hold) come primarily from the MAIN INDEXER: its
+ * full-ingestion stream sees every Transfer, cheap-filters the wallet's, writes `wallet_transactions`,
+ * and fires `onWalletTransfer(tokens)` here — EVENT-DRIVEN, so a buy/sell reflects within one block.
+ * This periodic scan (incremental `getLogs` on WALLET_LOGS_RPC, cursored) stays as the COLD-START
+ * discovery (initial backfill of pre-existing holdings, which the indexer's filtered sync doesn't carry)
+ * and a safety net; the two writers are idempotent (dedup by tx:logIndex), so the overlap is harmless.
+ *
+ * BALANCES are always NETWORK GROUND TRUTH: a `balanceOf` multicall (reliable-lane cascade) for the
+ * touched tokens → `wallet_token_balances`. We do NOT derive balances by summing transfers — the network
+ * read catches rebasing/airdrops/direct-sends too. The dashboard/holdings are then a pure DB triangulation:
+ * balances(network) × the token registry (symbol/decimals/tagging) × token_prices (value, or $0). No
  * Blockscout, no per-render calls, surgical precision.
  */
 const TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const ERC20_BAL = parseAbi(["function balanceOf(address) view returns (uint256)"]);
 const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const SAFETY_RESCAN_TICKS = 120; // ~1h at 30s/tick: a rare re-scan safety net behind the indexer's live feed
 type Holding = { token: string; symbol: string; decimals: number; balance: number; priceUsd: number | null; valueUsd: number };
 
 export class WalletHoldings {
   private timer?: NodeJS.Timeout;
   private running = false;
   private ticks = 0;
+  private backfilled = false; // the one-time cold-start Transfer backfill has completed (then indexer feeds)
   private readonly known: Set<string>;
 
   constructor(private readonly config: Config, private readonly chain: BerachainClients, private readonly db: Database, private readonly logger: Logger) {
@@ -50,16 +57,24 @@ export class WalletHoldings {
     try {
       const owner = this.config.WALLET_ADDRESS?.toLowerCase();
       if (!owner) return;
-      // 1. Detect NEW movements (cursored getLogs) → persist to the transaction ledger.
-      const { transfers, cursor, ok } = await this.scanNewTransfers(owner);
-      if (ok) {
-        if (transfers.length) await this.db.insertWalletTransfers(this.config.CHAIN_ID, owner, transfers).catch(() => 0);
-        // 2. Only the tokens a new transfer TOUCHED need a fresh balance (ground truth). Every ~20
-        //    ticks, refresh ALL known balances too (catches rebasing tokens that move with no transfer).
-        const touched = new Set(transfers.map((t) => t.token));
-        if (this.ticks % 20 === 0) for (const b of await this.db.walletTokenBalances(this.config.CHAIN_ID, owner).catch(() => [])) touched.add(b.token);
-        await this.refreshBalances(owner, [...touched]);
-        await this.db.saveMarketSnapshot("wallet", "scan", { cursor, observedAt: new Date().toISOString() }).catch(() => undefined);
+      // 1. COLD-START discovery + safety net. Steady-state transfer capture is now the INDEXER's job (its
+      //    full-ingestion stream fires onWalletTransfer in real-time). This own getLogs scan runs ONLY as
+      //    the initial backfill — to discover pre-existing holdings the indexer, starting at head, doesn't
+      //    replay — and an occasional safety re-scan (catch a block the indexer served via filtered fallback).
+      if (!this.backfilled || this.ticks % SAFETY_RESCAN_TICKS === 0) {
+        const { transfers, cursor, ok } = await this.scanNewTransfers(owner);
+        if (ok) {
+          if (transfers.length) await this.db.insertWalletTransfers(this.config.CHAIN_ID, owner, transfers).catch(() => 0);
+          await this.refreshBalances(owner, [...new Set(transfers.map((t) => t.token))]);
+          await this.db.saveMarketSnapshot("wallet", "scan", { cursor, observedAt: new Date().toISOString() }).catch(() => undefined);
+          this.backfilled = true;
+        }
+      }
+      // 2. Periodic FULL balance refresh (ground truth for ALL held tokens) — catches rebasing tokens that
+      //    move with no Transfer. Independent of the scan; ~every 20 ticks.
+      if (this.ticks % 20 === 0) {
+        const all = (await this.db.walletTokenBalances(this.config.CHAIN_ID, owner).catch(() => [])).map((b) => b.token);
+        if (all.length) await this.refreshBalances(owner, all);
       }
       // 3. Assemble the display holdings from the DB (triangulation) + persist the portfolio/NAV.
       await this.assembleHoldings(owner);
@@ -103,17 +118,42 @@ export class WalletHoldings {
     return { transfers: [...seen.values()], cursor: head.toString(), ok: true };
   }
 
-  /** Fresh balanceOf for the given tokens via ONE multicall (precision lane, self-healing) → persist. */
+  /** GROUND-TRUTH balances from the NETWORK: one balanceOf multicall for the given tokens. READ-lane cascade
+   * (precision=nodies → primary=base.org → fallback) — NEVER the dedicated indexer (drpc) or execution
+   * (publicnode) lanes, so the wallet read can't starve the indexer's block ingestion (which it did: the
+   * indexer's drpc free-tier tipped over). One multicall = one eth_call, so a read lane handles it fine. */
+  private async multicallBalances(owner: string, tokens: string[]): Promise<Array<{ status: string; result?: unknown }>> {
+    const contracts = tokens.map((t) => ({ address: t as Address, abi: ERC20_BAL, functionName: "balanceOf" as const, args: [owner as Address] }));
+    for (const client of [this.chain.precision, this.chain.primary, this.chain.fallback]) {
+      try { return await client.multicall({ contracts, allowFailure: true, multicallAddress: MULTICALL3 }) as Array<{ status: string; result?: unknown }>; }
+      catch { /* lane down/limited → next */ }
+    }
+    return [];
+  }
+
+  /** Fresh balanceOf for the given tokens (network ground truth) → persist. */
   private async refreshBalances(owner: string, tokens: string[]): Promise<void> {
     if (!tokens.length) return;
-    const contracts = tokens.map((t) => ({ address: t as Address, abi: ERC20_BAL, functionName: "balanceOf" as const, args: [owner as Address] }));
-    const results = await this.chain.precisionRead((c) => c.multicall({ contracts, allowFailure: true, multicallAddress: MULTICALL3 }), "wallet-balances").catch(() => [] as Array<{ status: string; result?: unknown }>);
+    const results = await this.multicallBalances(owner, tokens);
     for (let i = 0; i < tokens.length; i++) {
       const r = results[i];
       if (!r || r.status !== "success" || typeof r.result !== "bigint") continue; // read failed → keep prior balance
       await this.db.upsertWalletTokenBalance(this.config.CHAIN_ID, owner, tokens[i], r.result).catch(() => undefined);
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: tokens[i], kind: "token", source: "wallet" }).catch(() => undefined); // register; scanner/enricher own metadata
     }
+  }
+
+  /** EVENT-DRIVEN (Canale wallet, fired by the indexer when a Transfer touched the wallet this block):
+   * re-read JUST those tokens' balances FROM CHAIN (ground truth) + re-assemble the holdings immediately,
+   * so the wallet reflects a buy/sell within one block instead of waiting for the periodic tick. The
+   * indexer already persisted the movement to wallet_transactions (history); here we align the balances. */
+  async onWalletTransfer(tokens: string[]): Promise<void> {
+    const owner = this.config.WALLET_ADDRESS?.toLowerCase();
+    if (!owner || !tokens.length) return;
+    try {
+      await this.refreshBalances(owner, tokens);
+      await this.assembleHoldings(owner);
+    } catch (e) { this.logger.debug({ err: e instanceof Error ? e.message : String(e) }, "wallet onWalletTransfer failed"); }
   }
 
   /** DB TRIANGULATION → the holdings snapshot the dashboard reads: wallet balances × registry
@@ -145,11 +185,16 @@ export class WalletHoldings {
 
   /** Snapshot the portfolio/NAV into the DB so the dashboard reads the last good value (never a live
    * call in its request path). Native/core USD prices come from the Lane-A cache, not a live oracle. */
-  private async persistPortfolio(_owner: string): Promise<void> {
+  private async persistPortfolio(owner: string): Promise<void> {
     const dailyLoss = await this.db.dailyLossUsd().catch(() => 0);
     const net = await this.db.latestNetworkObservation().catch(() => undefined);
     const dataHealthy = net ? (net.primaryHealthy && net.secondaryHealthy) : true;
-    const portfolio = await this.chain.portfolio(dailyLoss, dataHealthy).catch((e) => { this.logger.debug({ err: e instanceof Error ? e.message : String(e) }, "portfolio snapshot skipped (transient)"); return undefined; });
+    // DB-first NAV: hand the indexed core-asset balances to portfolio() so it derives from the DB, not RPC
+    // (native + any token the DB lacks still read on-chain). These balances are network ground-truth,
+    // refreshed by this same service's event-driven + periodic multicall — so they're fresh, not stale.
+    const known = new Map<string, bigint>();
+    for (const b of await this.db.walletTokenBalances(this.config.CHAIN_ID, owner).catch(() => [])) { try { known.set(b.token.toLowerCase(), BigInt(b.balanceRaw)); } catch { /* skip */ } }
+    const portfolio = await this.chain.portfolio(dailyLoss, dataHealthy, known).catch((e) => { this.logger.debug({ err: e instanceof Error ? e.message : String(e) }, "portfolio snapshot skipped (transient)"); return undefined; });
     if (!portfolio) return;
     const px = await this.db.getTokenPrices(this.config.CHAIN_ID, [this.config.WBERA_ADDRESS, this.config.HONEY_ADDRESS, this.config.USDC_E_ADDRESS]).catch(() => new Map());
     const beraUsd = px.get(this.config.WBERA_ADDRESS.toLowerCase())?.priceUsd ?? portfolio.beraUsd;

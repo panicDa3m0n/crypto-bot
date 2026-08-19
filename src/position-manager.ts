@@ -4,6 +4,7 @@ import type { Config } from "./config.js";
 import type { BerachainClients } from "./chain.js";
 import type { Database, PositionPlan } from "./db.js";
 import type { Primitives } from "./primitives.js";
+import { NATIVE_ETH } from "./aggregator.js";
 
 /**
  * Programmatic position engine. Scarlet PLANS a position (entry now or on a limit price, plus
@@ -22,6 +23,7 @@ export class PositionManager {
   private timer?: NodeJS.Timeout;
   private running = false;
   private readonly dec = new Map<string, number>();
+  private readonly sellFail = new Map<number, number>(); // planId → consecutive transfer-block strikes (honeypot detection)
 
   constructor(
     private readonly config: Config,
@@ -29,7 +31,8 @@ export class PositionManager {
     private readonly db: Database,
     private readonly primitives: Primitives,
     private readonly logger: Logger,
-    private readonly wake: (key: string, reason: string) => void
+    private readonly wake: (key: string, reason: string) => void,
+    private readonly isSynced?: () => boolean // pause entries/exits while the indexer realigns (stale data)
   ) {}
 
   start(intervalMs = 20_000): void {
@@ -46,6 +49,7 @@ export class PositionManager {
 
   private async tick(): Promise<void> {
     if (this.running) return;
+    if (this.isSynced && !this.isSynced()) return; // indexer realigning → prices stale → don't fire entries/exits
     this.running = true;
     try {
       const plans = await this.db.activePositionPlans(this.config.CHAIN_ID).catch(() => []);
@@ -68,17 +72,16 @@ export class PositionManager {
     const baseDec = await this.decimals(base);
     const baseAmount = BigInt(Math.floor((p.entryAmountUsd / baseUsd) * 10 ** baseDec));
     if (baseAmount <= 0n) return;
-    // Simulate the buy to read the executable token price now.
-    const sim = await this.primitives.swapBest(base, token, baseAmount, 8, false).catch(() => undefined);
+    // BUY with NATIVE ETH (`base` = WETH is used only to price/size). Native input needs no wrap, no ERC20
+    // approval and no transferFrom — removing the whole "insufficient WETH / missing approval" failure class.
+    const sim = await this.primitives.swapBest(NATIVE_ETH, token, baseAmount, 8, false).catch(() => undefined);
     if (!sim || !sim.ok || sim.mode !== "simulated") { return this.failEntry(p, sim && "reason" in sim ? String(sim.reason) : "non instradabile ora"); }
     const tokenDec = await this.decimals(token);
     const tokenOut = Number(BigInt(String((sim.detail as { expectedOut?: string }).expectedOut ?? "0"))) / 10 ** tokenDec;
     if (!(tokenOut > 0)) return this.failEntry(p, "quote di acquisto nulla");
     const priceNow = p.entryAmountUsd / tokenOut; // USD per token
     if (p.entryKind === "limit" && p.entryPrice != null && priceNow > p.entryPrice) return; // wait for the dip — NOT a failure
-    // Ensure we hold enough base (wrap native → WETH if the base is the wrapped-native).
-    await this.ensureBase(base, baseAmount).catch(() => undefined);
-    const exec = await this.primitives.swapBest(base, token, baseAmount, 8, true).catch((e) => ({ ok: false as const, primitive: "swap", stage: "execute" as const, reason: e instanceof Error ? e.message : String(e) }));
+    const exec = await this.primitives.swapBest(NATIVE_ETH, token, baseAmount, 8, true).catch((e) => ({ ok: false as const, primitive: "swap", stage: "execute" as const, reason: e instanceof Error ? e.message : String(e) }));
     if (exec.ok && exec.mode === "executed") {
       await this.db.updatePositionPlan(p.id, { status: "open", entryAttempts: 0, filledAmountToken: tokenOut, filledPrice: priceNow, filledAt: new Date().toISOString(), lastResult: `filled ${tokenOut.toFixed(4)} ${p.symbol ?? ""} @ $${priceNow.toPrecision(4)}` });
       await this.db.addJournal("action", `POSITION #${p.id} ENTRY riempita: ${tokenOut.toFixed(4)} ${p.symbol ?? p.token.slice(0, 8)} @ $${priceNow.toPrecision(4)} (${p.entryAmountUsd}$)`, { plan: p.id, tx: (exec as { txHash?: string }).txHash }, "position").catch(() => undefined);
@@ -113,16 +116,21 @@ export class PositionManager {
       return this.sell(p, Math.min(100, p.exitNowPct), `CLOSE (manuale) ${Math.min(100, p.exitNowPct)}%`, tokenDec, true);
     }
     const baseUsd = await this.chain.tokenPrice(base).catch(() => 0);
-    if (!(baseUsd > 0)) return;
+    if (!(baseUsd > 0)) { this.logger.warn({ id: p.id, base }, "manageOpen SKIP: base (WETH) price unavailable"); return; }
     const heldTokens = p.filledAmountToken * (p.remainingPct / 100);
     if (heldTokens <= 0) { await this.db.updatePositionPlan(p.id, { status: "closed" }); return; }
     const heldWei = BigInt(Math.floor(heldTokens * 10 ** tokenDec));
-    // Simulate selling the held amount to read the REAL current exit price.
-    const sim = await this.primitives.swapBest(token, base, heldWei, 8, false).catch(() => undefined);
+    // Simulate selling the held amount to read the REAL current exit price. Proceeds settle in NATIVE ETH
+    // (18 dec, same as WETH) via the cross-venue aggregator — `base` (WETH) is only the pricing numéraire.
+    const sim = await this.primitives.swapBest(token, NATIVE_ETH, heldWei, 8, false).catch(() => undefined);
     if (!sim || !sim.ok || sim.mode !== "simulated") { await this.db.updatePositionPlan(p.id, { lastResult: "can't sell right now (no route / honeypot) — watching" }); return; }
-    const baseOut = Number(BigInt(String((sim.detail as { expectedOut?: string }).expectedOut ?? "0"))) / 10 ** (await this.decimals(base));
-    const priceNow = (baseOut * baseUsd) / heldTokens; // USD per token, executable
+    const baseOut = Number(BigInt(String((sim.detail as { expectedOut?: string }).expectedOut ?? "0"))) / 10 ** 18;
+    const priceNow = (baseOut * baseUsd) / heldTokens; // USD per token, REALLY executable at her size
     const gainPct = (priceNow / p.filledPrice - 1) * 100;
+    // Persist the REAL executable price for this HELD token so the P&L (dashboard + Scarlet's data) shows the
+    // TRUTH, not a phantom Lane-A/DefiLlama quote (a thin memecoin can display +85% while its real sellable
+    // price is flat — that misled us into thinking a position had risen). Small size, updated each tick.
+    if (priceNow > 0 && Number.isFinite(priceNow)) await this.db.upsertTokenPrices(this.config.CHAIN_ID, [{ token: p.token, priceUsd: priceNow, confidence: 0.9, source: "exec" }]).catch(() => undefined);
 
     // 1) Stop-loss → exit everything.
     if (p.stopLossPct != null && gainPct <= -p.stopLossPct) return this.sell(p, 100, `STOP-LOSS ${gainPct.toFixed(1)}%`, tokenDec);
@@ -144,38 +152,56 @@ export class PositionManager {
   /** Executes a sell of `pct`% of the ORIGINAL filled amount; updates remaining + notifies. When
    * `wasManualExit`, clears the pending exit request ONLY on success so a transient failure retries. */
   private async sell(p: PositionPlan, pct: number, reason: string, tokenDec: number, wasManualExit = false): Promise<void> {
-    const token = p.token as Address; const base = p.baseToken as Address;
+    const token = p.token as Address;
     const sellTokens = (p.filledAmountToken ?? 0) * (pct / 100);
-    const sellWei = BigInt(Math.floor(sellTokens * 10 ** tokenDec));
+    let sellWei = BigInt(Math.floor(sellTokens * 10 ** tokenDec));
     if (sellWei <= 0n) return;
-    const exec = await this.primitives.swapBest(token, base, sellWei, 10, true).catch((e) => ({ ok: false as const, primitive: "swap", stage: "execute" as const, reason: e instanceof Error ? e.message : String(e) }));
+    // NEVER sell more than we actually HOLD. `filledAmountToken` is the pre-trade SIMULATION; the real
+    // received amount is a hair less (execution slippage), so selling the recorded amount reverts the
+    // router's transferFrom on insufficient balance (the VIRTUAL case: held 8.77089, tried 8.77101). Cap to
+    // the live on-chain balance — and for a full/over-exit sweep exactly what's there.
+    const owner = this.config.WALLET_ADDRESS as Address;
+    // The sell amount the tx will spend → read on the EXECUTION lane (same node as preflight+send), so the
+    // cap matches exactly what that node sees (no cross-node lag). fallback as a resilience net.
+    let bal: bigint | null = null;
+    for (const client of [this.chain.exec, this.chain.fallback]) {
+      try { bal = await client.readContract({ address: token, abi: DEC, functionName: "balanceOf", args: [owner] }) as bigint; break; } catch { /* next lane */ }
+    }
+    if (bal != null) {
+      if (bal <= 0n) { await this.db.updatePositionPlan(p.id, { remainingPct: 0, status: "closed", lastResult: `${reason} — nessun saldo on-chain (già venduto/spostato)`, ...(wasManualExit ? { exitNowPct: null } : {}) }); return; }
+      if (sellWei > bal) sellWei = bal; // cap to what we truly hold
+    }
+    // Sell token → NATIVE ETH via the aggregator (one-time MAX approval to the router handled downstream).
+    const exec = await this.primitives.swapBest(token, NATIVE_ETH, sellWei, 10, true).catch((e) => ({ ok: false as const, primitive: "swap", stage: "execute" as const, reason: e instanceof Error ? e.message : String(e) }));
     if (exec.ok && exec.mode === "executed") {
+      this.sellFail.delete(p.id); // a real sell went through → clear the honeypot strike counter
       const remaining = Math.max(0, p.remainingPct - pct);
       await this.db.updatePositionPlan(p.id, { remainingPct: remaining, status: remaining <= 0.01 ? "closed" : "open", lastResult: reason, ...(wasManualExit ? { exitNowPct: null } : {}) });
       await this.db.addJournal("action", `POSITION #${p.id} ${reason}: venduto ${pct}% di ${p.symbol ?? p.token.slice(0, 8)} (rimane ${remaining.toFixed(0)}%)`, { plan: p.id, tx: (exec as { txHash?: string }).txHash }, "position").catch(() => undefined);
       this.wake(`position:${p.id}`, `Position #${p.id} (${p.symbol ?? "token"}): ${reason} — sold ${pct}%, ${remaining.toFixed(0)}% left. Review and re-plan if needed.`);
     } else {
       const why = "reason" in exec ? exec.reason : "unknown";
-      const hard = /revert|STF|insufficient|transfer/i.test(why);
-      if (hard) {
-        // On-chain revert (e.g. sell-tax/honeypot) → BLOCK. Keep it filled+open-value but status 'error'.
-        // EMPIRICAL: flag the token sell-blocked so the gate refuses it forever (catches time-based honeypots).
-        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: p.token, kind: "token", meta: { sellBlocked: true, sellBlockReason: why.slice(0, 80), sellBlockedAt: new Date().toISOString() }, source: "sell-fail" }).catch(() => undefined);
-        await this.db.updatePositionPlan(p.id, { status: "error", exitNowPct: null, lastResult: `VENDITA BLOCCATA (revert): ${why.slice(0, 110)}` });
-        this.wake(`position-error:${p.id}`, `Strategia #${p.id} (${p.symbol ?? "token"}): la VENDITA reverta on-chain (${why.slice(0, 60)}) — probabile sell-tax. BLOCCATA: modifica o chiudi.`);
+      // An RPC/transport failure is NOT the token's fault → ALWAYS retry (now rare after the TX-cycle
+      // unification: preflight/send/receipt on one node, portfolio resilient). Never blacklist on these.
+      const rpcish = /rpc request failed|over rate limit|429|too many|timeout|timed out|fetch failed|missing or invalid parameters|internal error|-32603|econnreset|socket/i.test(why);
+      // A TOKEN-LEVEL transfer/sell block = HONEYPOT (transfer_from_failed / STF / sell-tax / blacklist / trading
+      // disabled). With the TX cycle unified (no approval-visibility race) and sellWei capped to the REAL balance
+      // (no VIRTUAL over-sell), a PERSISTENT transfer-block is the token's fault. Confirm over 2 strikes to tolerate
+      // a one-off, then block it FOREVER + blacklist → we stop retrying AND never buy it again.
+      const transferBlock = !rpcish && /transfer_from_failed|\bstf\b|transfer.?fail|sell.?tax|blacklist|not.?(allowed|whitelist)|cannot.?(sell|transfer)|trading.?(not|disabled)|max.?(tx|wallet)|honeypot/i.test(why);
+      const strikes = transferBlock ? (this.sellFail.get(p.id) ?? 0) + 1 : 0;
+      if (transferBlock) this.sellFail.set(p.id, strikes); else this.sellFail.delete(p.id);
+      if (transferBlock && strikes >= 2) {
+        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: p.token, kind: "token", meta: { sellBlocked: true, honeypot: true, sellBlockReason: why.slice(0, 80), sellBlockedAt: new Date().toISOString() }, source: "sell-fail" }).catch(() => undefined);
+        await this.db.addBlacklist({ scope: "token", value: p.token, tier: "exclude", source: "system", reason: `honeypot: ${why.slice(0, 80)}` }).catch(() => undefined);
+        await this.db.updatePositionPlan(p.id, { status: "error", exitNowPct: null, lastResult: `VENDITA BLOCCATA (honeypot — transferFrom reverta ${strikes}×): ${why.slice(0, 90)}` });
+        this.sellFail.delete(p.id);
+        this.wake(`position-error:${p.id}`, `Strategia #${p.id} (${p.symbol ?? "token"}): HONEYPOT — la vendita è bloccata dal token (${why.slice(0, 50)}). Blacklistato: non lo ricompreremo.`);
       } else {
-        // Transient (RPC/route) → keep the pending exit and retry next tick (idempotent close).
-        await this.db.updatePositionPlan(p.id, { lastResult: `${reason} — vendita ritenta (transitorio): ${why.slice(0, 80)}` });
+        // First strike / transient (RPC / route) → keep the pending exit and retry next tick (free, idempotent).
+        await this.db.updatePositionPlan(p.id, { lastResult: `${reason} — ritenta (${rpcish ? "RPC transitorio" : transferBlock ? `sospetto honeypot ${strikes}/2` : "transitorio"}): ${why.slice(0, 70)}` });
       }
     }
   }
 
-  /** Wraps native → wrapped-native if the base is the wrapped token and the balance is short. */
-  private async ensureBase(base: Address, needWei: bigint): Promise<void> {
-    if (base.toLowerCase() !== this.config.WBERA_ADDRESS.toLowerCase()) return; // only auto-wrap the native
-    const owner = this.config.WALLET_ADDRESS as Address; if (!owner) return;
-    const bal = await this.chain.primary.readContract({ address: base, abi: DEC, functionName: "balanceOf", args: [owner] }).catch(() => 0n) as bigint;
-    if (bal >= needWei) return;
-    await this.primitives.wrap(needWei - bal + needWei / 100n, true).catch(() => undefined); // wrap the shortfall (+1% buffer)
-  }
 }

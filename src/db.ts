@@ -14,7 +14,7 @@ export type PositionPlan = {
   filledAmountToken: number | null; filledPrice: number | null; filledAt: string | null;
   stopLossPct: number | null; takeProfitPct: number | null;
   partials: Array<{ atPct: number; sellPct: number; done?: boolean }>;
-  remainingPct: number; note: string | null; lastResult: string | null; exitNowPct: number | null; entryAttempts: number;
+  remainingPct: number; note: string | null; lastResult: string | null; exitNowPct: number | null; entryAttempts: number; strategy: string | null;
 };
 function rowToPlan(r: Record<string, unknown>): PositionPlan {
   const num = (v: unknown): number | null => v === null || v === undefined ? null : Number(v);
@@ -23,7 +23,7 @@ function rowToPlan(r: Record<string, unknown>): PositionPlan {
     status: String(r.status), entryKind: String(r.entry_kind), entryPrice: num(r.entry_price), entryAmountUsd: Number(r.entry_amount_usd),
     filledAmountToken: num(r.filled_amount_token), filledPrice: num(r.filled_price), filledAt: r.filled_at ? new Date(r.filled_at as string).toISOString() : null,
     stopLossPct: num(r.stop_loss_pct), takeProfitPct: num(r.take_profit_pct), partials: (r.partials as PositionPlan["partials"]) ?? [],
-    remainingPct: Number(r.remaining_pct), note: (r.note as string) ?? null, lastResult: (r.last_result as string) ?? null, exitNowPct: num(r.exit_now_pct), entryAttempts: Number(r.entry_attempts ?? 0)
+    remainingPct: Number(r.remaining_pct), note: (r.note as string) ?? null, lastResult: (r.last_result as string) ?? null, exitNowPct: num(r.exit_now_pct), entryAttempts: Number(r.entry_attempts ?? 0), strategy: (r.strategy as string) ?? null
   };
 }
 
@@ -335,6 +335,17 @@ export class Database {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS scarlet_memory_category_idx ON scarlet_memory(category, updated_at DESC);
+      -- Operative-state machine log: every transition Scarlet chooses (with her justification), kept for
+      -- continuity + shown in the dashboard. The latest row is her current operative state.
+      CREATE TABLE IF NOT EXISTS scarlet_state (
+        id BIGSERIAL PRIMARY KEY,
+        at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        state TEXT NOT NULL,
+        justification TEXT,
+        cycle TEXT,
+        phase TEXT NOT NULL DEFAULT 'operative'
+      );
+      CREATE INDEX IF NOT EXISTS scarlet_state_at_idx ON scarlet_state(at DESC);
       ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_value_usd NUMERIC;
       ALTER TABLE positions ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'erc4626';
       ALTER TABLE positions ADD COLUMN IF NOT EXISTS label TEXT;
@@ -377,6 +388,26 @@ export class Database {
         PRIMARY KEY (chain_id, address, kind)
       );
       CREATE INDEX IF NOT EXISTS entities_chain_kind_idx ON entities(chain_id, kind, status);
+      -- BLOCK-BASED entity tracking + the ENRICHMENT BUFFER (db-first convergence). Internal logic reasons
+      -- in BLOCKS, not timestamps (created_at/updated_at stay, for humans only): created_block/updated_block
+      -- make "how many blocks since this entity was updated" answerable at a glance. enrich_pending is
+      -- GENERATED — an entity is "in the enrichment buffer" the INSTANT a DEFINED field for its kind is
+      -- missing (token=decimals, pool=token0), and leaves it the instant enrichment fills it: zero drift,
+      -- no writer bookkeeping. enrich_resync marks the boot/gap set the startup gate waits to drain;
+      -- enrich_failed = enrichment gave up after bounded attempts (visible, does NOT block the gate);
+      -- enrich_attempts/enrich_checked_block record WHY (block-based) an entity stayed un-updated.
+      ALTER TABLE entities ADD COLUMN IF NOT EXISTS created_block BIGINT;
+      ALTER TABLE entities ADD COLUMN IF NOT EXISTS updated_block BIGINT;
+      ALTER TABLE entities ADD COLUMN IF NOT EXISTS enrich_resync BOOLEAN NOT NULL DEFAULT false;
+      ALTER TABLE entities ADD COLUMN IF NOT EXISTS enrich_failed BOOLEAN NOT NULL DEFAULT false;
+      ALTER TABLE entities ADD COLUMN IF NOT EXISTS enrich_attempts INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE entities ADD COLUMN IF NOT EXISTS enrich_checked_block BIGINT;
+      ALTER TABLE entities ADD COLUMN IF NOT EXISTS enrich_pending BOOLEAN
+        GENERATED ALWAYS AS ((kind = 'token' AND decimals IS NULL) OR (kind = 'pool' AND (meta->>'token0') IS NULL)) STORED;
+      -- The BUFFER query index: ONLY the incomplete-and-not-failed subset, keyed for resync-first,
+      -- oldest-block-first drain. The enricher's drain touches this subset, never a full-table scan.
+      CREATE INDEX IF NOT EXISTS entities_enrich_buffer_idx ON entities(chain_id, kind, enrich_resync DESC, updated_block)
+        WHERE enrich_pending AND NOT enrich_failed;
       -- Scarlet's token JUDGMENT history (append-only). Her verdicts on a token live here, address-keyed,
       -- so she reconstructs HER past decisions on it. The token FACTS (identity/provenance/security) live
       -- on the entity; this is only the layer of opinion, kept as a timeline (not a single latest value).
@@ -406,6 +437,19 @@ export class Database {
         at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (chain_id, block_number)
       );
+      -- ROLLING per-swap FLOW (db-first convergence): the indexer records each priced swap's wallet + USD
+      -- value here so the FlowSensor derives hotPools/activeWallets/bigSwaps from the DB instead of its own
+      -- getLogs. Pruned to a short window (FLOW_RETAIN_BLOCKS); delete-then-insert per block = idempotent.
+      CREATE TABLE IF NOT EXISTS recent_swaps (
+        id BIGSERIAL PRIMARY KEY,
+        chain_id INTEGER NOT NULL,
+        block_number BIGINT NOT NULL,
+        pool TEXT NOT NULL,
+        wallet TEXT,
+        value_usd DOUBLE PRECISION NOT NULL,
+        at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS recent_swaps_block_idx ON recent_swaps(chain_id, block_number);
       CREATE INDEX IF NOT EXISTS raw_blocks_at_idx ON raw_blocks(at);
       -- Per-pool AMM state, ingested from the SAME Swap/Sync logs the indexer already parses (V2 Sync
       -- carries the reserves; V3 Swap carries sqrtPriceX96 + liquidity). One latest row per pool. This
@@ -422,6 +466,18 @@ export class Database {
         block_number BIGINT NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (chain_id, pool)
+      );
+      -- V3 per-tick liquidity map (from Mint/Burn events). liquidity_net = net liquidity added when the
+      -- price crosses this tick going UP (Uniswap convention: +ΔL at tickLower, −ΔL at tickUpper). This is
+      -- the data a tick-crossing swap sim needs to price LARGE V3 trades EXACTLY (no more single-tick approx).
+      CREATE TABLE IF NOT EXISTS tick_liquidity (
+        chain_id INTEGER NOT NULL,
+        pool TEXT NOT NULL,
+        tick INTEGER NOT NULL,
+        liquidity_net NUMERIC NOT NULL DEFAULT 0,
+        block_number BIGINT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (chain_id, pool, tick)
       );
       -- Per-token market stats in 5-min buckets, from V3 swap amounts (the indexer already reads them).
       -- Gives volume / txns / buy-sell / price-change over any window by summing recent buckets — the
@@ -462,6 +518,10 @@ export class Database {
       ALTER TABLE token_prices ADD COLUMN IF NOT EXISTS vol_slow DOUBLE PRECISION;   -- EWMA var-rate (per sec), slow half-life
       ALTER TABLE token_prices ADD COLUMN IF NOT EXISTS vol_sample_price DOUBLE PRECISION; -- last price used for the return
       ALTER TABLE token_prices ADD COLUMN IF NOT EXISTS vol_at TIMESTAMPTZ;          -- when vol was last updated
+      -- FRESHNESS: the block at which this price was last written by a block-anchored source (indexer /
+      -- indexer-backfill). NULL for off-chain sources (defillama/aggregator/exec) that carry no block.
+      -- Lets every consumer see how far behind head a display price is, matching pool_state.block_number.
+      ALTER TABLE token_prices ADD COLUMN IF NOT EXISTS block_number BIGINT;
       -- Wallet MOVEMENTS (ERC-20 Transfer events touching the wallet), persisted once + appended as
       -- new ones are detected. The wallet reads/derives from here — never re-requests saved history.
       CREATE TABLE IF NOT EXISTS wallet_transactions (
@@ -542,6 +602,7 @@ export class Database {
       -- Retry counter for entries. A strategy that fails hard (on-chain revert) or exhausts retries goes
       -- to status 'error' (blocked): the engine stops touching it; Scarlet sees it and must modify or close.
       ALTER TABLE position_plans ADD COLUMN IF NOT EXISTS entry_attempts INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE position_plans ADD COLUMN IF NOT EXISTS strategy TEXT; -- category budget: 'launchtoken' | 'bluechip' (drives per-strategy budget accounting)
       CREATE TABLE IF NOT EXISTS lending_positions (
         chain_id INTEGER NOT NULL,
         protocol TEXT NOT NULL,          -- family: morpho | aave-v3 | compound | ...
@@ -670,14 +731,25 @@ export class Database {
   }
 
   // --- programmatic position plans (SL/TP/partial; the system executes) -------
-  async createPositionPlan(p: { chainId: number; token: string; symbol: string | null; baseToken: string; entryKind: string; entryPrice: number | null; entryAmountUsd: number; stopLossPct: number | null; takeProfitPct: number | null; partials: unknown; note: string }): Promise<number> {
+  async createPositionPlan(p: { chainId: number; token: string; symbol: string | null; baseToken: string; entryKind: string; entryPrice: number | null; entryAmountUsd: number; stopLossPct: number | null; takeProfitPct: number | null; partials: unknown; note: string; strategy?: string | null }): Promise<number> {
     const status = p.entryKind === "now" ? "entering" : "pending-entry";
     const r = await this.pool.query<{ id: number }>(
-      `INSERT INTO position_plans(chain_id, token, symbol, base_token, status, entry_kind, entry_price, entry_amount_usd, stop_loss_pct, take_profit_pct, partials, note)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
-      [p.chainId, p.token.toLowerCase(), p.symbol, p.baseToken.toLowerCase(), status, p.entryKind, p.entryPrice, p.entryAmountUsd, p.stopLossPct, p.takeProfitPct, jsonParam(p.partials ?? []), p.note]
+      `INSERT INTO position_plans(chain_id, token, symbol, base_token, status, entry_kind, entry_price, entry_amount_usd, stop_loss_pct, take_profit_pct, partials, note, strategy)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+      [p.chainId, p.token.toLowerCase(), p.symbol, p.baseToken.toLowerCase(), status, p.entryKind, p.entryPrice, p.entryAmountUsd, p.stopLossPct, p.takeProfitPct, jsonParam(p.partials ?? []), p.note, p.strategy ?? null]
     );
     return r.rows[0].id;
+  }
+
+  /** Per-strategy deployed capital (sum of active plans' entry USD, grouped by strategy) — for category budgets. */
+  async usedBudgetByStrategy(chainId: number): Promise<Record<string, number>> {
+    const r = await this.pool.query<{ strategy: string | null; used: string }>(
+      `SELECT COALESCE(strategy,'?') AS strategy, COALESCE(SUM(entry_amount_usd),0) AS used FROM position_plans
+       WHERE chain_id=$1 AND status IN ('pending-entry','entering','open','exiting') GROUP BY 1`, [chainId]
+    );
+    const out: Record<string, number> = {};
+    for (const row of r.rows) out[row.strategy ?? "?"] = Number(row.used);
+    return out;
   }
   async activePositionPlans(chainId: number): Promise<Array<PositionPlan>> {
     const r = await this.pool.query(`SELECT * FROM position_plans WHERE chain_id=$1 AND status IN ('pending-entry','entering','open','exiting') ORDER BY created_at`, [chainId]);
@@ -711,20 +783,23 @@ export class Database {
 
   /** Upserts an entity's DETERMINISTIC fields (symbol/name/decimals/meta) — set by the system's
    * resolver, never by Scarlet. Her note + status are preserved unless explicitly changed. */
-  async upsertEntity(e: { chainId: number; address: string; kind: string; symbol?: string | null; name?: string | null; decimals?: number | null; meta?: Record<string, unknown>; source?: string }): Promise<void> {
+  async upsertEntity(e: { chainId: number; address: string; kind: string; symbol?: string | null; name?: string | null; decimals?: number | null; meta?: Record<string, unknown>; source?: string; block?: number }): Promise<void> {
     // "?"/"" are NON-values — store them as NULL so they never overwrite a real symbol via COALESCE
     // (a "?" is truthy and would clobber a good name). meta is MERGED, never clobbered.
+    // block: the chain block this write reflects → created_block on first insert, updated_block on every
+    // write (staleness = head − updated_block). Callers without a block (non-indexer) pass null → untouched.
     const sym = e.symbol && e.symbol !== "?" ? e.symbol : null;
     const nm = e.name && e.name !== "?" ? e.name : null;
     await this.pool.query(
-      `INSERT INTO entities(chain_id, address, kind, symbol, name, decimals, meta, source)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+      `INSERT INTO entities(chain_id, address, kind, symbol, name, decimals, meta, source, created_block, updated_block)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
        ON CONFLICT (chain_id, address, kind) DO UPDATE SET
          symbol=COALESCE(EXCLUDED.symbol, entities.symbol),
          name=COALESCE(EXCLUDED.name, entities.name),
          decimals=COALESCE(EXCLUDED.decimals, entities.decimals),
-         meta=entities.meta || EXCLUDED.meta, updated_at=NOW()`,
-      [e.chainId, e.address.toLowerCase(), e.kind, sym, nm, e.decimals ?? null, jsonParam(e.meta ?? {}), e.source ?? "scarlet"]
+         meta=entities.meta || EXCLUDED.meta, updated_at=NOW(),
+         updated_block=COALESCE(EXCLUDED.updated_block, entities.updated_block)`,
+      [e.chainId, e.address.toLowerCase(), e.kind, sym, nm, e.decimals ?? null, jsonParam(e.meta ?? {}), e.source ?? "scarlet", e.block ?? null]
     );
   }
   async getEntity(chainId: number, address: string): Promise<Array<{ address: string; kind: string; symbol: string | null; name: string | null; decimals: number | null; meta: unknown; note: string | null; status: string; source: string }>> {
@@ -744,6 +819,24 @@ export class Database {
     const c: Record<string, number> = {};
     for (const row of counts.rows) c[row.kind] = row.n;
     return { rows: rows.rows.map((r) => ({ address: r.address, kind: r.kind, symbol: r.symbol, name: r.name, decimals: r.decimals, meta: r.meta, note: r.note, status: r.status, source: r.source, updatedAt: new Date(r.updated_at).toISOString() })), total: total.rows[0]?.n ?? 0, counts: c };
+  }
+
+  /** VENUE COVERAGE worklist: every distinct pool factory (the DEX that emitted the pool), with how many
+   * pools + how many are ACTIVE (fresh pool_state). Feeds the "unknown active DEX" report — a factory here
+   * that isn't in our executable registry is a protocol whose pools we ingest + quote but can't yet own-
+   * execute (curate its router + encoder to cover). Ranked most-active first. */
+  async poolFactoryActivity(chainId: number, freshMinutes = 30, limit = 40): Promise<Array<{ factory: string; archetype: string | null; pools: number; withState: number; fresh: number }>> {
+    const r = await this.pool.query<{ factory: string; archetype: string | null; pools: string; with_state: string; fresh: string }>(
+      `SELECT COALESCE(e.meta->>'factory','(missing)') factory, e.meta->>'archetype' archetype,
+              count(*)::text pools,
+              count(ps.pool)::text with_state,
+              count(*) FILTER (WHERE ps.updated_at > NOW() - ($2 || ' min')::interval)::text fresh
+       FROM entities e LEFT JOIN pool_state ps ON ps.chain_id=e.chain_id AND ps.pool=e.address
+       WHERE e.chain_id=$1 AND e.kind='pool'
+       GROUP BY 1,2 ORDER BY fresh DESC, pools DESC LIMIT $3`,
+      [chainId, String(freshMinutes), limit]
+    );
+    return r.rows.map((x) => ({ factory: x.factory, archetype: x.archetype, pools: Number(x.pools), withState: Number(x.with_state), fresh: Number(x.fresh) }));
   }
 
   /** Arb candidate tokens FROM THE REGISTRY: tokens that appear in >=2 discovered pools (i.e.
@@ -766,6 +859,19 @@ export class Database {
     return r.rows.map((x) => ({ address: x.address, symbol: x.symbol, pools: Number(x.pools) }));
   }
 
+  /** GENUINE fresh launches from the indexer's discovery: pools it saw CREATED (origin='created', i.e. a
+   * real PoolCreated event, NOT an old pool first-seen-via-swap) at/after `sinceBlock`. Feeds the launch
+   * sensor from the DB instead of a duplicate getLogs. Oldest-first so a cursor can advance monotonically. */
+  async recentLaunches(chainId: number, sinceBlock: number, limit = 100): Promise<Array<{ address: string; token0: string; token1: string; fee: number | null; factory: string | null; archetype: string | null; createdBlock: number }>> {
+    const r = await this.pool.query<{ address: string; t0: string; t1: string; fee: string | null; factory: string | null; archetype: string | null; created_block: string }>(
+      `SELECT address, meta->>'token0' t0, meta->>'token1' t1, meta->>'fee' fee, meta->>'factory' factory, meta->>'archetype' archetype, created_block
+       FROM entities WHERE chain_id=$1 AND kind='pool' AND meta->>'origin'='created' AND created_block >= $2 AND (meta->>'token0') IS NOT NULL
+       ORDER BY created_block ASC LIMIT $3`,
+      [chainId, sinceBlock, limit]
+    );
+    return r.rows.map((x) => ({ address: x.address, token0: x.t0, token1: x.t1, fee: x.fee != null ? Number(x.fee) : null, factory: x.factory, archetype: x.archetype, createdBlock: Number(x.created_block) }));
+  }
+
   /** All discovered pools containing a token (either side) — for the price oracle / arb. */
   async poolsForToken(chainId: number, token: string): Promise<Array<{ address: string; meta: unknown }>> {
     const r = await this.pool.query<{ address: string; meta: unknown }>(
@@ -784,11 +890,14 @@ export class Database {
     return r.rows;
   }
 
-  /** Token entities the system knows about but is MISSING decimals for — the immutable fact the
-   * oracle needs. Filled from Blockscout (keyless) so the oracle resolves from system data, not RPC. */
+  /** ENRICHMENT BUFFER (tokens): token entities missing the price-critical `decimals`, not yet given up on.
+   * Index-backed (entities_enrich_buffer_idx) so this touches ONLY the incomplete subset — never a full
+   * scan, even at millions of entities. Resync set first (the boot/gap entities the gate waits for), then
+   * oldest-block-first (NULLS FIRST = never-updated ahead of stale). */
   async entitiesNeedingDecimals(chainId: number, limit = 20): Promise<Array<{ address: string }>> {
     const r = await this.pool.query<{ address: string }>(
-      `SELECT address FROM entities WHERE chain_id=$1 AND kind='token' AND decimals IS NULL AND NOT (meta ? 'decimalsCheckedAt') ORDER BY updated_at DESC LIMIT $2`,
+      `SELECT address FROM entities WHERE chain_id=$1 AND kind='token' AND enrich_pending AND NOT enrich_failed
+       ORDER BY enrich_resync DESC, updated_block ASC NULLS FIRST LIMIT $2`,
       [chainId, limit]
     );
     return r.rows;
@@ -796,13 +905,13 @@ export class Database {
 
   // --- DISPLAY prices (Lane A: indicative, cached, batch-refreshed — never a decision input) ---
   /** Batch-upsert display prices (from DefiLlama batch / Blockscout / bounded aggregator backfill). */
-  async upsertTokenPrices(chainId: number, rows: Array<{ token: string; priceUsd: number | null; confidence?: number | null; source?: string }>, vol?: { tauFastSec: number; tauSlowSec: number }): Promise<void> {
+  async upsertTokenPrices(chainId: number, rows: Array<{ token: string; priceUsd: number | null; confidence?: number | null; source?: string; block?: number | null }>, vol?: { tauFastSec: number; tauSlowSec: number }): Promise<void> {
     if (!rows.length) return;
     const values: unknown[] = [];
     const tuples = rows.map((r, i) => {
-      const b = i * 5;
-      values.push(chainId, r.token.toLowerCase(), r.priceUsd, r.confidence ?? null, r.source ?? "defillama");
-      return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},NOW())`;
+      const b = i * 6;
+      values.push(chainId, r.token.toLowerCase(), r.priceUsd, r.confidence ?? null, r.source ?? "defillama", r.block ?? null);
+      return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},NOW())`;
     });
     const tf = vol?.tauFastSec ?? 1200, ts = vol?.tauSlowSec ?? 86400;
     values.push(tf, ts);
@@ -814,8 +923,9 @@ export class Database {
     const ewma = (tau: string, col: string) => `(exp(-${dt}/${tau}) * COALESCE(token_prices.${col}, ${instVar}) + (1 - exp(-${dt}/${tau})) * ${instVar})`;
     const canUpdate = "token_prices.vol_sample_price > 0 AND EXCLUDED.price_usd > 0 AND token_prices.vol_at IS NOT NULL";
     await this.pool.query(
-      `INSERT INTO token_prices(chain_id, token, price_usd, confidence, source, updated_at) VALUES ${tuples.join(",")}
+      `INSERT INTO token_prices(chain_id, token, price_usd, confidence, source, block_number, updated_at) VALUES ${tuples.join(",")}
        ON CONFLICT (chain_id, token) DO UPDATE SET price_usd=EXCLUDED.price_usd, confidence=EXCLUDED.confidence, source=EXCLUDED.source, updated_at=NOW(),
+         block_number = COALESCE(EXCLUDED.block_number, token_prices.block_number),
          vol_fast = CASE WHEN ${canUpdate} THEN ${ewma(pTf, "vol_fast")} ELSE token_prices.vol_fast END,
          vol_slow = CASE WHEN ${canUpdate} THEN ${ewma(pTs, "vol_slow")} ELSE token_prices.vol_slow END,
          vol_sample_price = CASE WHEN EXCLUDED.price_usd > 0 THEN EXCLUDED.price_usd ELSE token_prices.vol_sample_price END,
@@ -866,14 +976,14 @@ export class Database {
   }
 
   /** Display prices for a set of tokens (render-time read; no external calls). */
-  async getTokenPrices(chainId: number, tokens: string[]): Promise<Map<string, { priceUsd: number | null; confidence: number | null; source: string; updatedAt: string }>> {
-    const out = new Map<string, { priceUsd: number | null; confidence: number | null; source: string; updatedAt: string }>();
+  async getTokenPrices(chainId: number, tokens: string[]): Promise<Map<string, { priceUsd: number | null; confidence: number | null; source: string; updatedAt: string; block: number | null }>> {
+    const out = new Map<string, { priceUsd: number | null; confidence: number | null; source: string; updatedAt: string; block: number | null }>();
     if (!tokens.length) return out;
     const lower = tokens.map((t) => t.toLowerCase());
-    const r = await this.pool.query<{ token: string; price_usd: number | null; confidence: number | null; source: string; updated_at: Date }>(
-      `SELECT token, price_usd, confidence, source, updated_at FROM token_prices WHERE chain_id=$1 AND token = ANY($2::text[])`, [chainId, lower]
+    const r = await this.pool.query<{ token: string; price_usd: number | null; confidence: number | null; source: string; updated_at: Date; block_number: string | null }>(
+      `SELECT token, price_usd, confidence, source, updated_at, block_number::text FROM token_prices WHERE chain_id=$1 AND token = ANY($2::text[])`, [chainId, lower]
     );
-    for (const row of r.rows) out.set(row.token, { priceUsd: row.price_usd, confidence: row.confidence, source: row.source, updatedAt: row.updated_at.toISOString() });
+    for (const row of r.rows) out.set(row.token, { priceUsd: row.price_usd, confidence: row.confidence, source: row.source, updatedAt: row.updated_at.toISOString(), block: row.block_number == null ? null : Number(row.block_number) });
     return out;
   }
 
@@ -902,6 +1012,61 @@ export class Database {
     return r.rows;
   }
 
+  /** Pool entities the indexer discovered by their Swap/Sync but whose token0/token1 aren't known yet
+   * (bare pools written on the critical path). The enricher fills token0/1/fee on its dedicated lane. */
+  /** ENRICHMENT BUFFER (pools): bare pools missing token0/1 (discovered by a Swap/Sync, no PoolCreated seen),
+   * not yet given up on. Same index-backed, resync-first, oldest-first drain as the token buffer. */
+  async entitiesNeedingPoolInfo(chainId: number, limit = 20): Promise<Array<{ address: string; archetype: string | null }>> {
+    const r = await this.pool.query<{ address: string; archetype: string | null }>(
+      `SELECT address, meta->>'archetype' AS archetype FROM entities WHERE chain_id=$1 AND kind='pool' AND enrich_pending AND NOT enrich_failed
+       ORDER BY enrich_resync DESC, updated_block ASC NULLS FIRST LIMIT $2`,
+      [chainId, limit]
+    );
+    return r.rows;
+  }
+
+  /** ENRICHMENT BUFFER — record a FAILED read attempt on an entity (block-based, persisted; replaces the
+   * old in-memory counter that reset on restart). Stamps the attempt block, and after `maxAttempts` marks
+   * the entity terminally `enrich_failed` so a genuinely-unresolvable address stops being re-drained and
+   * never hangs the resync gate — while staying visible (attempts + checked_block show WHY it's un-updated). */
+  async bumpEnrichAttempt(chainId: number, address: string, kind: string, block: number | null, maxAttempts: number): Promise<void> {
+    await this.pool.query(
+      `UPDATE entities SET enrich_attempts = enrich_attempts + 1, enrich_checked_block = COALESCE($4, enrich_checked_block),
+         enrich_failed = (enrich_attempts + 1 >= $5)
+       WHERE chain_id=$1 AND address=$2 AND kind=$3`,
+      [chainId, address.toLowerCase(), kind, block, maxAttempts]
+    );
+  }
+
+  /** GATE (resync): snapshot the CURRENT incomplete set as the resync set to drain. Called once when the
+   * indexer first reaches head — everything discovered up to head (boot scan + gap) is present now. Sets
+   * enrich_resync = true for still-incomplete entities, false for the rest, atomically. Returns how many
+   * remain outstanding (the number the startup gate then waits to reach 0). */
+  async flagResyncSet(chainId: number): Promise<number> {
+    await this.pool.query(`UPDATE entities SET enrich_resync = (enrich_pending AND NOT enrich_failed) WHERE chain_id=$1`, [chainId]);
+    return this.countResyncOutstanding(chainId);
+  }
+
+  /** GATE (resync): how many resync-flagged entities are still incomplete (not yet enriched, not failed).
+   * 0 = the resync set is fully resolved → the startup gate may release the acting services. */
+  async countResyncOutstanding(chainId: number): Promise<number> {
+    const r = await this.pool.query<{ n: number }>(
+      `SELECT count(*)::int n FROM entities WHERE chain_id=$1 AND enrich_resync AND enrich_pending AND NOT enrich_failed`, [chainId]
+    );
+    return r.rows[0]?.n ?? 0;
+  }
+
+  /** RECONCILIATION: pool entities missing `meta.factory` — old/bare pools discovered before we stored the
+   * factory (own-execution routes each pool to ITS dex's router by factory). The manual re-sync backfills it.
+   * `factoryCheckedAt` guards pools whose factory() couldn't be read, so a re-run doesn't loop on them. */
+  async poolsMissingFactory(chainId: number, limit = 200): Promise<string[]> {
+    const r = await this.pool.query<{ address: string }>(
+      `SELECT address FROM entities WHERE chain_id=$1 AND kind='pool' AND NOT (meta ? 'factory') AND NOT (meta ? 'factoryCheckedAt') ORDER BY updated_at DESC LIMIT $2`,
+      [chainId, limit]
+    );
+    return r.rows.map((x) => x.address);
+  }
+
   /** Token symbol+decimals for a set of addresses, FROM THE REGISTRY (the source of truth). Consumers
    * like the wallet read metadata here and only compute quantities — they never resolve it themselves. */
   async tokenMeta(chainId: number, addresses: string[]): Promise<Map<string, { symbol: string | null; decimals: number | null }>> {
@@ -928,6 +1093,18 @@ export class Database {
        VALUES ${tup.join(",")} ON CONFLICT (chain_id, wallet, tx_hash, log_index) DO NOTHING`, flat
     );
     return res.rowCount ?? 0;
+  }
+
+  /** A WATCHED wallet's transfers AFTER a block (oldest-first), JOINed to token symbols/decimals — fed by
+   * the indexer. Lets FollowService read followed smart-money's moves from the DB instead of its own getLogs. */
+  async walletTransfersSince(chainId: number, wallet: string, sinceBlock: number): Promise<Array<{ txHash: string; block: string; token: string; symbol: string | null; decimals: number | null; from: string; to: string; valueRaw: string; direction: string }>> {
+    const r = await this.pool.query<{ tx_hash: string; block_number: string; token: string; symbol: string | null; decimals: number | null; from_addr: string; to_addr: string; value_raw: string; direction: string }>(
+      `SELECT t.tx_hash, t.block_number::text, t.token, e.symbol, e.decimals, t.from_addr, t.to_addr, t.value_raw::text, t.direction
+       FROM wallet_transactions t LEFT JOIN entities e ON e.chain_id=t.chain_id AND e.address=t.token AND e.kind='token'
+       WHERE t.chain_id=$1 AND t.wallet=$2 AND t.block_number > $3 ORDER BY t.block_number ASC, t.log_index ASC LIMIT 200`,
+      [chainId, wallet.toLowerCase(), sinceBlock]
+    );
+    return r.rows.map((x) => ({ txHash: x.tx_hash, block: x.block_number, token: x.token, symbol: x.symbol, decimals: x.decimals, from: x.from_addr, to: x.to_addr, valueRaw: x.value_raw, direction: x.direction }));
   }
 
   /** The wallet's transaction history for the detail page — newest first, JOINed to token symbols. */
@@ -1180,6 +1357,39 @@ export class Database {
     const r = await this.pool.query(`DELETE FROM raw_blocks WHERE chain_id=$1 AND at < NOW() - ($2 || ' hours')::interval`, [chainId, String(olderThanHours)]);
     return r.rowCount ?? 0;
   }
+  /** Rolling buffer: keep only the last `keep` blocks (by block_number) of raw full logs. */
+  async pruneRawBlocksKeepLast(chainId: number, keep: number): Promise<number> {
+    const r = await this.pool.query(
+      `DELETE FROM raw_blocks WHERE chain_id=$1 AND block_number < (SELECT COALESCE(MAX(block_number),0) - $2 FROM raw_blocks WHERE chain_id=$1)`,
+      [chainId, keep]
+    );
+    return r.rowCount ?? 0;
+  }
+  /** ROLLING FLOW: replace this block's swap rows (idempotent on re-process) with the given per-swap
+   * {pool, wallet, valueUsd}. The indexer calls this once per block; the FlowSensor reads it back. */
+  async insertRecentSwaps(chainId: number, block: number, rows: Array<{ pool: string; wallet: string | null; valueUsd: number }>): Promise<void> {
+    await this.pool.query(`DELETE FROM recent_swaps WHERE chain_id=$1 AND block_number=$2`, [chainId, block]);
+    if (!rows.length) return;
+    const vals: unknown[] = [];
+    const tuples = rows.map((r, i) => { const b = i * 5; vals.push(chainId, block, r.pool.toLowerCase(), r.wallet?.toLowerCase() ?? null, r.valueUsd); return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5})`; });
+    await this.pool.query(`INSERT INTO recent_swaps(chain_id, block_number, pool, wallet, value_usd) VALUES ${tuples.join(",")}`, vals);
+  }
+  /** Rolling window: drop flow rows older than `keep` blocks behind the newest. */
+  async pruneRecentSwaps(chainId: number, keep: number): Promise<number> {
+    const r = await this.pool.query(
+      `DELETE FROM recent_swaps WHERE chain_id=$1 AND block_number < (SELECT COALESCE(MAX(block_number),0) - $2 FROM recent_swaps WHERE chain_id=$1)`,
+      [chainId, keep]
+    );
+    return r.rowCount ?? 0;
+  }
+  /** FLOW read (for the FlowSensor): per-swap {block, pool, wallet, valueUsd} at/after `sinceBlock`. */
+  async recentSwaps(chainId: number, sinceBlock: number): Promise<Array<{ block: number; pool: string; wallet: string | null; valueUsd: number }>> {
+    const r = await this.pool.query<{ block_number: string; pool: string; wallet: string | null; value_usd: number }>(
+      `SELECT block_number, pool, wallet, value_usd FROM recent_swaps WHERE chain_id=$1 AND block_number >= $2 ORDER BY block_number ASC`,
+      [chainId, sinceBlock]
+    );
+    return r.rows.map((x) => ({ block: Number(x.block_number), pool: x.pool, wallet: x.wallet, valueUsd: x.value_usd }));
+  }
   /** Pool metadata (token0/token1/archetype) for a batch of pool addresses — from the entities registry. */
   async poolInfoBatch(chainId: number, addresses: string[]): Promise<Map<string, { token0: string | null; token1: string | null; archetype: string | null }>> {
     const out = new Map<string, { token0: string | null; token1: string | null; archetype: string | null }>();
@@ -1213,6 +1423,56 @@ export class Database {
         rows.map((x) => s(x.sqrtPrice)), rows.map((x) => s(x.liquidity)),
         rows.map((x) => x.block)]
     );
+  }
+
+  /** Accumulate V3 per-tick liquidity from Mint/Burn deltas. Each delta contributes +Δ at tickLower and
+   * −Δ at tickUpper (Uniswap's crossing convention); Burn passes a negative Δ. Idempotency isn't perfect
+   * across reprocessing (deltas accumulate), but the rolling raw buffer + block stamp let us rebuild if needed. */
+  async upsertTickLiquidity(chainId: number, block: number, deltas: Array<{ pool: string; tickLower: number; tickUpper: number; liquidityDelta: bigint }>): Promise<void> {
+    if (!deltas.length) return;
+    // Aggregate by (pool, tick) FIRST — several Mint/Burn on the same tick in one block would otherwise
+    // produce duplicate conflict keys in a single INSERT (Postgres 21000: "cannot affect row twice").
+    const net = new Map<string, bigint>(); // `${pool}:${tick}` → summed net-liquidity delta
+    for (const d of deltas) {
+      const kl = `${d.pool.toLowerCase()}:${d.tickLower}`, ku = `${d.pool.toLowerCase()}:${d.tickUpper}`;
+      net.set(kl, (net.get(kl) ?? 0n) + d.liquidityDelta); // +Δ at tickLower
+      net.set(ku, (net.get(ku) ?? 0n) - d.liquidityDelta); // −Δ at tickUpper
+    }
+    const rows: Array<[string, number, string]> = [...net.entries()].map(([k, v]) => { const i = k.lastIndexOf(":"); return [k.slice(0, i), Number(k.slice(i + 1)), v.toString()]; });
+    const values: unknown[] = [];
+    const tuples = rows.map((r, i) => { const b = i * 5; values.push(chainId, r[0], r[1], r[2], block); return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},NOW())`; });
+    await this.pool.query(
+      `INSERT INTO tick_liquidity(chain_id, pool, tick, liquidity_net, block_number, updated_at) VALUES ${tuples.join(",")}
+       ON CONFLICT (chain_id, pool, tick) DO UPDATE SET liquidity_net = tick_liquidity.liquidity_net + EXCLUDED.liquidity_net, block_number = EXCLUDED.block_number, updated_at = NOW()`,
+      values
+    );
+  }
+
+  /** DEV RESET: return the system to a CLEAN slate. Wipes everything NOT managed by the indexer/enrichment
+   * (nor system infra) — agent history/cognition, positions, annotations, follows, NAV history, the wallet
+   * transfer/balance history (so Scarlet doesn't see stale movements) and derived/observation history.
+   * KEEPS: objective indexer/enrichment data (entities, pool_state, token_prices, token_stats,
+   * tick_liquidity, indexer_state, scan_cursors, venues, discovered_pools, raw_blocks,
+   * protocol_verifications, lending_markets/positions) + SYSTEM infra (signal_blacklist = honeypot memory,
+   * organs = deployed contract addresses/seeds). Logs self-rotate. Idempotent (TRUNCATE), one statement. */
+  async resetScarletState(): Promise<void> {
+    await this.pool.query(
+      `TRUNCATE scarlet_journal, scarlet_memory, scarlet_state, decisions, executions, ledger_entries,
+        position_plans, positions, token_annotations, research_traces, strategy_hypotheses,
+        opportunity_candidates, follows, follow_moves, portfolio_snapshots, agent_summaries,
+        wallet_transactions, wallet_token_balances, market_snapshots, network_observations,
+        liquidation_events, autoflash, bend_accounts, bend_positions
+       RESTART IDENTITY CASCADE`
+    );
+  }
+
+  /** Initialized ticks (non-zero net liquidity) for a V3 pool — the input to the exact tick-crossing sim. */
+  async tickLiquidity(chainId: number, pool: string): Promise<Array<{ tick: number; liquidityNet: bigint }>> {
+    const r = await this.pool.query<{ tick: number; liquidity_net: string }>(
+      `SELECT tick, liquidity_net::text FROM tick_liquidity WHERE chain_id=$1 AND pool=$2 AND liquidity_net <> 0 ORDER BY tick`,
+      [chainId, pool.toLowerCase()]
+    );
+    return r.rows.map((x) => ({ tick: x.tick, liquidityNet: BigInt(x.liquidity_net) }));
   }
 
   /** Increment per-token market stats for the current 5-min bucket (from V3 swap amounts). */
@@ -1500,6 +1760,19 @@ export class Database {
   /** Records one human-readable entry in Scarlet's journal (a note, a thought, or an action). */
   async addJournal(kind: "note" | "thought" | "action" | "rest" | "memory" | "cycle" | "tool", content: string, meta: Record<string, unknown> = {}, cycle?: string, stream = "main"): Promise<void> {
     await this.pool.query(`INSERT INTO scarlet_journal(cycle, kind, content, meta, stream) VALUES($1,$2,$3,$4,$5)`, [cycle ?? null, kind, content.replace(/\u0000/g, "").slice(0, 4_000), jsonParam(meta), stream]);
+  }
+
+  // --- operative-state machine ---
+  async logScarletState(state: string, justification: string, cycle?: string, phase = "operative"): Promise<void> {
+    await this.pool.query(`INSERT INTO scarlet_state(state, justification, cycle, phase) VALUES($1,$2,$3,$4)`, [state, justification.slice(0, 500), cycle ?? null, phase]);
+  }
+  async latestScarletState(): Promise<{ state: string; justification: string | null; at: string } | undefined> {
+    const r = await this.pool.query<{ state: string; justification: string | null; at: Date }>(`SELECT state, justification, at FROM scarlet_state WHERE phase='operative' ORDER BY at DESC LIMIT 1`);
+    return r.rows[0] ? { state: r.rows[0].state, justification: r.rows[0].justification, at: r.rows[0].at.toISOString() } : undefined;
+  }
+  async recentScarletStates(limit = 25): Promise<Array<{ state: string; justification: string | null; at: string }>> {
+    const r = await this.pool.query<{ state: string; justification: string | null; at: Date }>(`SELECT state, justification, at FROM scarlet_state ORDER BY at DESC LIMIT $1`, [limit]);
+    return r.rows.map((x) => ({ state: x.state, justification: x.justification, at: x.at.toISOString() }));
   }
 
   async recentJournal(limit = 40, stream?: string): Promise<Array<{ at: string; cycle?: string; kind: string; content: string; meta: unknown }>> {

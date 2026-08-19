@@ -2,6 +2,7 @@ import type { Logger } from "pino";
 import { parseAbi, type Address } from "viem";
 import type { Config } from "./config.js";
 import type { BerachainClients } from "./chain.js";
+import type { Database } from "./db.js";
 
 /**
  * The deterministic address resolver. Scarlet works with an ADDRESS; the system does the rest:
@@ -31,15 +32,22 @@ export type ResolvedEntity = {
 };
 
 export class EntityResolver {
-  constructor(private readonly config: Config, private readonly chain: BerachainClients, private readonly logger: Logger) {}
+  constructor(private readonly config: Config, private readonly chain: BerachainClients, private readonly db: Database, private readonly logger: Logger) {}
 
   async resolve(address: Address): Promise<ResolvedEntity> {
-    const [symbol, name, decimals, code] = await Promise.all([
-      this.chain.primary.readContract({ address, abi: ERC20, functionName: "symbol" }).catch(() => null) as Promise<string | null>,
-      this.chain.primary.readContract({ address, abi: ERC20, functionName: "name" }).catch(() => null) as Promise<string | null>,
-      this.chain.primary.readContract({ address, abi: ERC20, functionName: "decimals" }).catch(() => null) as Promise<number | null>,
-      this.chain.primary.getCode({ address }).catch(() => undefined)
+    // DB-FIRST (db-first convergence): identity metadata is the enrichment/registry's job — take symbol/
+    // name/decimals from `entities` when the system already knows them. Only a genuinely-unknown address
+    // is read on-chain, and then on the dedicated ENRICHMENT lane (not the shared primary read pool).
+    const ent = (await this.db.getEntity(this.config.CHAIN_ID, address.toLowerCase()).catch(() => []))[0];
+    const dbSym = ent?.symbol ?? null, dbName = ent?.name ?? null, dbDec = ent?.decimals ?? null;
+    const needChain = dbSym == null || dbDec == null;
+    const [rSym, rName, rDec, code] = await Promise.all([
+      needChain && dbSym == null ? this.chain.enrichment.readContract({ address, abi: ERC20, functionName: "symbol" }).catch(() => null) as Promise<string | null> : Promise.resolve(null),
+      needChain && dbName == null ? this.chain.enrichment.readContract({ address, abi: ERC20, functionName: "name" }).catch(() => null) as Promise<string | null> : Promise.resolve(null),
+      needChain && dbDec == null ? this.chain.enrichment.readContract({ address, abi: ERC20, functionName: "decimals" }).catch(() => null) as Promise<number | null> : Promise.resolve(null),
+      this.chain.enrichment.getCode({ address }).catch(() => undefined)
     ]);
+    const symbol = dbSym ?? rSym, name = dbName ?? rName, decimals = dbDec ?? rDec;
     const isToken = decimals !== null && symbol !== null;
     const gt = await this.gtToken(address).catch(() => undefined);
     return {

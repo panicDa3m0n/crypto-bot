@@ -14,7 +14,7 @@ const addr = z.string().regex(/^0x[a-fA-F0-9]{40}$/);
 export const dexProfileSchema = z.object({
   id: z.string(),
   name: z.string(),
-  type: z.enum(["uni-v3", "uni-v2", "balancer", "morpho", "dolomite", "erc4626", "reward-vault"]),
+  type: z.string(), // free-form (was a closed enum): a seed with a new DEX type must NEVER crash startup — it's just metadata
   factory: addr,
   router: addr.optional(),
   quoter: addr.optional(),

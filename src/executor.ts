@@ -82,7 +82,7 @@ export class GuardedExecutor {
 
   private async settle(hash: Hex, snapshot: PortfolioSnapshot, decisionId: string, request: ExecutionRequest): Promise<void> {
     try {
-      const receipt = await this.chain.primary.waitForTransactionReceipt({ hash, confirmations: 1, timeout: 120_000 });
+      const receipt = await this.chain.waitReceipt({ hash, confirmations: 1, timeout: 120_000 });
       if (receipt.status === "success" && request.position) {
         if (!snapshot.walletAddress) throw new Error("position settlement lacks the bound wallet address");
         await this.positions.captureSuccessfulExecution(request, snapshot.walletAddress as Address);

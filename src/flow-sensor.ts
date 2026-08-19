@@ -1,4 +1,3 @@
-import { parseAbi, parseAbiItem, type Address } from "viem";
 import type { Logger } from "pino";
 import type { BerachainClients } from "./chain.js";
 import type { Config } from "./config.js";
@@ -16,15 +15,6 @@ import type { Database } from "./db.js";
  * It writes a digest each cycle; Scarlet's briefing turns it into theses. This is the
  * "study others' transactions / read the charts" capability, within what's actually possible.
  */
-const SWAP_EVENT = parseAbiItem("event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)");
-const POOL_META = parseAbi([
-  "function token0() view returns (address)",
-  "function token1() view returns (address)",
-  "function fee() view returns (uint24)"
-]);
-const SYM = parseAbi(["function symbol() view returns (string)"]);
-const WINDOW = 90n; // Monad eth_getLogs cap is 100 blocks
-
 type PoolRow = { name: string; pool: string; dex: string; baseId: string; baseSym: string; priceUsd: number; vol: number; liq: number; chg: number };
 
 /** Flatten a GeckoTerminal /pools page into typed rows (base token identity + venue + price). */
@@ -59,19 +49,15 @@ function crossVenueSpreads(rows: PoolRow[]): Array<{ token: string; spreadPct: n
   return out.sort((a, b) => b.spreadPct - a.spreadPct).slice(0, 10);
 }
 
-type Swap = { pool: string; wallet: string; block: bigint; absAmount0: bigint; absAmount1: bigint };
-type PoolStat = { swaps: number; wallets: Set<string>; lastBlock: bigint; maxAbs0: bigint; maxAbs1: bigint };
-type WalletStat = { swaps: number; pools: Set<string>; lastBlock: bigint };
+type FlowRow = { block: number; pool: string; wallet: string | null; valueUsd: number };
+type PoolStat = { swaps: number; wallets: Set<string>; lastBlock: number; volUsd: number };
+type WalletStat = { swaps: number; pools: Set<string>; lastBlock: number; volUsd: number };
 
 export class FlowSensor {
   private timer?: NodeJS.Timeout;
-  private cursor?: bigint;
   private running = false;
   private scans = 0;
   private venueFlow: { topByVolume: unknown[]; trending: unknown[]; venues: unknown[]; crossVenueArb: unknown[] } = { topByVolume: [], trending: [], venues: [], crossVenueArb: [] };
-  private readonly recent: Swap[] = [];               // rolling raw swaps (trimmed by block age)
-  private readonly poolMeta = new Map<string, { label: string; token0: string; token1: string }>();
-  private readonly retainBlocks = 900n;               // ~5 min of flow at ~3 blocks/s
 
   constructor(private readonly config: Config, private readonly chain: BerachainClients, private readonly db: Database, private readonly logger: Logger) {}
 
@@ -107,75 +93,58 @@ export class FlowSensor {
     this.running = true;
     try {
       if (this.scans++ % 5 === 0) await this.pullGeckoVolume(); // venue-agnostic volume, gently (stagger vs graduation sensor)
-      // Isolate flow reads on the SECONDARY RPC so this never starves the execution path.
-      const rpc = this.chain.secondary ?? this.chain.primary;
-      const head = await rpc.getBlockNumber();
-      if (this.cursor === undefined) { this.cursor = head > 45n ? head - 45n : head; }
-      // Never backfill a large gap (would blow the getLogs size + rate limits): sample the
-      // most recent ≤45-block window and skip ahead if we've fallen behind.
-      let from = this.cursor + 1n;
-      if (head - from > 60n) from = head - 45n;
-      const to = from + WINDOW > head ? head : from + WINDOW;
-      if (from > to) return;
-      const logs = await rpc.getLogs({ event: SWAP_EVENT, fromBlock: from, toBlock: to }).catch((e) => { this.logger.debug({ err: e }, "flow getLogs failed"); return []; });
-      for (const log of logs) {
-        const a = log.args as { recipient?: Address; amount0?: bigint; amount1?: bigint };
-        if (!log.address || a.amount0 === undefined || a.amount1 === undefined) continue;
-        this.recent.push({ pool: log.address.toLowerCase(), wallet: (a.recipient ?? "0x").toLowerCase(), block: log.blockNumber ?? to, absAmount0: a.amount0 < 0n ? -a.amount0 : a.amount0, absAmount1: a.amount1 < 0n ? -a.amount1 : a.amount1 });
-      }
-      this.cursor = to;
-      // Trim the rolling window to the retention horizon.
-      const floor = head > this.retainBlocks ? head - this.retainBlocks : 0n;
-      let i = 0; while (i < this.recent.length && this.recent[i].block < floor) i++;
-      if (i > 0) this.recent.splice(0, i);
-      await this.persistDigest(head);
+      // DB-FIRST (db-first convergence): the block-indexer records every priced swap's wallet + USD into
+      // recent_swaps (a rolling window). Read that window from the DB and aggregate — no own getLogs, no RPC.
+      const head = await this.db.getIndexerCursor(this.config.CHAIN_ID).catch(() => null);
+      if (head == null) return;
+      const since = Math.max(0, head - this.config.INDEXER_FLOW_RETAIN_BLOCKS);
+      const rows = await this.db.recentSwaps(this.config.CHAIN_ID, since).catch(() => [] as FlowRow[]);
+      await this.persistDigest(head, rows);
     } finally {
       this.running = false;
     }
   }
 
-  private async persistDigest(head: bigint): Promise<void> {
-    if (!this.recent.length) { await this.db.saveMarketSnapshot("flow", "recent", { observedAt: new Date().toISOString(), head: head.toString(), note: "On-chain V3 swap tail is quiet this window — the real volume is venue-agnostic below (topByVolume). Hunt there.", hotPools: [], activeWallets: [], bigSwaps: [], topByVolume: this.venueFlow.topByVolume, trending: this.venueFlow.trending, allVenues: this.venueFlow.venues, crossVenueArb: this.venueFlow.crossVenueArb }).catch(() => undefined); return; }
+  private async persistDigest(head: number, rows: FlowRow[]): Promise<void> {
+    if (!rows.length) { await this.db.saveMarketSnapshot("flow", "recent", { observedAt: new Date().toISOString(), head: String(head), note: "On-chain swap tail is quiet this window — the real volume is venue-agnostic below (topByVolume). Hunt there.", hotPools: [], activeWallets: [], bigSwaps: [], topByVolume: this.venueFlow.topByVolume, trending: this.venueFlow.trending, allVenues: this.venueFlow.venues, crossVenueArb: this.venueFlow.crossVenueArb }).catch(() => undefined); return; }
     const pools = new Map<string, PoolStat>();
     const wallets = new Map<string, WalletStat>();
-    for (const s of this.recent) {
-      const ps = pools.get(s.pool) ?? { swaps: 0, wallets: new Set(), lastBlock: 0n, maxAbs0: 0n, maxAbs1: 0n };
-      ps.swaps++; ps.wallets.add(s.wallet); if (s.block > ps.lastBlock) ps.lastBlock = s.block; if (s.absAmount0 > ps.maxAbs0) ps.maxAbs0 = s.absAmount0; if (s.absAmount1 > ps.maxAbs1) ps.maxAbs1 = s.absAmount1;
+    for (const s of rows) {
+      const ps = pools.get(s.pool) ?? { swaps: 0, wallets: new Set(), lastBlock: 0, volUsd: 0 };
+      ps.swaps++; if (s.wallet) ps.wallets.add(s.wallet); if (s.block > ps.lastBlock) ps.lastBlock = s.block; ps.volUsd += s.valueUsd;
       pools.set(s.pool, ps);
-      if (s.wallet && s.wallet !== "0x") { const ws = wallets.get(s.wallet) ?? { swaps: 0, pools: new Set(), lastBlock: 0n }; ws.swaps++; ws.pools.add(s.pool); if (s.block > ws.lastBlock) ws.lastBlock = s.block; wallets.set(s.wallet, ws); }
+      if (s.wallet) { const ws = wallets.get(s.wallet) ?? { swaps: 0, pools: new Set(), lastBlock: 0, volUsd: 0 }; ws.swaps++; ws.pools.add(s.pool); if (s.block > ws.lastBlock) ws.lastBlock = s.block; ws.volUsd += s.valueUsd; wallets.set(s.wallet, ws); }
     }
     const topPools = [...pools.entries()].sort((a, b) => b[1].swaps - a[1].swaps).slice(0, 12);
-    await this.enrich(topPools.slice(0, 6).map(([p]) => p));
-    const hotPools = topPools.map(([pool, st]) => ({ pool, label: this.poolMeta.get(pool)?.label ?? pool.slice(0, 10), swaps: st.swaps, uniqueTraders: st.wallets.size, lastBlock: st.lastBlock.toString() }));
-    const activeWallets = [...wallets.entries()].sort((a, b) => b[1].swaps - a[1].swaps).slice(0, 10).map(([wallet, st]) => ({ wallet, swaps: st.swaps, poolsTraded: st.pools.size, lastBlock: st.lastBlock.toString() }));
-    // Biggest single swaps (by the larger of the two leg magnitudes, raw) — whale moves.
-    const bigSwaps = [...this.recent].sort((a, b) => Number((b.absAmount0 > b.absAmount1 ? b.absAmount0 : b.absAmount1) - (a.absAmount0 > a.absAmount1 ? a.absAmount0 : a.absAmount1))).slice(0, 8)
-      .map((s) => ({ pool: s.pool, label: this.poolMeta.get(s.pool)?.label ?? s.pool.slice(0, 10), wallet: s.wallet, block: s.block.toString() }));
+    const labels = await this.labels(topPools.map(([p]) => p));
+    const hotPools = topPools.map(([pool, st]) => ({ pool, label: labels.get(pool) ?? pool.slice(0, 10), swaps: st.swaps, uniqueTraders: st.wallets.size, volUsd: Math.round(st.volUsd), lastBlock: String(st.lastBlock) }));
+    const activeWallets = [...wallets.entries()].sort((a, b) => b[1].swaps - a[1].swaps).slice(0, 10).map(([wallet, st]) => ({ wallet, swaps: st.swaps, poolsTraded: st.pools.size, volUsd: Math.round(st.volUsd), lastBlock: String(st.lastBlock) }));
+    // Biggest single swaps by USD value — whale moves.
+    const big = [...rows].sort((a, b) => b.valueUsd - a.valueUsd).slice(0, 8);
+    const bigLabels = await this.labels(big.map((s) => s.pool));
+    const bigSwaps = big.map((s) => ({ pool: s.pool, label: bigLabels.get(s.pool) ?? s.pool.slice(0, 10), wallet: s.wallet, valueUsd: Math.round(s.valueUsd), block: String(s.block) }));
     await this.db.saveMarketSnapshot("flow", "recent", {
-      observedAt: new Date().toISOString(), head: head.toString(), windowSwaps: this.recent.length, windowBlocks: Number(this.retainBlocks),
-      note: "Flow. topByVolume/trending = venue-agnostic (GeckoTerminal, ALL DEXs incl. orderbooks) — where the real $ moves; hunt momentum/arb there. hotPools/activeWallets/bigSwaps = on-chain V3 detail (one block late) for wallet-level smart-money to study/follow. Confirm any thesis by reading the pool + simulating.",
+      observedAt: new Date().toISOString(), head: String(head), windowSwaps: rows.length, windowBlocks: this.config.INDEXER_FLOW_RETAIN_BLOCKS,
+      note: "Flow. topByVolume/trending = venue-agnostic (GeckoTerminal, ALL DEXs incl. orderbooks) — where the real $ moves; hunt momentum/arb there. hotPools/activeWallets/bigSwaps = on-chain detail (from the indexer) for wallet-level smart-money to study/follow. Confirm any thesis by reading the pool + simulating.",
       topByVolume: this.venueFlow.topByVolume, trending: this.venueFlow.trending, allVenues: this.venueFlow.venues, crossVenueArb: this.venueFlow.crossVenueArb, hotPools, activeWallets, bigSwaps
     }).catch(() => undefined);
-    this.logger.info({ windowSwaps: this.recent.length, hotPools: hotPools.length, activeWallets: activeWallets.length }, "flow digest saved");
+    this.logger.info({ windowSwaps: rows.length, hotPools: hotPools.length, activeWallets: activeWallets.length, source: "db" }, "flow digest saved");
   }
 
-  /** Lazily resolve + cache a pool's token pair label so the digest is human-readable. */
-  private async enrich(poolAddrs: string[]): Promise<void> {
-    for (const pool of poolAddrs) {
-      if (this.poolMeta.has(pool)) continue;
-      const rpc = this.chain.secondary ?? this.chain.primary;
-      try {
-        const [t0, t1] = await Promise.all([
-          rpc.readContract({ address: pool as Address, abi: POOL_META, functionName: "token0" }).catch(() => undefined) as Promise<Address | undefined>,
-          rpc.readContract({ address: pool as Address, abi: POOL_META, functionName: "token1" }).catch(() => undefined) as Promise<Address | undefined>
-        ]);
-        if (!t0 || !t1) { this.poolMeta.set(pool, { label: pool.slice(0, 10), token0: "", token1: "" }); continue; }
-        const [s0, s1] = await Promise.all([
-          rpc.readContract({ address: t0, abi: SYM, functionName: "symbol" }).catch(() => "?") as Promise<string>,
-          rpc.readContract({ address: t1, abi: SYM, functionName: "symbol" }).catch(() => "?") as Promise<string>
-        ]);
-        this.poolMeta.set(pool, { label: `${s0}/${s1}`, token0: t0.toLowerCase(), token1: t1.toLowerCase() });
-      } catch { this.poolMeta.set(pool, { label: pool.slice(0, 10), token0: "", token1: "" }); }
+  /** Human-readable pool labels (sym0/sym1) FROM THE DB registry — entities topology + token metadata. */
+  private async labels(poolAddrs: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    const uniq = [...new Set(poolAddrs.map((p) => p.toLowerCase()))];
+    if (!uniq.length) return out;
+    const info = await this.db.poolInfoBatch(this.config.CHAIN_ID, uniq).catch(() => new Map());
+    const toks = new Set<string>();
+    for (const i of info.values()) { if (i.token0) toks.add(i.token0.toLowerCase()); if (i.token1) toks.add(i.token1.toLowerCase()); }
+    const meta = await this.db.tokenMeta(this.config.CHAIN_ID, [...toks]).catch(() => new Map());
+    for (const p of uniq) {
+      const i = info.get(p);
+      if (!i?.token0 || !i.token1) { out.set(p, p.slice(0, 10)); continue; }
+      out.set(p, `${meta.get(i.token0.toLowerCase())?.symbol ?? "?"}/${meta.get(i.token1.toLowerCase())?.symbol ?? "?"}`);
     }
+    return out;
   }
 }

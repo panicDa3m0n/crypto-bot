@@ -38,6 +38,7 @@ export class PriceOracle {
   private readonly resLatest = new Map<string, { val: { r0: bigint; r1: bigint } | null; at: number }>(); // pool → latest reserves (short TTL)
   private readonly LATEST_TTL_MS = 4_000; // ~2 Base blocks: within a classify burst the same pool is read once, not N times
   private readonly usdCache = new Map<string, { usd: number; at: number }>(); // token → usd (short TTL)
+  private headBlockCache = { block: 0, at: 0 }; // indexer cursor, cached ~2s → block-based staleness w/o a read per quote
   constructor(private readonly config: Config, private readonly chain: BerachainClients, private readonly db: Database, private readonly logger: Logger) {
     // Pre-seed authoritative decimals from the network profile (USDC=6, cbBTC=8, WETH=18…). These
     // never depend on a flaky RPC read — decisive for the USD conversion of loan-token proceeds.
@@ -102,6 +103,16 @@ export class PriceOracle {
     return val;
   }
 
+  /** How many blocks behind head this pool_state is — the block-based freshness unit. Head = the indexer
+   * cursor from the DB, cached ~2s so quoting never pays a read per pool. 0 when the head is unknown. */
+  private async blocksBehind(stateBlock: number): Promise<number> {
+    if (Date.now() - this.headBlockCache.at > 2_000) {
+      const h = await this.db.getIndexerCursor(this.config.CHAIN_ID).catch(() => this.headBlockCache.block);
+      this.headBlockCache = { block: h ?? this.headBlockCache.block, at: Date.now() };
+    }
+    return this.headBlockCache.block > 0 && stateBlock > 0 ? Math.max(0, this.headBlockCache.block - stateBlock) : 0;
+  }
+
   private async readReserves(pool: PoolRef, atBlock?: bigint): Promise<{ r0: bigint; r1: bigint } | null> {
     const address = pool.address as Address;
     // SINGLE SOURCE OF TRUTH: the block-indexer persists latest pool state (V2 reserves / V3
@@ -113,6 +124,11 @@ export class PriceOracle {
     if (atBlock == null && pool.archetype !== "solidly") {
       const st = (await this.db.poolStateBatch(this.config.CHAIN_ID, [address.toLowerCase()]).catch(() => null))?.get(address.toLowerCase());
       if (st) {
+        // FRESHNESS: we serve this quote from a LOCAL MIRROR — flag when it's stale so a served-from-old-
+        // state quote is never silent. Block-based (head − state block vs ROUTE_MAX_BLOCKS_BEHIND), the
+        // system's real freshness unit; the head is the indexer cursor, cached ~2s (no read per quote).
+        const behind = await this.blocksBehind(st.block);
+        if (behind > this.config.ROUTE_MAX_BLOCKS_BEHIND) this.logger.debug({ pool: address.toLowerCase(), block: st.block, blocksBehind: behind }, "pool_state stale on read (served from mirror)");
         if (st.sqrtPrice && st.sqrtPrice > 0n && st.liquidity && st.liquidity > 0n) return { r0: (st.liquidity * Q96) / st.sqrtPrice, r1: (st.liquidity * st.sqrtPrice) / Q96 };
         if (st.r0 != null && st.r1 != null && st.r0 > 0n && st.r1 > 0n) return { r0: st.r0, r1: st.r1 };
       }

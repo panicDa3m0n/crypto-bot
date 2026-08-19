@@ -33,6 +33,7 @@ import { EntityResolver } from "./entity-resolver.js";
 import { FollowService } from "./follow-service.js";
 import { PositionManager } from "./position-manager.js";
 import { Aggregator } from "./aggregator.js";
+import { LocalRouter } from "./router/router.js";
 import { Blockscout } from "./blockscout.js";
 import { DisplayPrices } from "./display-prices.js";
 import { ArbEngine } from "./arb-engine.js";
@@ -83,8 +84,10 @@ const whaleIntel = new WhaleIntel(config, chain, db, etherscan, blockscout, logg
 const graduationSensor = new GraduationSensor(config, chain, db, logger);
 const classifier = new AddressClassifier(chain, logger);
 const chainScanner = new ChainScanner(config, chain, db, classifier, logger);
-const registryEnricher = new RegistryEnricher(config, db, etherscan, blockscout, logger);
-const aggregator = new Aggregator(config, logger);
+// LocalRouter IS an Aggregator (drop-in): quotes come from our local AMM mirror (kills the quote
+// firehose / 400-429 storm); the external aggregator remains the fallback for venues we don't index
+// and still builds execution calldata in Phase 2. Every consumer keeps its `Aggregator` type.
+const aggregator = new LocalRouter(config, logger, db, chain);
 const oracle = new PriceOracle(config, chain, db, logger);
 chain.setOracle(oracle); // align system-wide tokenPrice to our on-chain oracle (API is the fallback)
 const monadSignals = new MonadSignals(config, chain, db, aggregator, logger);
@@ -92,14 +95,17 @@ const perception = new Perception(sensorium, db, chain, monadSignals, positions,
 const primitives = new Primitives(config, chain, db, executor, positions, wberaAdapter, allowanceAdapter, logger, aggregator);
 const chronicle = new Chronicle(config, db, logger);
 const marketData = new MarketData(config);
-const resolver = new EntityResolver(config, chain, logger);
+const resolver = new EntityResolver(config, chain, db, logger);
 const scarlet = new Scarlet(config, chain, db, health, positions, perception, primitives, venues, etherscan, chronicle, marketData, resolver, monadSignals, logger);
 // Rebuild (Gradino 1): the clean trading core. Constructed always; only DRIVES when SCARLET_V2_ENABLED.
 const llm = new Llm(config, logger);
 // The v2 core runs on its OWN chronology stream — detached from the legacy agent's diary (same
 // compaction machinery, fresh history). The legacy 'main' journal/summary is not inherited.
 const chronicleV2 = new Chronicle(config, db, logger, SCARLET_STREAM);
-const scarletV2 = new ScarletAgent(config, chain, db, health, positions, chronicleV2, llm, marketData, primitives, blockscout, logger);
+// THE STARTING POINT: derive prices/pools/tokens from every block → DB. Constructed here (before its
+// consumers) so Scarlet + the position manager can read its `synced` gate (wait while it realigns).
+const blockIndexer = new BlockIndexer(config, chain, db, logger);
+const scarletV2 = new ScarletAgent(config, chain, db, health, positions, chronicleV2, llm, marketData, primitives, blockscout, logger, () => blockIndexer.synced);
 // The agent actually in charge this run — v2 when flagged, else the legacy Scarlet.
 const activeAgent = config.SCARLET_V2_ENABLED ? scarletV2 : scarlet;
 
@@ -126,12 +132,20 @@ const autoflash = new AutoflashService(db, primitives, logger, wake, config.CHAI
 const autoArm = new AutoArmReconciler(config, chain, db, monadSignals, primitives, aggregator, logger);
 const liquidationMonitor = new LiquidationMonitor(config, chain, db, primitives, aggregator, logger, wake);
 const followService = new FollowService(config, chain, db, logger, wake);
-const positionManager = new PositionManager(config, chain, db, primitives, logger, agentWake);
+const positionManager = new PositionManager(config, chain, db, primitives, logger, agentWake, () => blockIndexer.synced);
 const arbEngine = new ArbEngine(config, chain, db, oracle, logger, wake);
 const positionRegistry = new PositionRegistry(config, chain, db, oracle, aggregator, blockscout, logger, wake);
 const walletHoldings = new WalletHoldings(config, chain, db, logger);
+// Event-driven wallet (Canale wallet): the indexer detects our Transfers in the block stream → WalletHoldings
+// re-reads just those balances from chain. Keeps the wallet aligned within one block, on the reliable lane.
+blockIndexer.onWalletTransfer = (tokens) => void walletHoldings.onWalletTransfer(tokens);
 const displayPrices = new DisplayPrices(config, db, aggregator, logger);
-const blockIndexer = new BlockIndexer(config, chain, db, logger);
+// The enrichment worker lives WITH the indexer (same process): the indexer writes bare entities, the worker
+// drains them on the dedicated enrichment RPC and backfills price via the indexer's repriceFromState.
+const registryEnricher = new RegistryEnricher(config, chain, db, etherscan, blockscout, logger, (tokens) => blockIndexer.repriceFromState(tokens).then(() => undefined));
+// PUSH: when a block discovers a new/incomplete entity, nudge the enricher to drain the buffer immediately
+// (no per-block full-DB scan — the buffer is the index-backed pending subset). See db-first convergence.
+blockIndexer.onDiscovery = () => registryEnricher.nudge();
 
 let scarletHeartbeat: NodeJS.Timeout | undefined;
 let scarletStopped = false;
@@ -153,27 +167,41 @@ async function main() {
     if (config.WHALE_INTEL_ENABLED) whaleIntel.start();
     if (config.GRAD_ENABLED) graduationSensor.start();
     if (config.SCANNER_ENABLED) chainScanner.start();
-    if (config.ENRICH_ENABLED) registryEnricher.start();
+    else logger.warn("ChainScanner RETIRED by config (SCANNER_ENABLED=false): discovery is the block-indexer's job now — it writes the same dex/pool/token entities from every block. Set SCANNER_ENABLED=true only to A/B.");
   }
   if (config.SERVICE_ROLE !== "observer") {
     reconciler.start();
     blockIndexer.start(); // THE STARTING POINT: derive prices/pools/tokens from every block → DB (everything reads the DB)
+    if (config.ENRICH_ENABLED) registryEnricher.start(); // enrichment worker — co-located with the indexer (drains its bare-entity queue)
     walletHoldings.start(); // keyless direct-from-chain wallet token holdings for the dashboard
     displayPrices.start(); // Lane A: batch-refresh indicative token prices into DB (dashboard reads cache, never APIs)
     dashboard = startDashboard({ config, db, chain, positions, logger, primitives, aggregator });
-    if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED) autoflash.start();
-    if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED && config.AUTOARM_ENABLED) autoArm.start();
-    // On-chain HF monitor: watches ALL near-threshold positions (no cap), fires fresh at the cross.
-    if (config.EXECUTION_ENABLED && config.LIQ_MONITOR_ENABLED) liquidationMonitor.start();
-    // Managed intents: the system tracks the smart-money Scarlet follows and executes her
-    // programmed positions (SL/TP/partials) so she never misses an entry or exit.
-    if (config.SCARLET_AGENT_ENABLED) followService.start();
-    if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED) positionManager.start();
-    // Arb engine: the system hunts cross-venue/triangular cycles across the whole network and
-    // verifies each at real size via the aggregator before surfacing it (no false positives).
-    if (config.SCARLET_AGENT_ENABLED && config.ARB_ENABLED) arbEngine.start();
-    // The liquidation system needs the atomic organ (Morpho 0-fee flash-loan executor) to fire.
-    // Deploy it ONCE (db-persisted) so the flash-kill path is live, not a dead branch.
+    // GATE (db-first convergence): acting services operate ONLY on FRESH, COMPLETE data — wait for the
+    // indexer at head AND the enrichment RESYNC set drained (every entity discovered up to head enriched
+    // or terminally-failed). The always-on DB writers (indexer/enrichment/dashboard/walletHoldings/
+    // displayPrices) keep running during the wait. Same gate for a cold-start or a resync; resolves fast
+    // when already at head with nothing outstanding. Extends the old "Scarlet-only" gate to EVERY service
+    // that acts (liquidations included), so none acts on partial data during catch-up.
+    const waitResyncDrained = async (): Promise<void> => {
+      if (!config.ENRICH_ENABLED) { logger.warn("enrichment disabled — skipping resync-drain gate"); return; }
+      const deadline = config.ENRICH_RESYNC_MAX_WAIT_MS > 0 ? Date.now() + config.ENRICH_RESYNC_MAX_WAIT_MS : Infinity;
+      let last = -1;
+      for (;;) {
+        const n = await db.countResyncOutstanding(config.CHAIN_ID).catch(() => 0);
+        if (n === 0) { if (last > 0) logger.info("enrichment resync drained — gate open"); return; }
+        if (n !== last) { logger.info({ outstanding: n }, "waiting for enrichment resync to drain…"); last = n; }
+        registryEnricher.nudge();
+        if (Date.now() >= deadline) { logger.warn({ outstanding: n }, "resync-drain gate TIMED OUT — proceeding anyway (investigate stuck enrichment)"); return; }
+        await new Promise<void>((r) => setTimeout(r, 1000));
+      }
+    };
+    logger.info("waiting for indexer head + enrichment resync before starting acting services…");
+    await blockIndexer.ready;
+    await waitResyncDrained();
+    logger.info("system fresh (indexer at head, resync drained) — starting acting services");
+    await (aggregator as { reportVenueCoverage?: () => Promise<void> }).reportVenueCoverage?.().catch(() => undefined); // worklist: which active DEXes we can/can't own-execute
+    // The liquidation system needs the atomic organ (Morpho 0-fee flash-loan executor) to fire. Deploy it
+    // ONCE (db-persisted) BEFORE the services that use it, so the flash-kill path is live, not a dead branch.
     if (config.EXECUTION_ENABLED && config.LIQ_REGISTRY_ENABLED) {
       const organ = await db.getOrgan("atomic-executor").catch(() => undefined);
       if (!organ) {
@@ -181,6 +209,15 @@ async function main() {
         logger.warn({ result: r }, "atomic organ auto-deploy");
       } else { logger.info({ organ: organ.address }, "atomic organ present"); }
     }
+    // Liquidation engines — act on OTHERS' positions from the fresh DB + on-chain HF (need the organ above).
+    if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED) autoflash.start();
+    if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED && config.AUTOARM_ENABLED) autoArm.start();
+    // On-chain HF monitor: watches ALL near-threshold positions (no cap), fires fresh at the cross.
+    if (config.EXECUTION_ENABLED && config.LIQ_MONITOR_ENABLED) liquidationMonitor.start();
+    // Scarlet's managed intents (smart-money follows + programmed SL/TP/partials) + trading + arb + registry.
+    if (config.SCARLET_AGENT_ENABLED) followService.start();
+    if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED) positionManager.start();
+    if (config.SCARLET_AGENT_ENABLED && config.ARB_ENABLED) arbEngine.start();
     if (config.SCARLET_AGENT_ENABLED && config.LIQ_REGISTRY_ENABLED) positionRegistry.start();
     if (config.SCARLET_AGENT_ENABLED) {
       // Continuous operation: each cycle re-schedules the next a short gap AFTER it finishes.
@@ -190,6 +227,11 @@ async function main() {
         if (!scarletStopped) scarletHeartbeat = setTimeout(loop, activeAgent.nextGapMs);
       };
       scarletHeartbeat = setTimeout(() => void loop(), 10_000);
+    } else {
+      // DISABLED-BY-CONFIG log (pattern to extend everywhere): when a subsystem is intentionally off,
+      // say so LOUDLY once, so a forgotten flag doesn't look like a silent failure. Only the AGENT is
+      // stopped — indexer/enrichment/dashboard/walletHoldings keep running (no need to kill the container).
+      logger.warn("Scarlet AGENT DISABLED by config (SCARLET_AGENT_ENABLED=false): trading loop, position-manager, follow, arb and registry NOT started. Indexer/enrichment/dashboard still run. Set SCARLET_AGENT_ENABLED=true to re-enable.");
     }
   }
   logger.info({ role: config.SERVICE_ROLE, chain: config.CHAIN_NAME, executionEnabled: config.EXECUTION_ENABLED, agent: config.SCARLET_V2_ENABLED ? "v2 (rebuild core)" : "legacy", llmAvailable: activeAgent.available, walletConfigured: Boolean(config.WALLET_ADDRESS) }, "Scarlet service started");

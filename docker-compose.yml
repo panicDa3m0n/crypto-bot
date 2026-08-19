@@ -30,6 +30,8 @@ services:
       SERVICE_ROLE: observer
       EXECUTION_ENABLED: "false"
       SCANNER_ENABLED: "false" # redundant: the block-indexer discovers pools/tokens/dex from the block stream
+    volumes:
+      - ./logs:/app/logs # unified rotating log file (system-observer.log) persists on the host
     depends_on:
       postgres:
         condition: service_healthy
@@ -44,6 +46,8 @@ services:
         required: false
     environment:
       SERVICE_ROLE: brain
+    volumes:
+      - ./logs:/app/logs # unified rotating log file (system-brain.log) persists on the host — THE observability log
     depends_on:
       postgres:
         condition: service_healthy

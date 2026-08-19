@@ -8,6 +8,16 @@ const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   SERVICE_ROLE: z.enum(["all", "observer", "brain"]).default("all"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
+  // UNIFIED OBSERVABILITY FILE — every subsystem's log (they all share one pino logger) is ALSO written to a
+  // single timestamped, ROTATING file on a mounted volume, so we can review "everything that happened" across
+  // restarts without gaps. Rotation keeps it from growing forever (a ~12h window is enough to spot bugs) and
+  // is fully settable to widen for longer test runs.
+  LOG_FILE_ENABLED: bool.default(true),
+  LOG_DIR: z.string().default("logs"),                          // mounted host dir (persists across restarts)
+  LOG_FILE_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("debug"), // file catches MORE detail than stdout
+  LOG_ROTATE_INTERVAL: z.string().default("12h"),               // rotate on this cadence (e.g. '12h', '1d', '6h')
+  LOG_RETENTION_FILES: z.coerce.number().int().min(1).max(200).default(4), // keep this many rotated files (retention)
+  LOG_MAX_SIZE: z.string().default("100M"),                     // also rotate if a single file exceeds this size
   DATABASE_URL: z.string().url(),
   REDIS_URL: z.string().url(),
   PRIMARY_RPC_HTTP_URL: z.string().url(),
@@ -22,6 +32,25 @@ const schema = z.object({
   // liquidations, arb) so it stays free + fresh when we need to fire — never contended by the
   // read firehose. Point it at a dedicated (ideally paid) endpoint; defaults to the fallback RPC.
   EXECUTION_RPC_HTTP_URL: z.string().url().optional(),
+  // DEDICATED INDEXER LANE. The block-indexer does 1 getLogs/block + a burst of metadata reads on
+  // discovery; a rate-limit here loses a block and unbalances the whole system, so it gets its OWN RPC,
+  // used ONLY by the indexer — full-ingestion (eth_getBlockReceipts real-time) AND sync (eth_getLogs).
+  // ── RPC LANE ASSIGNMENT (measured 2026-08-18; see memory `rpc-lane-assignment`). Chosen by tool need +
+  // burst + timing, one RPC per tool, each with a capable fallback. base.org BLOCKS getBlockReceipts (403),
+  // so the indexer runs on drpc (52ms, receipts+getLogs; fallback publicnode/nodies → degrade to getLogs).
+  // Key timing: the indexer's sync burst (~50/s, 8→6 concurrency) happens ONLY while Scarlet is GATED, so it
+  // never coincides with Scarlet's tools. Execution → publicnode (MEV-protected send). General reads →
+  // base.org. PriceOracle precision + enrichment → nodies. Secondary/fallbacks → 1rpc/blastapi.
+  INDEXER_RPC_HTTP_URL: z.string().url().default("https://base.drpc.org"),
+  // DEDICATED ENRICHMENT LANE. Enrichment (token decimals/symbol/name + pool token0/1/fee) is BURSTY —
+  // a first-run/catch-up can queue thousands of reads — so it gets its OWN endpoint, isolated from the
+  // indexer's per-block critical path. When this RPC throttles, the enrichment queue simply waits (the
+  // indexer never blocks). Configurable so we can swap it in one env change.
+  ENRICHMENT_RPC_HTTP_URL: z.string().url().default("https://base-pokt.nodies.app"),
+  // Scarlet's TOOL reads (honeypot probe, balanceOf/allowance for the final pre-trade checks). Low-volume
+  // + bursty-in-short-windows; ALIGNED with the indexer lane by default (they don't collide at steady
+  // state), but overridable to split them if needed. Purpose→endpoint is logged at startup ("RPC lanes").
+  TOOLS_RPC_HTTP_URL: z.string().url().optional(),
   // Chain selector: CHAIN_ID picks the networks/<CHAIN_ID>.json profile that fills every
   // chain-specific field below (RPC, addresses, explorer, DEXes, tokens, infra). Flip it to migrate.
   CHAIN_ID: z.coerce.number().int().positive().default(8453),
@@ -49,6 +78,22 @@ const schema = z.object({
   DEX_FACTORY: z.string().regex(/^0x[a-fA-F0-9]{40}$/).default("0x204faca1764b154221e35c0d20abb3c525710498"),
   DEX_QUOTER: z.string().regex(/^0x[a-fA-F0-9]{40}$/).default("0x661e93cca42afacb172121ef892830ca3b70f08d"),
   DEX_ROUTER: z.string().regex(/^0x[a-fA-F0-9]{40}$/).default("0xfe31f71c1b106eac32f1a19239c9a9a72ddfb900"),
+  // OWN EXECUTION (Phase 3): when true, swaps are built + broadcast from OUR local route via the venue's
+  // router (Uniswap V3 SwapRouter02 / Aerodrome / Uniswap V2), not the external aggregator's calldata —
+  // the aggregator stays the FALLBACK (tried only if our build/preflight fails BEFORE broadcast), and that
+  // fallback is LOGGED as an anomaly to diagnose, not an accepted outcome. Default ON (db-first convergence:
+  // we execute, not KyberSwap). The preflight eth_call is the safety boundary: a mis-encode reverts in
+  // simulation and falls back, never sends. Flip false only to force the aggregator path for A/B.
+  LOCAL_EXECUTION_ENABLED: bool.default(true),
+  // Venue routers for own execution (Base defaults; overridden from the network profile's dexes).
+  AERODROME_ROUTER: z.string().regex(/^0x[a-fA-F0-9]{40}$/).default("0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"),
+  AERODROME_POOL_FACTORY: z.string().regex(/^0x[a-fA-F0-9]{40}$/).default("0x420DD381b31aEf6683db6B902084cB0FFECe40Da"),
+  UNIV2_ROUTER: z.string().regex(/^0x[a-fA-F0-9]{40}$/).default("0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24"),
+  UNIV2_FACTORY: z.string().regex(/^0x[a-fA-F0-9]{40}$/).default("0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6"),
+  // Aerodrome SlipStream (Base CL): V3-style pricing but the router keys pools by int24 tickSpacing (not
+  // fee) + takes a deadline. Its own encoder covers the top own-execution gap (SlipStream's fresh pools).
+  SLIPSTREAM_POOL_FACTORY: z.string().regex(/^0x[a-fA-F0-9]{40}$/).default("0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"),
+  SLIPSTREAM_ROUTER: z.string().regex(/^0x[a-fA-F0-9]{40}$/).default("0xbe6d8f0d05cc4be24d5167a3ef062215be6d18a5"),
   // Etherscan V2 unified API: one key, every EVM chain (chainid selects it). Powers
   // verified-ABI resolution and the anti-scam gate. Read-only, rate-limited, free.
   ETHERSCAN_API_KEY: z.string().min(1).optional(),
@@ -112,7 +157,11 @@ const schema = z.object({
   // Chain scanner: builds the system's OWN address universe (tokens/pools/dexes) by ingesting
   // block-window event logs and classifying emitters mechanically — no curated list. Windowed
   // with a per-tick probe budget to respect public-RPC limits.
-  SCANNER_ENABLED: bool.default(true), // bool (not z.coerce.boolean, which reads "false" as truthy)
+  // RETIRED (db-first convergence): the block-indexer now discovers the SAME dex/pool/token entities from
+  // every block (PoolCreated/PairCreated + bare-pool-on-swap), so the scanner's own getLogs discovery is
+  // pure duplication — no consumer reads scanner-specific output (all read `entities`). Default OFF; the
+  // observer logs it disabled. Flip true only to A/B against the indexer's discovery.
+  SCANNER_ENABLED: bool.default(false), // bool (not z.coerce.boolean, which reads "false" as truthy)
   SCANNER_INTERVAL_MS: z.coerce.number().int().min(10_000).default(30_000),
   // Public RPCs cap eth_getLogs range (blastapi Base = 10 blocks), so the window is CHUNKED:
   // RANGE_BLOCKS per getLogs call, up to MAX_CHUNKS calls per tick, advancing the cursor only
@@ -126,6 +175,14 @@ const schema = z.object({
   ENRICH_ENABLED: bool.default(true),
   ENRICH_INTERVAL_MS: z.coerce.number().int().min(10_000).default(30_000),
   ENRICH_BATCH: z.coerce.number().int().min(1).max(50).default(12),
+  // Inter-read spacing (ms) for the enrichment worker — paces sustained reads UNDER free-tier RPC limits
+  // (a tight burst gets 429'd). Lower it when the enrichment lane is a keyed/paid endpoint with headroom.
+  ENRICH_SPACING_MS: z.coerce.number().int().min(0).max(2_000).default(150),
+  // STARTUP GATE safety: acting services wait for the indexer at head AND the enrichment RESYNC set drained.
+  // If the resync set doesn't drain within this budget (a stuck/rate-limited lane), proceed anyway with a
+  // LOUD warning rather than bricking the whole bot. 0 = wait indefinitely. Terminal-fail (MAX_ATTEMPTS)
+  // normally guarantees the set resolves, so hitting this is a real anomaly to investigate.
+  ENRICH_RESYNC_MAX_WAIT_MS: z.coerce.number().int().min(0).max(3_600_000).default(300_000),
   // Lending position registry: enumerate ALL borrowers (old + new), classify into tiers, poll
   // adaptively — watch (near HF threshold, fast) / profitable (healthy, slow) / low_collateral /
   // blacklist / closed. Watch-tier feeds the existing flash-kill.
@@ -156,7 +213,49 @@ const schema = z.object({
   DEBUG_KEEP_RAW_BLOCKS: bool.default(false),
   INDEXER_RAW_RETENTION_HOURS: z.coerce.number().int().min(1).max(168).default(24),
   INDEXER_MAX_CATCHUP: z.coerce.number().int().min(10).max(50_000).default(2_000), // cap blocks caught up per tick
+  // FULL INGESTION: in REAL-TIME, fetch the WHOLE block via eth_getBlockReceipts (every log + receipt),
+  // not just our topic-filtered subset — the cost is ~+10ms/block but we stop being blind to ~97% of the
+  // network (other venues, token flows, LP liquidity, …). base.org blocks getBlockReceipts, so it runs on
+  // the precision lane (publicnode). Off → legacy filtered getLogs. Historical SYNC stays filtered (bulk).
+  INDEXER_FULL_INGESTION: bool.default(true),
+  // Rolling raw-block buffer: keep the last N blocks' FULL logs (backup + reorg handling + discovery of
+  // event types worth decoding). 0 = off. ~0.5MB/block → 100 blocks ≈ 50MB.
+  INDEXER_RAW_BUFFER_BLOCKS: z.coerce.number().int().min(0).max(5_000).default(100),
   INDEXER_POLL_MS: z.coerce.number().int().min(1_000).max(10_000).default(2_500),  // fallback poll if WS heads drops
+  // COLD START = RESYNC, no history replay (db-first convergence). A fresh DB (no cursor) starts AT head
+  // (default 0): pre-existing state is NOT replayed — it comes from seeds + live discovery + enrichment
+  // reading current on-chain data. A resume (cursor exists) covers the gap FORWARD from the last block.
+  INDEXER_COLD_START_BLOCKS: z.coerce.number().int().min(0).max(60_000_000).default(0),
+  // Safety: if the resume gap exceeds this, DON'T replay it — jump to head−COLD_START_BLOCKS (treat as a
+  // fresh start). Bounds a pathological multi-day catch-up (state re-derives forward + enrichment fills).
+  INDEXER_MAX_RESYNC_GAP: z.coerce.number().int().min(1_000).max(10_000_000).default(50_000),
+  // SYNC vs real-time: a lag above this = "behind" → parallel FULL-ingestion catch-up + acting services
+  // gated (wait). Below it = synced → real-time on the dedicated lane. A few blocks of lag is normal.
+  INDEXER_RESYNC_LAG: z.coerce.number().int().min(2).max(10_000).default(60),
+  // Behind (catch-up): full-ingest this many blocks CONCURRENTLY across the receipts-capable lanes
+  // (indexer/exec/precision — base.org can't serve getBlockReceipts) to cut catch-up time; process up to
+  // SYNC_MAX_CATCHUP blocks per tick. ONE pipeline: catch-up uses the SAME full ingestion as real-time
+  // (not filtered getLogs) so wallet transfers / token_stats are captured identically. Kept at 6.
+  INDEXER_SYNC_CONCURRENCY: z.coerce.number().int().min(1).max(24).default(6),
+  // Per-tick block cap when behind. Full ingestion is one getBlockReceipts/block, so this is far smaller
+  // than the old filtered-getLogs cap (100k) — a tick stays bounded and progress stays visible.
+  INDEXER_SYNC_MAX_CATCHUP: z.coerce.number().int().min(100).max(2_000_000).default(2_000),
+  // token_stats bucket uses wall-clock (5-min): during a big catch-up, blocks older than this (48h in blocks)
+  // must NOT write stats or they'd dump historical volume into the current bucket. Guarded in processBlock.
+  INDEXER_STATS_MAX_LAG_BLOCKS: z.coerce.number().int().min(3_600).max(2_000_000).default(86_400),
+  // FLOW capture (db-first convergence): the indexer records each priced swap's wallet + USD into
+  // recent_swaps so the FlowSensor derives hotPools/activeWallets/bigSwaps from the DB, not its own getLogs.
+  INDEXER_FLOW_ENABLED: bool.default(true),
+  INDEXER_FLOW_MIN_USD: z.coerce.number().min(0).default(1),          // skip dust swaps (bounds the table)
+  INDEXER_FLOW_RETAIN_BLOCKS: z.coerce.number().int().min(30).max(50_000).default(150), // ~5min on Base (2s blocks)
+  // Uniswap V4 singleton PoolManager (Base) + the block to backfill its Initialize events from (V4 pools
+  // exist only in the Initialize log — the `resync v4pools` task scans them so existing pools like BSW price).
+  V4_POOLMANAGER: z.string().regex(/^0x[a-fA-F0-9]{40}$/).default("0x498581fF718922c3f8e6A244956aF099B2652b2b"),
+  V4_BACKFILL_FROM_BLOCK: z.coerce.number().int().min(0).default(38_000_000), // safely before V4 Base launch (~Jan 2026)
+  // ROUTER FRESHNESS: a quote/route leg whose pool_state is more than this many blocks behind the indexer
+  // head is "stale" → the local router refreshes it on-chain or skips it (never quotes on blindly-old state).
+  // On Base (~2s blocks) 5 blocks ≈ 10s. Cross-cutting freshness stamp: every datum carries its update-block.
+  ROUTE_MAX_BLOCKS_BEHIND: z.coerce.number().int().min(1).max(10_000).default(5),
   // Chainlink ETH/USD feed (Base) — the ROBUST anchor for USD conversion (one bad anchor cascades to all).
   CHAINLINK_ETH_USD_FEED: z.string().min(1).default("0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"),
   WALLET_LOGS_RPC: z.string().url().default("https://mainnet.base.org"),
@@ -184,7 +283,12 @@ const schema = z.object({
   // Rebuild (Gradino 1): the clean ScarletAgent trading core. When true it drives instead of the legacy
   // Scarlet; woken by the periodic heartbeat (Channel A) + own-position/watchlist events (Channel B).
   SCARLET_V2_ENABLED: bool.default(false),
-  SCARLET_CORE_PROMPT_PATH: z.string().min(1).default("src/prompts/scarlet-core.md"),
+  // State machine prompts. Identity = stable core (loaded as system[0]); the phase prompts and the
+  // per-strategy prompts are attached on top of it as the turn moves through activation → operative → conclusion.
+  SCARLET_CORE_PROMPT_PATH: z.string().min(1).default("src/prompts/scarlet-identity.md"),
+  SCARLET_ACTIVATION_PROMPT_PATH: z.string().min(1).default("src/prompts/scarlet-activation.md"),
+  SCARLET_CONCLUSION_PROMPT_PATH: z.string().min(1).default("src/prompts/scarlet-conclusion.md"),
+  SCARLET_STRATEGY_DIR: z.string().min(1).default("src/strategy"),
   SCARLET_MAX_ROUNDS: z.coerce.number().int().min(1).max(24).default(8),
   // Rest between cycles: the next activation starts this long AFTER the previous
   // one finishes (not a fixed interval), so Scarlet operates continuously with no
@@ -286,9 +390,20 @@ const schema = z.object({
   ,POSITION_MAX_NAV_PCT_QUALITY: z.coerce.number().positive().max(100).default(30) // hard concentration cap, established token
   ,POSITION_MAX_LIQ_PCT: z.coerce.number().positive().max(20).default(1.5)     // ≤ this % of the token's liquidity (clean exit)
   ,PORTFOLIO_HEAT_PCT: z.coerce.number().positive().max(100).default(18)       // total open risk cap → emergent position count
-  ,POSITION_MIN_USD: z.coerce.number().positive().default(1)                   // floor: below this, don't bother
+  ,POSITION_MIN_USD: z.coerce.number().positive().default(0.10)                // floor: even a 10-cent lottery ticket is allowed (gas on Base is ~1-5¢)
   ,POSITION_MAX_USD: z.coerce.number().positive().default(40)                  // absolute per-position ceiling (safety)
   ,POSITION_MAX_OPEN: z.coerce.number().int().min(1).max(50).default(20)       // hard sanity cap (heat is the real limiter)
+  // LAUNCHTOKEN sizing is DIFFERENT from bluechip: it's a power-law LOTTERY. You go in almost expecting to
+  // lose the ticket; the edge is the rare 10-100× spike. So a launch bet is a TINY fixed ticket (a small %
+  // of NAV, conviction-scaled), NOT the risk/stop model — the whole ticket is the risk (a memecoin dumps
+  // past any stop). Many small uncorrelated tickets; the spikes pay for the zeros.
+  ,LAUNCH_TICKET_PCT: z.coerce.number().positive().max(10).default(0.6)        // % of NAV per launch ticket (× conviction)
+  ,LAUNCH_MAX_USD: z.coerce.number().positive().default(5)                     // absolute ceiling on a single launch ticket
+  // PER-CATEGORY BUDGETS (of NAV) — Scarlet organizes her capital into buckets, NOT one daily/total cap. Each
+  // strategy can deploy up to ITS bucket; the rest stays as stable/native RESERVE (maintenance; future: LP for
+  // fees). She sees the live allocation (used/free) in the briefing and works within it. Defaults are guardrails.
+  ,LAUNCH_BUDGET_PCT: z.coerce.number().min(0).max(100).default(20)            // lottery money → launches
+  ,BLUECHIP_BUDGET_PCT: z.coerce.number().min(0).max(100).default(50)          // complex/long-term (+ future borrow/lending) → bluechips
   ,POSITION_SLIPPAGE_PCT: z.coerce.number().min(0.1).max(50).default(8)
   // Capital bands drive which profit engines Scarlet may consider at the current
   // NAV. Micro-cent Berachain gas keeps micro strategies economic; larger bands
@@ -345,6 +460,13 @@ function applyNetwork(input: Record<string, string | undefined>, net: Network): 
   set("AGGREGATOR_1INCH", net.infra.aggregator1inch);
   set("BALANCER_VAULT", net.infra.balancerVault);
   if (dex0) { set("DEX_FACTORY", dex0.factory); set("DEX_ROUTER", dex0.router); set("DEX_QUOTER", dex0.quoter); }
+  // Own-execution venue routers (Phase 3): source from the profile's dexes so a chain switch reroutes them.
+  const aeroDex = net.dexes.find((d) => d.id === "aerodrome" || d.type === "aerodrome-v2");
+  if (aeroDex?.router) set("AERODROME_ROUTER", aeroDex.router);
+  if (aeroDex?.factory) set("AERODROME_POOL_FACTORY", aeroDex.factory);
+  const univ2Dex = net.dexes.find((d) => d.id === "uniswap-v2" || d.type === "uni-v2");
+  if (univ2Dex?.router) set("UNIV2_ROUTER", univ2Dex.router);
+  if (univ2Dex?.factory) set("UNIV2_FACTORY", univ2Dex.factory);
   // Extra DEXes (beyond the primary) are seeded into the venue registry.
   if (net.dexes.length > 1) set("VENUE_EXTRA_JSON", JSON.stringify(net.dexes.slice(1).map((d) => ({ id: d.id, name: d.name, type: d.type, address: d.factory, meta: { role: "factory", swapRouter: d.router, quoter: d.quoter, note: d.note } }))));
 }

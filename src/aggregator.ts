@@ -15,7 +15,13 @@ import type { Config } from "./config.js";
  * a caller treats "no quote" as "not routable right now" (fail-safe).
  */
 export type Quote = { amountIn: bigint; amountOut: bigint; gasUnits: number; gasUsd: number; routerAddress: string; routeSummary: unknown };
-export type BuiltSwap = { router: Address; calldata: `0x${string}`; amountIn: bigint; amountOut: bigint };
+export type BuiltSwap = { router: Address; calldata: `0x${string}`; amountIn: bigint; amountOut: bigint; value: bigint };
+
+/** The aggregator's native-currency sentinel: pass this as tokenIn to spend NATIVE ETH (no wrap, no
+ * ERC20 approval, no transferFrom — the router receives ETH via msg.value), or as tokenOut to receive it.
+ * Kyber/0x/1inch/Odos all use this address. */
+export const NATIVE_ETH = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE" as Address;
+export function isNative(token: string): boolean { return token.toLowerCase() === NATIVE_ETH.toLowerCase(); }
 
 export class Aggregator {
   private readonly base: string; // e.g. https://aggregator-api.kyberswap.com/base/api/v1
@@ -57,10 +63,11 @@ export class Aggregator {
         body: JSON.stringify({ routeSummary, sender, recipient, slippageTolerance: slippageBps }), signal: AbortSignal.timeout(10_000)
       });
       if (!r.ok) return null;
-      const j = await r.json() as { code?: number; data?: { routerAddress?: string; data?: string; amountIn?: string; amountOut?: string } };
+      const j = await r.json() as { code?: number; data?: { routerAddress?: string; data?: string; amountIn?: string; amountOut?: string; transactionValue?: string } };
       const d = j?.data;
       if (j?.code !== 0 || !d?.data || !d.routerAddress) return null;
-      return { router: d.routerAddress as Address, calldata: d.data as `0x${string}`, amountIn: BigInt(d.amountIn ?? "0"), amountOut: BigInt(d.amountOut ?? "0") };
+      // `transactionValue` is the msg.value the router expects: = amountIn for a NATIVE-ETH input, "0" for ERC20 in.
+      return { router: d.routerAddress as Address, calldata: d.data as `0x${string}`, amountIn: BigInt(d.amountIn ?? "0"), amountOut: BigInt(d.amountOut ?? "0"), value: BigInt(d.transactionValue ?? "0") };
     } catch (error) { this.logger.debug({ err: error }, "aggregator build failed"); return null; }
   }
 

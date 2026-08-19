@@ -79,8 +79,14 @@ export function startDashboard(deps: Deps): { close: () => void } | undefined {
         for (const r of rows) { const c = r.cycle ?? "—"; if (!byCycle.has(c)) { byCycle.set(c, { cycle: c, at: r.at, reason: null, entries: [] }); order.push(c); } const g = byCycle.get(c)!; if (r.kind === "cycle") g.reason = r.content; else g.entries.push({ at: r.at, kind: r.kind, content: r.content }); }
         // rows are newest-first → reverse entries to chronological; the cycle's `at` is its EARLIEST entry.
         const cycles = order.map((c) => { const g = byCycle.get(c)!; const entries = g.entries.slice().reverse(); return { cycle: g.cycle, at: entries[0]?.at ?? g.at, reason: g.reason, entries }; });
+        // Operative-state machine: her current state + the recent transition log (with justifications).
+        const [current, stateLog, nextNote] = await Promise.all([
+          deps.db.latestScarletState().catch(() => undefined),
+          deps.db.recentScarletStates(25).catch(() => []),
+          deps.db.latestMarketSnapshot<{ text: string; at: string }>("scarlet", "nextNote").catch(() => undefined)
+        ]);
         res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "access-control-allow-origin": "*" });
-        res.end(JSON.stringify({ enabled: deps.config.SCARLET_V2_ENABLED, cycles, now: new Date().toISOString() }));
+        res.end(JSON.stringify({ enabled: deps.config.SCARLET_V2_ENABLED, cycles, currentState: current ?? null, stateLog, nextNote: nextNote ?? null, now: new Date().toISOString() }));
         return;
       }
       if (url.pathname.startsWith("/api/route-probe")) {
@@ -662,6 +668,23 @@ const SCARLET_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><hea
     <template x-if="tab==='reason'">
       <div class="space-y-3">
         <div class="rounded-2xl bg-panel border border-line p-4 text-[12px] text-dim">Timeline di Scarlet, ciclo per ciclo: <b class="text-txt">inizio</b> (perché si è svegliata) → i blocchi tra i due estremi (pensiero, strumenti, azioni) → <b class="text-txt">fine</b>. Solo lettura, si aggiorna da solo.</div>
+        <!-- STATO OPERATIVO -->
+        <section class="rounded-2xl bg-panel border border-line p-4">
+          <div class="flex items-center gap-3 flex-wrap">
+            <span class="text-[11px] uppercase tracking-widest text-dim">Stato operativo</span>
+            <span class="text-[13px] font-semibold px-2.5 py-0.5 rounded-full border border-energy text-energy bg-energy/10" x-text="d.currentState?.state || '—'"></span>
+            <span class="text-[11px] text-dim" x-show="d.currentState" x-text="d.currentState? new Date(d.currentState.at).toLocaleString():''"></span>
+          </div>
+          <div class="text-[12px] text-dim mt-1.5" x-show="d.currentState?.justification"><span class="text-txt">motivo:</span> <span x-text="d.currentState?.justification"></span></div>
+          <div class="text-[12px] mt-2 rounded-lg bg-panel2 border border-line p-2" x-show="d.nextNote"><span class="text-energy">nota per il prossimo turno:</span> <span class="text-dim" x-text="d.nextNote?.text"></span></div>
+          <template x-if="d.stateLog?.length>1">
+            <div class="mt-2.5 flex flex-wrap gap-1.5">
+              <template x-for="(s,i) in d.stateLog.slice(0,12)" :key="i">
+                <span class="text-[10px] px-2 py-0.5 rounded-full border border-line text-dim" :title="(s.justification||'')+' — '+new Date(s.at).toLocaleString()" x-text="s.state"></span>
+              </template>
+            </div>
+          </template>
+        </section>
         <template x-if="!d.cycles?.length"><div class="rounded-2xl bg-panel border border-line p-6 text-dim text-center">Nessun ragionamento ancora — Scarlet non si è ancora attivata, o riposa.</div></template>
         <template x-for="(c,i) in (d.cycles||[])" :key="c.cycle">
           <section class="rounded-2xl bg-panel border border-line overflow-hidden">

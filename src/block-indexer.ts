@@ -3,6 +3,10 @@ import { parseAbi, type Address } from "viem";
 import type { Config } from "./config.js";
 import type { BerachainClients } from "./chain.js";
 import type { Database } from "./db.js";
+import {
+  decodeLog, decodeTransfer, TOPIC0S, TRANSFER, MORPHO_CREATE_MARKET, MORPHO_LIQUIDATE,
+  word, wordAddr, addrFromTopic, type RawLog, type DecodedEvent
+} from "./indexer/events.js";
 
 /**
  * BlockIndexer — the STARTING POINT of the whole system.
@@ -20,38 +24,21 @@ import type { Database } from "./db.js";
  * public getLogs range) → no block silently skipped; the Chainlink anchor makes the USD base rock-solid.
  */
 
-const V3_SWAP = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
-const V2_SYNC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
-const V2_SWAP = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"; // UniV2 Swap (amounts, for volume)
-const PAIR_CREATED = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"; // V2 factory
-const POOL_CREATED = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"; // V3 factory
-// Morpho Blue — position lifecycle. The indexer discovers/closes borrowers LIVE from these logs (the
-// Morpho API stays as periodic seed + cross-check). Topics verified via toEventSelector; Borrow &
-// Liquidate match the constants already in position-registry.
-// Discovery on Borrow (debt appears → liquidation-relevant), close on Liquidate, params from
-// CreateMarket. SupplyCollateral is intentionally NOT tracked: collateral without debt isn't
-// liquidatable, and exact amounts come from the per-block RPC confirm anyway.
-const MORPHO_CREATE_MARKET = "0xac4b2400f169220b0c0afdde7a0b32e775ba727ea1cb30b35f935cdaab8683ac";
-const MORPHO_BORROW = "0x570954540bed6b1304a87dfe815a5eda4a648f7097a16240dcd85c9b5fd42a43";
-const MORPHO_LIQUIDATE = "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41";
-const MORPHO_TOPICS = new Set([MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE]);
+// Decoding (topic0 signatures, byte helpers, DecodedEvent, EVENT_DECODERS) now lives in ONE place —
+// src/indexer/events.ts — the unified registry. This indexer decodes each log there, then reduces the
+// normalized events into DB writes. Only block-indexer-specific constants remain here.
 const MORPHO_MARKET_ABI = parseAbi(["function idToMarketParams(bytes32 id) view returns (address loanToken, address collateralToken, address oracle, address irm, uint256 lltv)"]);
-const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)"]);
-const ERC20_META_ABI = parseAbi(["function symbol() view returns (string)", "function name() view returns (string)", "function decimals() view returns (uint8)"]);
-const IDENTITY_CAP = 8; // max token-identity resolutions per call (bounds first-run RPC burst)
-const BOOTSTRAP_CAP = 20; // max unknown pools to bootstrap per block (self-limits any first-run burst)
 // Sanity bounds: a thin pool at an extreme tick can quote an absurd price; unfiltered it poisons the
 // token's price AND (× that price) its volume, and propagates through multi-hop. No real Base token
 // unit exceeds these, so we simply refuse to write out-of-range prices / implausible single-swap volume.
 const MAX_PRICE_USD = 10_000_000;    // ~158× cbBTC — well above any legitimate per-unit price
 const MAX_SWAP_USD = 1_000_000_000;  // reject a single swap valued over $1B as a decode/decimals artifact
 const sanePrice = (p: number | null | undefined): p is number => p != null && Number.isFinite(p) && p > 0 && p < MAX_PRICE_USD;
-const TOPIC0S = [V3_SWAP, V2_SYNC, V2_SWAP, PAIR_CREATED, POOL_CREATED, MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE];
 const CHUNK = 10;            // public getLogs range cap
+const ZERO_ADDR = "0x0000000000000000000000000000000000000000"; // V4 native-ETH currency sentinel → WETH
 const ANCHOR_TTL_MS = 30_000; // refresh ETH/USD at most this often
 const Q96 = 2n ** 96n;
 
-type RawLog = { address: string; topics: string[]; data: string; blockNumber: string };
 type RawRpc = { request: (a: { method: string; params: unknown }) => Promise<unknown> };
 
 export class BlockIndexer {
@@ -62,11 +49,28 @@ export class BlockIndexer {
   private ticks = 0;
   private timer?: NodeJS.Timeout;
   private unwatch?: () => void;
+  private headBlock = 0;       // latest network head seen (for the token_stats freshness guard)
+  private syncedFlag = false;  // false while catching up (cold-start / resync) → Scarlet is gated
+  private syncAnnounced = false; // the ONE-TIME first-head event (flag resync set + open the startup gate)
+  private readyResolve!: () => void;
+  /** Resolves the FIRST time the indexer reaches head — the startup gate Scarlet awaits before operating. */
+  readonly ready: Promise<void> = new Promise((r) => { this.readyResolve = r; });
   private readonly weth: string;
   private readonly usdc: string;
   private readonly morpho: string | null;
+  private readonly walletLower: string | null;
+  private watchedWallets = new Set<string>(); // OUR wallet ∪ followed smart-money — all fed to wallet_transactions
+  /** Event-driven hook (Canale wallet): fired with the tokens a wallet Transfer touched THIS block, so
+   * WalletHoldings re-reads just those balances FROM CHAIN. Injected by index.ts; unset = no wallet wired. */
+  onWalletTransfer?: (tokens: string[]) => void;
+  /** PUSH to the enricher: fired when a block wrote a new/incomplete entity (bare pool/token) → the enricher
+   * drains the buffer NOW instead of waiting for its idle poll. Injected by index.ts (= enricher.nudge). */
+  onDiscovery?: () => void;
   private readonly marketCache = new Map<string, { loanToken: string; collateralToken: string; oracle: string; irm: string; lltv: bigint }>();
-  private readonly resolvedTokens = new Set<string>(); // tokens whose identity we've read one-shot (dedup)
+
+  /** TRUE when the indexer is at the chain head (data is fresh). While FALSE it's realigning (cold-start or
+   * resync after a lost block) and Scarlet must WAIT — deciding on stale data is worse than not acting. */
+  get synced(): boolean { return this.syncedFlag; }
 
   constructor(
     private readonly config: Config,
@@ -77,14 +81,34 @@ export class BlockIndexer {
     this.weth = config.WBERA_ADDRESS.toLowerCase();
     this.usdc = config.USDC_E_ADDRESS.toLowerCase();
     this.morpho = config.MORPHO_CORE ? config.MORPHO_CORE.toLowerCase() : null;
+    this.walletLower = config.WALLET_ADDRESS ? config.WALLET_ADDRESS.toLowerCase() : null;
+    if (this.walletLower) this.watchedWallets.add(this.walletLower);
+  }
+
+  /** Rebuild the watched-wallet set = our wallet ∪ active follows (so the indexer feeds FollowService's
+   * followed-wallet transfers from the same stream). Cheap; refreshed periodically, not per block. */
+  private async refreshWatched(): Promise<void> {
+    const s = new Set<string>();
+    if (this.walletLower) s.add(this.walletLower);
+    for (const f of await this.db.activeFollows(this.config.CHAIN_ID).catch(() => [] as Array<{ wallet: string }>)) s.add(f.wallet.toLowerCase());
+    this.watchedWallets = s;
   }
 
   async start(): Promise<void> {
     if (!this.config.INDEXER_ENABLED) { this.logger.info("block-indexer disabled"); return; }
     const head = await this.head().catch(() => 0);
+    this.headBlock = head;
     const stored = await this.db.getIndexerCursor(this.config.CHAIN_ID).catch(() => null);
-    this.cursor = stored ?? Math.max(0, head - 1); // fresh start: from the current head, not genesis
+    const coldStart = Math.max(0, head - this.config.INDEXER_COLD_START_BLOCKS);
+    // COLD START = RESYNC, no history replay. Fresh DB (no cursor) → start at head (COLD_START_BLOCKS=0 by
+    // default); state comes from seeds + live discovery + enrichment, not from replaying old blocks. Resume
+    // (cursor exists) → cover the gap FORWARD, UNLESS it's pathologically large (off for days) → jump near
+    // head instead of replaying it (state re-derives forward + the resync buffer refills current data).
+    this.cursor = stored == null ? coldStart : (head - stored > this.config.INDEXER_MAX_RESYNC_GAP ? coldStart : stored);
+    this.syncedFlag = head - this.cursor <= this.config.INDEXER_RESYNC_LAG; // already fresh? (rare)
+    if (this.syncedFlag) await this.markSynced();
     await this.refreshAnchor();
+    await this.refreshWatched();
     // Trigger: WS heads (primary) + a poll heartbeat (fallback if the WS drops). Overlaps are no-ops.
     this.unwatch = this.chain.watchHeads(() => void this.tick().catch((e) => this.logger.error({ err: e }, "indexer tick failed")), (err) => this.logger.warn({ err: err.message }, "indexer heads WS error"));
     this.timer = setInterval(() => void this.tick().catch((e) => this.logger.error({ err: e }, "indexer tick failed")), this.config.INDEXER_POLL_MS);
@@ -93,35 +117,158 @@ export class BlockIndexer {
 
   stop(): void { if (this.timer) clearInterval(this.timer); if (this.unwatch) this.unwatch(); }
 
+  /** BACKFILL: recompute USD price for tokens that JUST got their decimals (from enrichment), using the
+   * already-stored pool_state — so a fresh token is priced the instant it's enriched, not only on its next
+   * swap. Pure DB work (no RPC): reuses the same pricers + anchor as the per-block path. The enricher calls
+   * this after filling a batch of decimals. */
+  async repriceFromState(tokens: string[]): Promise<number> {
+    const cid = this.config.CHAIN_ID;
+    const wanted = [...new Set(tokens.map((t) => t.toLowerCase()))].filter((t) => t !== this.weth && t !== this.usdc);
+    if (!wanted.length) return 0;
+    const priced: Array<{ token: string; priceUsd: number; confidence: number; source: string; block: number | null }> = [];
+    for (const T of wanted) {
+      const pools = await this.db.poolsForToken(cid, T).catch(() => [] as Array<{ address: string; meta: unknown }>);
+      if (!pools.length) continue;
+      const addrs = pools.map((p) => p.address.toLowerCase());
+      const [states, infos] = await Promise.all([this.db.poolStateBatch(cid, addrs).catch(() => new Map()), this.db.poolInfoBatch(cid, addrs).catch(() => new Map())]);
+      const involved = new Set<string>();
+      for (const info of infos.values()) { if (info.token0) involved.add(info.token0.toLowerCase()); if (info.token1) involved.add(info.token1.toLowerCase()); }
+      const meta = await this.db.tokenMeta(cid, [...involved]).catch(() => new Map()) as Map<string, { decimals: number | null }>;
+      const dec = (a: string): number | null => a === this.weth ? 18 : a === this.usdc ? 6 : (meta.get(a)?.decimals ?? null);
+      let best: { price: number; conf: number; block: number | null } | null = null;
+      for (const p of addrs) {
+        const info = infos.get(p); const st = states.get(p);
+        if (!info?.token0 || !info.token1 || !st) continue;
+        const t0 = info.token0.toLowerCase(), t1 = info.token1.toLowerCase();
+        const d0 = dec(t0), d1 = dec(t1); if (d0 == null || d1 == null) continue;
+        const p0in1 = st.archetype === "v3" && st.sqrtPrice != null ? priceV3FromSqrt(st.sqrtPrice, d0, d1)
+          : st.r0 != null && st.r1 != null ? priceV2FromReserves(st.r0, st.r1, d0, d1) : null;
+        if (p0in1 == null || !(p0in1 > 0)) continue;
+        const q0 = this.quoteUsd(t0), q1 = this.quoteUsd(t1);
+        let priceT: number | null = null, conf = 0;
+        if (T === t0 && q1 != null) { priceT = p0in1 * q1; conf = 0.95; }
+        else if (T === t1 && q0 != null) { priceT = (1 / p0in1) * q0; conf = 0.95; }
+        else { const other = T === t0 ? t1 : t0; const op = (await this.db.getTokenPrices(cid, [other]).catch(() => new Map())).get(other)?.priceUsd;
+          if (op != null && op > 0) { priceT = T === t0 ? p0in1 * op : (1 / p0in1) * op; conf = 0.8; } }
+        if (priceT != null && sanePrice(priceT) && (!best || conf > best.conf)) best = { price: priceT, conf, block: st.block ?? null };
+      }
+      if (best) priced.push({ token: T, priceUsd: best.price, confidence: best.conf, source: "indexer-backfill", block: best.block });
+    }
+    if (priced.length) await this.db.upsertTokenPrices(cid, priced, { tauFastSec: this.config.VOL_TAU_FAST_SEC, tauSlowSec: this.config.VOL_TAU_SLOW_SEC }).catch(() => undefined);
+    return priced.length;
+  }
+
   private async tick(): Promise<void> {
     if (this.running) return;
     this.running = true;
     try {
       if (Date.now() - this.ethUsdAt > ANCHOR_TTL_MS) await this.refreshAnchor();
       const head = await this.head();
-      if (head <= this.cursor) return;
-      const target = Math.min(head, this.cursor + this.config.INDEXER_MAX_CATCHUP); // cap catch-up per tick
+      this.headBlock = head;
+      if (head <= this.cursor) { await this.markSynced(); return; }
+      // SYNC MODE when we're materially behind (cold-start / resync after a lost block): parallel cascade
+      // catch-up + Scarlet gated. REAL-TIME (small lag): one chunk on the dedicated lane, Scarlet operates.
+      const behind = head - this.cursor > this.config.INDEXER_RESYNC_LAG;
+      if (behind && this.syncedFlag) { this.syncedFlag = false; this.logger.warn({ lag: head - this.cursor }, "indexer de-synced → catching up (Scarlet gated)"); }
+      const cap = behind ? this.config.INDEXER_SYNC_MAX_CATCHUP : this.config.INDEXER_MAX_CATCHUP;
+      const target = Math.min(head, this.cursor + cap);
       const t0 = Date.now();
-      let processed = 0, swaps = 0, discovered = 0, lending = 0;
-      let from = this.cursor + 1;
-      while (from <= target) {
-        const to = Math.min(from + CHUNK - 1, target);
-        const r = await this.processRange(from, to);
-        processed += to - from + 1; swaps += r.swaps; discovered += r.discovered; lending += r.lending;
-        from = to + 1;
-      }
+      const r = behind ? await this.catchUpParallel(this.cursor + 1, target) : await this.seqRange(this.cursor + 1, target);
       if (++this.ticks % 200 === 0) {
         await this.db.pruneTokenStats(this.config.CHAIN_ID, 48).catch(() => undefined); // 48h retention for market-stat windows
         if (this.config.DEBUG_KEEP_RAW_BLOCKS) await this.db.pruneRawBlocks(this.config.CHAIN_ID, this.config.INDEXER_RAW_RETENTION_HOURS).catch(() => undefined);
       }
-      if (processed > 0) this.logger.info({ upTo: this.cursor, blocks: processed, swaps, discovered, lending, ethUsd: this.ethUsd, ms: Date.now() - t0, lag: head - this.cursor }, "indexed blocks");
+      // Rolling raw-block buffer: trim to the last N blocks (~every 40 ticks so it stays near N, not unbounded).
+      if (this.config.INDEXER_RAW_BUFFER_BLOCKS > 0 && this.ticks % 40 === 0) await this.db.pruneRawBlocksKeepLast(this.config.CHAIN_ID, this.config.INDEXER_RAW_BUFFER_BLOCKS).catch(() => undefined);
+      // Rolling per-swap flow window: trim to the retain horizon (~every 20 ticks).
+      if (this.config.INDEXER_FLOW_ENABLED && this.ticks % 20 === 0) await this.db.pruneRecentSwaps(this.config.CHAIN_ID, this.config.INDEXER_FLOW_RETAIN_BLOCKS).catch(() => undefined);
+      // Refresh the followed-wallet set (~every 20 ticks) so newly-followed smart-money starts being captured.
+      if (this.ticks % 20 === 0) await this.refreshWatched();
+      if (r.processed > 0) this.logger.info({ upTo: this.cursor, blocks: r.processed, swaps: r.swaps, discovered: r.discovered, lending: r.lending, ethUsd: this.ethUsd, ms: Date.now() - t0, lag: head - this.cursor, mode: behind ? "sync" : "live" }, "indexed blocks");
+      if (this.headBlock - this.cursor <= this.config.INDEXER_RESYNC_LAG) await this.markSynced();
     } finally {
       this.running = false;
     }
   }
 
-  private async processRange(from: number, to: number): Promise<{ swaps: number; discovered: number; lending: number }> {
-    const logs = await this.getLogs(from, to);
+  /** At head. Sets the live `synced` flag every time (Scarlet's per-cycle freshness gate). The FIRST time,
+   * it also fires the ONE-TIME startup event: snapshot the current incomplete-entity set as the RESYNC set
+   * (everything discovered up to head — boot + gap) and resolve `ready`, so index.ts can then wait for the
+   * enrichment resync to drain before releasing the acting services. Later re-syncs only re-set the flag. */
+  private async markSynced(): Promise<void> {
+    this.syncedFlag = true;
+    if (this.syncAnnounced) return;
+    this.syncAnnounced = true;
+    await this.db.flagResyncSet(this.config.CHAIN_ID)
+      .then((n) => this.logger.info({ resyncEntities: n, cursor: this.cursor, head: this.headBlock }, "indexer at head — resync set flagged; gate opens once enrichment drains it"))
+      .catch((e) => this.logger.warn({ err: e }, "flagResyncSet failed (gate will not wait on resync)"));
+    this.readyResolve();
+  }
+
+  /** Real-time. FULL ingestion (default): whole-block logs via getBlockReceipts, per block — we see every
+   * event, store the last N blocks raw (rolling buffer). LEGACY: topic-filtered chunks on the indexer lane.
+   * processBlock filters internally by topic0, so feeding it ALL logs is behaviour-identical for known venues. */
+  private async seqRange(from: number, target: number): Promise<{ processed: number; swaps: number; discovered: number; lending: number }> {
+    let processed = 0, swaps = 0, discovered = 0, lending = 0;
+    if (this.config.INDEXER_FULL_INGESTION) {
+      for (let b = from; b <= target; b++) {
+        let logs = await this.blockReceiptsLogs(b);
+        if (logs == null) logs = await this.getLogs(b, b, this.chain.indexer); // receipts RPC down → filtered (no stall)
+        if (this.config.INDEXER_RAW_BUFFER_BLOCKS > 0) await this.db.saveRawBlock(this.config.CHAIN_ID, b, logs).catch(() => undefined);
+        const r = await this.applyRange(b, b, logs);
+        processed += 1; swaps += r.swaps; discovered += r.discovered; lending += r.lending;
+      }
+      return { processed, swaps, discovered, lending };
+    }
+    let f = from;
+    while (f <= target) {
+      const to = Math.min(f + CHUNK - 1, target);
+      const logs = await this.getLogs(f, to, this.chain.indexer);
+      const r = await this.applyRange(f, to, logs);
+      processed += to - f + 1; swaps += r.swaps; discovered += r.discovered; lending += r.lending;
+      f = to + 1;
+    }
+    return { processed, swaps, discovered, lending };
+  }
+
+  /** SYNC (behind) — the SAME full ingestion as real-time, just parallel for throughput: fetch whole-block
+   * logs (getBlockReceipts) for many blocks CONCURRENTLY across the RECEIPTS-CAPABLE lanes (indexer/exec/
+   * precision — base.org can't serve receipts, and precision is free while acting services are gated), then
+   * apply IN ORDER. ONE pipeline: catch-up captures wallet transfers / token_stats identically to live — no
+   * filtered-getLogs asymmetry. No block skipped: apply only the contiguous successful prefix, re-fetch the
+   * rest next round (cursor stays contiguous). Per-block getLogs fallback if a lane can't serve receipts. */
+  private async catchUpParallel(from: number, target: number): Promise<{ processed: number; swaps: number; discovered: number; lending: number }> {
+    // Receipts-capable + NON-contending: drpc(indexer) + publicnode(exec). NOT precision (= enrichment's
+    // nodies lane, busy draining the buffer during the same resync) nor base.org (can't serve receipts).
+    const lanes = [this.chain.indexer, this.chain.exec];
+    const conc = this.config.INDEXER_SYNC_CONCURRENCY;
+    let processed = 0, swaps = 0, discovered = 0, lending = 0;
+    let cur = from;
+    while (cur <= target) {
+      const blocks: number[] = [];
+      for (let b = cur; b <= target && blocks.length < conc; b++) blocks.push(b);
+      const fetched = await Promise.all(blocks.map((b, i) => this.blockLogs(b, lanes[i % lanes.length]).then((logs) => ({ b, logs })).catch(() => null)));
+      let advanced = false;
+      for (const item of fetched) {
+        if (!item || item.logs == null) break; // gap → stop; re-fetch from here next round (cursor stays contiguous)
+        const r = await this.applyRange(item.b, item.b, item.logs);
+        processed += 1; swaps += r.swaps; discovered += r.discovered; lending += r.lending;
+        cur = item.b + 1; advanced = true;
+      }
+      if (!advanced) await new Promise<void>((resolve) => setTimeout(resolve, 500)); // whole batch failed → brief backoff
+    }
+    return { processed, swaps, discovered, lending };
+  }
+
+  /** One block's logs by FULL ingestion on a specific lane (getBlockReceipts), with a filtered-getLogs
+   * fallback if that lane can't serve receipts — degraded for that block (no transfers/stats) but no stall. */
+  private async blockLogs(block: number, lane: typeof this.chain.indexer): Promise<RawLog[] | null> {
+    const r = await this.receiptsOn(block, lane);
+    if (r != null) return r;
+    return await this.getLogs(block, block, lane).catch(() => null);
+  }
+
+  private async applyRange(from: number, to: number, logs: RawLog[]): Promise<{ swaps: number; discovered: number; lending: number }> {
     const byBlock = new Map<number, RawLog[]>();
     for (const l of logs) { const b = Number(BigInt(l.blockNumber)); const arr = byBlock.get(b) ?? []; arr.push(l); byBlock.set(b, arr); }
     let swaps = 0, discovered = 0, lending = 0;
@@ -136,67 +283,94 @@ export class BlockIndexer {
   }
 
   private async processBlock(block: number, logs: RawLog[]): Promise<{ swaps: number; discovered: number; lending: number }> {
-    // 1) Discovery: new pools/tokens from factory events.
-    let discovered = 0;
-    const newTokens = new Set<string>();
-    for (const l of logs) {
-      const t0 = (l.topics[0] ?? "").toLowerCase();
-      if (t0 === PAIR_CREATED || t0 === POOL_CREATED) {
-        const token0 = addrFromTopic(l.topics[1]); const token1 = addrFromTopic(l.topics[2]);
-        const isV3 = t0 === POOL_CREATED;
-        const pool = isV3 ? wordAddr(l.data, 1) : wordAddr(l.data, 0);
-        // V3 PoolCreated(token0, token1, fee indexed, tickSpacing, pool): fee = topics[3]. Needed for
-        // exact sized amountOut (price-oracle.feePpm) so non-0.3% tiers don't default to 3000ppm.
-        const fee = isV3 && l.topics[3] ? Number(BigInt(l.topics[3])) : undefined;
-        if (pool && token0 && token1) {
-          await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: pool, kind: "pool", meta: { token0, token1, archetype: isV3 ? "v3" : "v2", fee, discoveredBy: "indexer" }, source: "indexer" }).catch(() => undefined);
-          await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token0, kind: "token", source: "indexer" }).catch(() => undefined);
-          await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token1, kind: "token", source: "indexer" }).catch(() => undefined);
-          // The emitting factory is a DEX — parity with the scanner's opportunistic dex discovery.
-          await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: l.address.toLowerCase(), kind: "dex", meta: { role: "factory", discoveredBy: "indexer" }, source: "indexer" }).catch(() => undefined);
-          newTokens.add(token0); newTokens.add(token1);
-          discovered += 1;
+    // Decode EVERY log ONCE via the unified registry → normalized events. Every reducer below consumes
+    // these; none re-reads raw bytes or re-branches on topic0 (src/indexer/events.ts is the single path).
+    const events: DecodedEvent[] = [];
+    for (const l of logs) { const e = decodeLog(l); if (e) events.push(e); }
+
+    // 0) WALLET activity (DB-first source of truth for our own wallet): the full-ingestion stream carries
+    // EVERY Transfer, so we cheap-filter for the wallet (topic from/to) and persist to wallet_transactions
+    // — the history/Movimenti + which tokens we hold. Then we signal WalletHoldings to re-read JUST those
+    // balances FROM CHAIN (event-driven, ground truth). No-op on the filtered sync path (no Transfer logs),
+    // so cold-start is untouched; this fires only in real-time full ingestion. Idempotent insert (tx:log).
+    // WATCHED wallets = OUR wallet ∪ the smart-money wallets we FOLLOW. The indexer feeds all of them from
+    // ONE stream → wallet_transactions (keyed by wallet), so WalletHoldings + FollowService read the DB
+    // instead of each running its own getLogs. onWalletTransfer fires only for OUR wallet (balance re-read).
+    if (this.watchedWallets.size) {
+      const byWallet = new Map<string, Array<{ txHash: string; logIndex: number; blockNumber: bigint; token: string; from: string; to: string; valueRaw: bigint; direction: string }>>();
+      const ownTouched = new Set<string>();
+      for (const l of logs) {
+        if ((l.topics[0] ?? "").toLowerCase() !== TRANSFER || l.transactionHash == null || l.logIndex == null) continue;
+        const from = addrFromTopic(l.topics[1]), to = addrFromTopic(l.topics[2]);
+        if (!from || !to || (!this.watchedWallets.has(from) && !this.watchedWallets.has(to))) continue;
+        const t = decodeTransfer(l); if (!t) continue;
+        for (const w of from === to ? [from] : [from, to]) {
+          if (!this.watchedWallets.has(w)) continue;
+          (byWallet.get(w) ?? byWallet.set(w, []).get(w)!).push({ txHash: l.transactionHash, logIndex: Number(BigInt(l.logIndex)), blockNumber: BigInt(block), token: t.token, from: t.from, to: t.to, valueRaw: t.value, direction: t.to === w ? (t.from === w ? "self" : "in") : "out" });
+          if (w === this.walletLower) ownTouched.add(t.token);
         }
       }
+      for (const [w, rows] of byWallet) await this.db.insertWalletTransfers(this.config.CHAIN_ID, w, rows).catch(() => 0);
+      if (ownTouched.size) this.onWalletTransfer?.([...ownTouched]); // fire-and-forget: WalletHoldings reads fresh balances
     }
-    // Identity one-shot: give freshly-created tokens symbol/name/decimals immediately (chain-sourced),
-    // rather than waiting for the enricher to rotate to them.
-    if (newTokens.size) await this.resolveIdentity([...newTokens]);
 
-    // 1b) Lending (Morpho): discover borrowers on Borrow, close on Liquidate, learn params on
-    // CreateMarket — the inventory becomes chain-sourced (API drops to seed + cross-check). Same
-    // getLogs call: Morpho topics ride the global topic0 filter; we keep only logs from the Morpho core.
+    // 1) Discovery: new pools/tokens/factory from PoolCreated/PairCreated events. The emitting FACTORY is
+    // stored on the pool — one archetype ("v3") is shared by many forks, so own-execution routes each pool
+    // to ITS dex's router. The bare `kind:token` entities are the enrichment QUEUE (async enricher fills them).
+    let discovered = 0;
+    for (const e of events) {
+      if (e.kind !== "pool_created") continue;
+      // V4: currency 0x0 = native ETH → price it as WETH. tickSpacing/hooks kept for future V4 execution.
+      const t0 = e.token0 === ZERO_ADDR ? this.weth : e.token0, t1 = e.token1 === ZERO_ADDR ? this.weth : e.token1;
+      const meta: Record<string, unknown> = { token0: t0, token1: t1, archetype: e.archetype, fee: e.fee, factory: e.factory, discoveredBy: "indexer", origin: "created" };
+      if (e.tickSpacing != null) meta.tickSpacing = e.tickSpacing;
+      if (e.hooks) meta.hooks = e.hooks;
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.pool, kind: "pool", meta, source: "indexer", block }).catch(() => undefined);
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t0, kind: "token", source: "indexer", block }).catch(() => undefined);
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t1, kind: "token", source: "indexer", block }).catch(() => undefined);
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.factory, kind: "dex", meta: { role: "factory", discoveredBy: "indexer" }, source: "indexer", block }).catch(() => undefined);
+      discovered += 1;
+    }
+    if (discovered) this.onDiscovery?.(); // push: new bare token/pool entities → enricher drains now
+
+    // 1b) Lending (Morpho): decoded morpho events from the Morpho core → borrower lifecycle (discover on
+    // Borrow, close on Liquidate, params on CreateMarket). API stays as periodic seed + cross-check.
     let lending = 0;
     if (this.morpho) {
-      for (const l of logs) {
-        if (l.address.toLowerCase() !== this.morpho) continue;
-        const t0 = (l.topics[0] ?? "").toLowerCase();
-        if (MORPHO_TOPICS.has(t0) && await this.handleMorpho(t0, l)) lending += 1;
+      for (const e of events) {
+        if (e.kind !== "morpho" || e.log.address.toLowerCase() !== this.morpho) continue;
+        if (await this.handleMorpho(e.topic0, e.log)) lending += 1;
       }
     }
 
-    // 2) Prices: swaps (V3) + syncs (V2) → the pool's price → USD via anchor.
-    const priced = logs.filter((l) => { const t = (l.topics[0] ?? "").toLowerCase(); return t === V3_SWAP || t === V2_SYNC; });
+    // 1c) V3 liquidity (Mint/Burn) → per-tick liquidity map: the foundation for EXACT V3-at-size quoting
+    // (Mint adds +L at tickLower/−L at tickUpper; Burn the reverse). Consumed later by the V3 tick sim.
+    const liq = events.filter((e): e is Extract<DecodedEvent, { kind: "liquidity_v3" }> => e.kind === "liquidity_v3");
+    if (liq.length) await this.db.upsertTickLiquidity(this.config.CHAIN_ID, block, liq.map((e) => ({ pool: e.pool, tickLower: e.tickLower, tickUpper: e.tickUpper, liquidityDelta: e.liquidityDelta }))).catch((err) => this.logger.debug({ err }, "indexer tick_liquidity upsert failed"));
+
+    // 2) Prices: swap_v3 (sqrtPrice) + sync (V2/Aerodrome reserves) events → the pool's price → USD anchor.
+    const priced = events.filter((e): e is Extract<DecodedEvent, { kind: "swap_v3" } | { kind: "sync" }> => e.kind === "swap_v3" || e.kind === "sync");
     if (!priced.length) return { swaps: 0, discovered, lending };
-    const poolAddrs = [...new Set(priced.map((l) => l.address.toLowerCase()))];
+    const poolAddrs = [...new Set(priced.map((e) => e.pool))];
     const pools = await this.db.poolInfoBatch(this.config.CHAIN_ID, poolAddrs);
-    // Self-sufficient discovery: a pool that swapped but isn't in entities (its Create predates the
-    // indexer and no scanner classified it) — bootstrap it ONCE (token0/token1/archetype) so the indexer
-    // discovers + prices it with no dependence on any other scanner. Capped/block to bound a first-run burst.
-    const unknown: Array<{ addr: string; archetype: string }> = [];
-    for (const l of priced) {
-      const a = l.address.toLowerCase();
-      if (pools.has(a) || unknown.some((u) => u.addr === a)) continue;
-      unknown.push({ addr: a, archetype: (l.topics[0] ?? "").toLowerCase() === V3_SWAP ? "v3" : "v2" });
+    // Self-sufficient discovery WITHOUT inline RPC: a pool that swapped but isn't in entities (its Create
+    // predates the indexer, or it's on a factory we don't watch) is written as a BARE `kind:pool` entity
+    // (archetype only) → the enricher fills token0/1/fee on its dedicated lane, then the price backfills.
+    // No cap needed: this is a fast DB upsert, not an RPC burst.
+    let bareDiscovered = 0;
+    for (const e of priced) {
+      if (pools.has(e.pool)) continue;
+      if (e.kind === "swap_v3" && e.v4) continue; // a V4 poolId can't be enriched on-chain (no reverse lookup) → only discover V4 pools via Initialize
+      const archetype = e.kind === "swap_v3" ? "v3" : e.archetype;
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.pool, kind: "pool", meta: { archetype, discoveredBy: "indexer", origin: "swap" }, source: "indexer", block }).catch(() => undefined);
+      bareDiscovered += 1;
     }
-    for (const u of unknown.slice(0, BOOTSTRAP_CAP)) { const info = await this.bootstrapPool(u.addr, u.archetype); if (info) pools.set(u.addr, info); }
+    if (bareDiscovered) this.onDiscovery?.(); // push: bare pools discovered via swap → enricher drains now
     const tokenSet = new Set<string>();
     for (const p of pools.values()) { if (p.token0) tokenSet.add(p.token0.toLowerCase()); if (p.token1) tokenSet.add(p.token1.toLowerCase()); }
+    // Decimals come from the DB (enricher-filled). A token not yet enriched is simply NOT priced this block —
+    // its raw pool_state is still written below, and the enricher backfills its price the moment decimals land.
     const meta = await this.db.tokenMeta(this.config.CHAIN_ID, [...tokenSet]).catch(() => new Map()) as Map<string, { symbol: string | null; decimals: number | null }>;
-    // Ensure decimals for tokens we're about to price: a fresh launch the enricher hasn't reached yet would
-    // otherwise be unpriceable during its most active window. Resolve one-shot (cached), then price this block.
-    const missingDec = [...tokenSet].filter((a) => a !== this.weth && a !== this.usdc && meta.get(a)?.decimals == null);
-    if (missingDec.length) for (const [a, v] of await this.resolveIdentity(missingDec)) if (v.decimals != null) meta.set(a, { symbol: v.symbol ?? null, decimals: v.decimals });
     const dec = (a: string): number | null => { if (a === this.weth) return 18; if (a === this.usdc) return 6; return meta.get(a)?.decimals ?? null; };
 
     // 2a) Pool state — from the SAME logs, independent of token metadata. V2 Sync = (r0,r1);
@@ -208,6 +382,7 @@ export class BlockIndexer {
     const state = new Map<string, { pool: string; archetype: string; r0?: bigint; r1?: bigint; sqrtPrice?: bigint; liquidity?: bigint; block: number }>();
     const rows = new Map<string, { price: number; conf: number }>(); // token → USD price this block (last swap wins)
     const stats = new Map<string, { volUsd: number; buys: number; sells: number; lastPrice: number; netFlowUsd: number; liqUsd: number | null }>(); // per-token market stats this block
+    const flowRows: Array<{ pool: string; wallet: string | null; valueUsd: number }> = []; // per-swap wallet+USD for the FlowSensor (recent_swaps)
     // A token's current USD: a QUOTE (WETH/USDC), a DIRECT price computed this block (conf≥0.95), or the
     // stored DB price. Only direct/quote anchors are used for multi-hop, so hop prices never chain.
     const usdOf = (t: string): number | null => {
@@ -216,18 +391,19 @@ export class BlockIndexer {
       const dbp = px.get(t)?.priceUsd; return sanePrice(dbp) ? dbp : null;
     };
     let swaps = 0;
-    for (const l of priced) {
-      const pool = l.address.toLowerCase();
-      const isSwap = (l.topics[0] ?? "").toLowerCase() === V3_SWAP;
-      if (isSwap) { const sp = word(l.data, 2), liq = word(l.data, 3); if (sp && sp > 0n) state.set(pool, { pool, archetype: "v3", sqrtPrice: sp, liquidity: liq ?? undefined, block }); }
-      else { const r0 = word(l.data, 0), r1 = word(l.data, 1); if (r0 != null && r1 != null) state.set(pool, { pool, archetype: "v2", r0, r1, block }); }
-
+    for (const e of priced) {
+      const pool = e.pool;
       const info = pools.get(pool);
+      if (info?.archetype === "aerodrome-stable") continue; // stablecoin-pair curve — x·y=k pricing is invalid; skip
+      const isSwap = e.kind === "swap_v3";
+      if (isSwap) { if (e.sqrtPrice > 0n) state.set(pool, { pool, archetype: "v3", sqrtPrice: e.sqrtPrice, liquidity: e.liquidity ?? undefined, block }); }
+      else { state.set(pool, { pool, archetype: e.archetype, r0: e.r0, r1: e.r1, block }); }
+
       if (!info?.token0 || !info.token1) continue; // unknown pool — discovery adds it; priced next time
       const t0 = info.token0.toLowerCase(), t1 = info.token1.toLowerCase();
       const d0 = dec(t0), d1 = dec(t1);
       if (d0 == null || d1 == null) continue; // decimals unknown → defer (enricher fills them)
-      const p0in1 = isSwap ? priceV3(l.data, d0, d1) : priceV2(l.data, d0, d1); // token0 price in token1 (human)
+      const p0in1 = isSwap ? priceV3FromSqrt(e.sqrtPrice, d0, d1) : priceV2FromReserves(e.r0, e.r1, d0, d1); // token0 price in token1 (human)
       if (p0in1 == null || !(p0in1 > 0) || !Number.isFinite(p0in1)) continue;
       swaps += 1;
       // Price the NON-quote token T via anchor side A. Direct if A is WETH/USDC (conf 0.95); else
@@ -245,37 +421,34 @@ export class BlockIndexer {
       // V3 volume/txns/flow: buy = T flows OUT (negative in V3's signed convention). netFlow = +S buy /
       // −S sell (buy pressure). liq = anchor(quote)-side VIRTUAL reserve × USD × 2 (rug-drain trajectory).
       if (isSwap) {
-        const aAmt = A === t0 ? sword(l.data, 0) : sword(l.data, 1);
-        const tAmt = A === t0 ? sword(l.data, 1) : sword(l.data, 0);
+        const aAmt = A === t0 ? e.amount0 : e.amount1;
+        const tAmt = A === t0 ? e.amount1 : e.amount0;
         const decA = A === t0 ? d0 : d1;
-        if (aAmt != null && tAmt != null) {
-          const S = Math.abs(Number(aAmt) / 10 ** decA) * U;
-          if (S > 0 && S < MAX_SWAP_USD && Number.isFinite(S)) {
-            const s = stats.get(T) ?? { volUsd: 0, buys: 0, sells: 0, lastPrice: priceT, netFlowUsd: 0, liqUsd: null };
-            const buy = tAmt < 0n;
-            s.volUsd += S; if (buy) s.buys += 1; else s.sells += 1; s.netFlowUsd += buy ? S : -S; s.lastPrice = priceT;
-            const sp = word(l.data, 2), L = word(l.data, 3);
-            if (sp && L && sp > 0n) { const qRes = A === t0 ? (L * Q96) / sp : (L * sp) / Q96; s.liqUsd = (Number(qRes) / 10 ** decA) * U * 2; }
-            stats.set(T, s);
-          }
+        const S = Math.abs(Number(aAmt) / 10 ** decA) * U;
+        if (S > 0 && S < MAX_SWAP_USD && Number.isFinite(S)) {
+          const s = stats.get(T) ?? { volUsd: 0, buys: 0, sells: 0, lastPrice: priceT, netFlowUsd: 0, liqUsd: null };
+          const buy = tAmt < 0n;
+          s.volUsd += S; if (buy) s.buys += 1; else s.sells += 1; s.netFlowUsd += buy ? S : -S; s.lastPrice = priceT;
+          if (e.sqrtPrice > 0n && e.liquidity && e.liquidity > 0n) { const qRes = A === t0 ? (e.liquidity * Q96) / e.sqrtPrice : (e.liquidity * e.sqrtPrice) / Q96; s.liqUsd = (Number(qRes) / 10 ** decA) * U * 2; }
+          stats.set(T, s);
+          if (this.config.INDEXER_FLOW_ENABLED && S >= this.config.INDEXER_FLOW_MIN_USD) flowRows.push({ pool, wallet: e.recipient, valueUsd: S }); // per-swap flow (wallet = recipient)
         }
       }
     }
 
-    // 2b) V2 volume/txns — the UniV2 Swap event carries the amounts the Sync doesn't. Price comes from
-    // the Sync (above); here we only attribute volume, using the priced side as the USD anchor.
-    for (const l of logs) {
-      if ((l.topics[0] ?? "").toLowerCase() !== V2_SWAP) continue;
-      const info = pools.get(l.address.toLowerCase());
-      if (!info?.token0 || !info.token1) continue;
+    // 2b) V2 + Aerodrome volume/txns — the swap_v2 event carries the amounts the Sync doesn't. Price from Sync.
+    const swapV2 = events.filter((e): e is Extract<DecodedEvent, { kind: "swap_v2" }> => e.kind === "swap_v2");
+    for (const e of swapV2) {
+      const info = pools.get(e.pool);
+      if (!info?.token0 || !info.token1 || info.archetype === "aerodrome-stable") continue;
       const t0 = info.token0.toLowerCase(), t1 = info.token1.toLowerCase();
       const d0 = dec(t0), d1 = dec(t1); if (d0 == null || d1 == null) continue;
       const u1 = usdOf(t1), u0 = usdOf(t0);
       let T: string, A: string, U: number, decA: number;
       if (u1 != null) { T = t0; A = t1; U = u1; decA = d1; } else if (u0 != null) { T = t1; A = t0; U = u0; decA = d0; } else continue;
       // Swap(amount0In, amount1In, amount0Out, amount1Out): net = In − Out (into pool positive).
-      const net0 = (word(l.data, 0) ?? 0n) - (word(l.data, 2) ?? 0n);
-      const net1 = (word(l.data, 1) ?? 0n) - (word(l.data, 3) ?? 0n);
+      const net0 = e.a0In - e.a0Out;
+      const net1 = e.a1In - e.a1Out;
       const netA = A === t0 ? net0 : net1, netT = T === t0 ? net0 : net1;
       const S = Math.abs(Number(netA) / 10 ** decA) * U;
       if (!(S > 0) || S >= MAX_SWAP_USD || !Number.isFinite(S)) continue;
@@ -283,19 +456,30 @@ export class BlockIndexer {
       const s = stats.get(T) ?? { volUsd: 0, buys: 0, sells: 0, lastPrice: priceT, netFlowUsd: 0, liqUsd: null };
       const buy = netT < 0n; // T flows OUT of the pool → bought
       s.volUsd += S; if (buy) s.buys += 1; else s.sells += 1; s.netFlowUsd += buy ? S : -S; if (priceT > 0) s.lastPrice = priceT;
-      const st = state.get(l.address.toLowerCase()); // reserves from this pool's Sync (same block)
+      const st = state.get(e.pool); // reserves from this pool's Sync (same block)
       if (st?.r0 != null && st.r1 != null) { const qRes = A === t0 ? st.r0 : st.r1; s.liqUsd = (Number(qRes) / 10 ** decA) * U * 2; }
       stats.set(T, s);
+      if (this.config.INDEXER_FLOW_ENABLED && S >= this.config.INDEXER_FLOW_MIN_USD) flowRows.push({ pool: e.pool, wallet: e.to, valueUsd: S }); // per-swap flow (wallet = to)
     }
 
     if (this.config.DEBUG_KEEP_RAW_BLOCKS && logs.length) await this.db.saveRawBlock(this.config.CHAIN_ID, block, logs).catch(() => undefined);
     if (state.size) await this.db.upsertPoolState(this.config.CHAIN_ID, [...state.values()]).catch((e) => this.logger.debug({ err: e }, "indexer pool_state upsert failed"));
     if (rows.size) {
-      await this.db.upsertTokenPrices(this.config.CHAIN_ID, [...rows.entries()].map(([token, v]) => ({ token, priceUsd: v.price, confidence: v.conf, source: "indexer" })), { tauFastSec: this.config.VOL_TAU_FAST_SEC, tauSlowSec: this.config.VOL_TAU_SLOW_SEC }).catch((e) => this.logger.debug({ err: e }, "indexer price upsert failed"));
+      await this.db.upsertTokenPrices(this.config.CHAIN_ID, [...rows.entries()].map(([token, v]) => ({ token, priceUsd: v.price, confidence: v.conf, source: "indexer", block })), { tauFastSec: this.config.VOL_TAU_FAST_SEC, tauSlowSec: this.config.VOL_TAU_SLOW_SEC }).catch((e) => this.logger.debug({ err: e }, "indexer price upsert failed"));
     }
-    if (stats.size) {
+    // FRESHNESS stamp: every data update carries the block it was written at (also visible in the log),
+    // so "how far behind is this pool/price" is answerable from the DB and the log alone.
+    if (state.size || rows.size) this.logger.debug({ block, blocksBehind: this.headBlock > 0 ? Math.max(0, this.headBlock - block) : null, pools: state.size, priced: rows.size, stats: stats.size }, "indexer data written @ block");
+    // token_stats buckets are WALL-CLOCK (5-min): during a big catch-up, blocks older than 48h would dump
+    // historical volume into the CURRENT bucket. Only write stats for near-head (recent) blocks.
+    if (stats.size && (this.headBlock === 0 || this.headBlock - block <= this.config.INDEXER_STATS_MAX_LAG_BLOCKS)) {
       const bucket = Math.floor(Date.now() / 1000 / 300) * 300;
       await this.db.upsertTokenStats(this.config.CHAIN_ID, bucket, [...stats.entries()].map(([token, s]) => ({ token, ...s }))).catch((e) => this.logger.debug({ err: e }, "indexer token_stats upsert failed"));
+    }
+    // Per-swap FLOW (recent_swaps) — only for blocks within the rolling window (near head); older catch-up
+    // blocks would be pruned immediately, so don't write them. FlowSensor reads this back.
+    if (flowRows.length && (this.headBlock === 0 || this.headBlock - block <= this.config.INDEXER_FLOW_RETAIN_BLOCKS)) {
+      await this.db.insertRecentSwaps(this.config.CHAIN_ID, block, flowRows).catch((e) => this.logger.debug({ err: e }, "indexer recent_swaps insert failed"));
     }
     return { swaps, discovered, lending };
   }
@@ -337,7 +521,7 @@ export class BlockIndexer {
     if (db) { this.marketCache.set(id, db); return db; }
     if (!this.morpho) return null;
     try {
-      const r = await this.chain.fallback.readContract({ address: this.morpho as Address, abi: MORPHO_MARKET_ABI, functionName: "idToMarketParams", args: [id as `0x${string}`] }) as readonly [string, string, string, string, bigint];
+      const r = await this.chain.indexer.readContract({ address: this.morpho as Address, abi: MORPHO_MARKET_ABI, functionName: "idToMarketParams", args: [id as `0x${string}`] }) as readonly [string, string, string, string, bigint];
       const m = { loanToken: r[0].toLowerCase(), collateralToken: r[1].toLowerCase(), oracle: r[2].toLowerCase(), irm: r[3].toLowerCase(), lltv: r[4] };
       if (m.collateralToken === "0x0000000000000000000000000000000000000000") return null;
       this.marketCache.set(id, m);
@@ -346,52 +530,6 @@ export class BlockIndexer {
     } catch (e) { this.logger.debug({ err: e, id }, "idToMarketParams bootstrap failed"); return null; }
   }
 
-  /** One-shot discovery of a pool seen swapping but absent from entities: read token0/token1(/fee),
-   * upsert the pool + its tokens, and return its meta so THIS block can already price it. */
-  private async bootstrapPool(addr: string, archetype: string): Promise<{ token0: string; token1: string; archetype: string } | null> {
-    try {
-      const [t0, t1] = await Promise.all([
-        this.chain.fallback.readContract({ address: addr as Address, abi: POOL_META_ABI, functionName: "token0" }) as Promise<string>,
-        this.chain.fallback.readContract({ address: addr as Address, abi: POOL_META_ABI, functionName: "token1" }) as Promise<string>
-      ]);
-      const token0 = t0.toLowerCase(), token1 = t1.toLowerCase();
-      const fee = archetype === "v3" ? await this.chain.fallback.readContract({ address: addr as Address, abi: POOL_META_ABI, functionName: "fee" }).then(Number).catch(() => undefined) : undefined;
-      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: addr, kind: "pool", meta: { token0, token1, archetype, fee, discoveredBy: "indexer-swap" }, source: "indexer" }).catch(() => undefined);
-      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token0, kind: "token", source: "indexer" }).catch(() => undefined);
-      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token1, kind: "token", source: "indexer" }).catch(() => undefined);
-      return { token0, token1, archetype };
-    } catch (e) { this.logger.debug({ err: e, pool: addr }, "pool bootstrap failed"); return null; }
-  }
-
-  /** Identity one-shot: read symbol/name/decimals for tokens the system doesn't yet know, persist to
-   * entities (COALESCE — never clobbers a good value), and cache so each token is read at most once.
-   * This makes the indexer the chain-source for token identity (drops the Blockscout dependency for it)
-   * and, crucially, lets a fresh launch be priced the instant it trades instead of waiting for enrichment. */
-  private async resolveIdentity(addrs: string[], cap = IDENTITY_CAP): Promise<Map<string, { symbol?: string; name?: string; decimals?: number }>> {
-    const out = new Map<string, { symbol?: string; name?: string; decimals?: number }>();
-    let done = 0;
-    for (const a0 of addrs) {
-      const a = a0.toLowerCase();
-      if (this.resolvedTokens.has(a) || a === this.weth || a === this.usdc) continue;
-      if (done >= cap) break;
-      this.resolvedTokens.add(a); done += 1;
-      try {
-        const [sym, nm, dc] = await Promise.all([
-          this.chain.fallback.readContract({ address: a as Address, abi: ERC20_META_ABI, functionName: "symbol" }).catch(() => undefined) as Promise<string | undefined>,
-          this.chain.fallback.readContract({ address: a as Address, abi: ERC20_META_ABI, functionName: "name" }).catch(() => undefined) as Promise<string | undefined>,
-          this.chain.fallback.readContract({ address: a as Address, abi: ERC20_META_ABI, functionName: "decimals" }).catch(() => undefined) as Promise<number | undefined>
-        ]);
-        const decimals = dc != null && Number.isFinite(Number(dc)) && Number(dc) >= 0 && Number(dc) <= 36 ? Number(dc) : undefined;
-        const symbol = typeof sym === "string" && sym.length > 0 ? sym.slice(0, 32) : undefined;
-        const name = typeof nm === "string" && nm.length > 0 ? nm.slice(0, 96) : undefined;
-        if (symbol || name || decimals != null) {
-          await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: a, kind: "token", symbol, name, decimals, source: "indexer" }).catch(() => undefined);
-          out.set(a, { symbol, name, decimals });
-        }
-      } catch (e) { this.logger.debug({ err: e, token: a }, "identity resolve failed"); }
-    }
-    return out;
-  }
 
   /** USD value of one unit of a QUOTE token (WETH via Chainlink, USDC = $1). null if not a quote. */
   private quoteUsd(token: string): number | null {
@@ -402,54 +540,64 @@ export class BlockIndexer {
 
   private async refreshAnchor(): Promise<void> {
     try {
-      const res = await (this.chain.fallback as unknown as RawRpc).request({ method: "eth_call", params: [{ to: this.config.CHAINLINK_ETH_USD_FEED, data: "0xfeaf968c" }, "latest"] }) as string; // latestRoundData()
+      const res = await (this.chain.indexer as unknown as RawRpc).request({ method: "eth_call", params: [{ to: this.config.CHAINLINK_ETH_USD_FEED, data: "0xfeaf968c" }, "latest"] }) as string; // latestRoundData()
       if (res && res.length >= 194) { this.ethUsd = Number(BigInt("0x" + res.slice(2 + 64, 2 + 128))) / 1e8; this.ethUsdAt = Date.now(); }
     } catch (e) { this.logger.debug({ err: e }, "anchor refresh failed"); }
   }
 
   private async head(): Promise<number> {
-    const r = await (this.chain.fallback as unknown as RawRpc).request({ method: "eth_blockNumber", params: [] }).catch(() => (this.chain.secondary as unknown as RawRpc).request({ method: "eth_blockNumber", params: [] })) as string;
+    const r = await (this.chain.indexer as unknown as RawRpc).request({ method: "eth_blockNumber", params: [] }) as string;
     return Number(BigInt(r));
   }
 
-  /** Topic-filtered getLogs for [from,to] on the public feed, with fallback across RPCs. */
-  private async getLogs(from: number, to: number): Promise<RawLog[]> {
+  /** EVERY log of a block via eth_getBlockReceipts on ONE lane (null = that lane can't serve it / errored). */
+  private async receiptsOn(block: number, client: typeof this.chain.indexer): Promise<RawLog[] | null> {
+    try {
+      const receipts = await (client as unknown as RawRpc).request({ method: "eth_getBlockReceipts", params: [hex(block)] }) as Array<{ logs?: RawLog[] }> | null;
+      if (receipts == null) return null;
+      const out: RawLog[] = [];
+      for (const rc of receipts) if (rc.logs) for (const lg of rc.logs) out.push(lg);
+      return out;
+    } catch { return null; }
+  }
+
+  /** FULL block ingestion (live, single block): try the indexer's OWN receipts-capable lanes drpc → publicnode
+   * (base.org can't serve receipts). null = neither served it → caller falls back to filtered getLogs (no stall). */
+  private async blockReceiptsLogs(block: number): Promise<RawLog[] | null> {
+    for (const client of [this.chain.indexer, this.chain.exec]) { const r = await this.receiptsOn(block, client); if (r != null) return r; }
+    return null;
+  }
+
+  /** Topic-filtered getLogs for [from,to] on `client` (default the dedicated indexer lane; during sync the
+   * caller passes different cascade lanes for concurrency). We retry IN-LANE so a transient blip doesn't skip
+   * a block; if all retries fail we throw → the caller keeps the cursor put → re-processed later (no skip). */
+  private async getLogs(from: number, to: number, client: typeof this.chain.indexer = this.chain.indexer): Promise<RawLog[]> {
     const params = [{ fromBlock: hex(from), toBlock: hex(to), topics: [TOPIC0S] }];
     let lastErr: unknown;
-    for (const client of [this.chain.fallback, this.chain.secondary, this.chain.primary]) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       try { return await (client as unknown as RawRpc).request({ method: "eth_getLogs", params }) as RawLog[]; }
-      catch (e) { lastErr = e; }
+      catch (e) { lastErr = e; if (attempt < 2) await new Promise<void>((resolve) => setTimeout(resolve, 300 * (attempt + 1))); }
     }
-    throw lastErr instanceof Error ? lastErr : new Error("getLogs failed on all RPCs");
+    throw lastErr instanceof Error ? lastErr : new Error("getLogs failed");
   }
 }
 
 // --- decoding helpers -------------------------------------------------------
 
 function hex(n: number): string { return "0x" + n.toString(16); }
-/** The Nth 32-byte word of `data` as a BigInt (null if data too short). */
-function word(data: string, i: number): bigint | null { const s = 2 + i * 64; return data.length >= s + 64 ? BigInt("0x" + data.slice(s, s + 64)) : null; }
-/** The Nth word as a SIGNED int256 (V3 Swap amount0/amount1 can be negative = out of the pool). */
-function sword(data: string, i: number): bigint | null { const u = word(data, i); return u == null ? null : (u >= (1n << 255n) ? u - (1n << 256n) : u); }
-function addrFromTopic(topic: string | undefined): string | null { return topic && topic.length >= 42 ? "0x" + topic.slice(-40).toLowerCase() : null; }
-/** address stored in the Nth 32-byte word of `data` (right-aligned). */
-function wordAddr(data: string, word: number): string | null { const s = 2 + word * 64; return data.length >= s + 64 ? "0x" + data.slice(s + 24, s + 64).toLowerCase() : null; }
 
-/** V3 Swap: price of 1 token0 in token1 (human), from sqrtPriceX96 (3rd data word). */
-function priceV3(data: string, dec0: number, dec1: number): number | null {
-  if (data.length < 2 + 194) return null;
-  const sqrtP = BigInt("0x" + data.slice(2 + 128, 2 + 192)); // word[2]
+/** CORE: price of 1 token0 in token1 (human) from a raw sqrtPriceX96. Reused by the per-block pricer AND
+ * the enrichment backfill (which recomputes from the stored pool_state once decimals arrive). */
+export function priceV3FromSqrt(sqrtP: bigint, dec0: number, dec1: number): number | null {
   if (sqrtP <= 0n) return null;
   const r = Number(sqrtP) / 2 ** 96;       // = sqrt(price_raw)
   const priceRaw = r * r;                  // token1/token0 in raw units
   return priceRaw * 10 ** (dec0 - dec1);   // token1(human) per token0(human)
 }
-
-/** V2 Sync: price of 1 token0 in token1 (human), from reserves. */
-function priceV2(data: string, dec0: number, dec1: number): number | null {
-  if (data.length < 2 + 128) return null;
-  const r0 = Number(BigInt("0x" + data.slice(2, 66))) / 10 ** dec0;
-  const r1 = Number(BigInt("0x" + data.slice(66, 130))) / 10 ** dec1;
+/** CORE: price of 1 token0 in token1 (human) from raw reserves. Reused by the per-block pricer + backfill. */
+export function priceV2FromReserves(r0raw: bigint, r1raw: bigint, dec0: number, dec1: number): number | null {
+  const r0 = Number(r0raw) / 10 ** dec0;
+  const r1 = Number(r1raw) / 10 ** dec1;
   if (!(r0 > 0)) return null;
   return r1 / r0;
 }

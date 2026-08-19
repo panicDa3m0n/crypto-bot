@@ -209,20 +209,20 @@ export class Scarlet {
           if (!/^0x[0-9a-f]{40}$/.test(wallet)) return { error: "wallet must be a 20-byte address" };
           const transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
           const padded = ("0x" + wallet.slice(2).padStart(64, "0")) as `0x${string}`;
-          const latest = await this.chain.primary.getBlockNumber();
+          const latest = await this.chain.tools.getBlockNumber();
           const fromBlock = latest - BigInt(Math.min(Number(args.blocks ?? 3000), 4096));
           const fb = ("0x" + fromBlock.toString(16)) as `0x${string}`;
           const tb = ("0x" + latest.toString(16)) as `0x${string}`;
           try {
-            const outgoing = await this.chain.primary.request({ method: "eth_getLogs", params: [{ fromBlock: fb, toBlock: tb, topics: [transfer as `0x${string}`, padded] }] } as never) as Array<{ address: string; transactionHash: string }>;
-            const incoming = await this.chain.primary.request({ method: "eth_getLogs", params: [{ fromBlock: fb, toBlock: tb, topics: [transfer as `0x${string}`, null, padded] }] } as never) as Array<{ address: string; transactionHash: string }>;
+            const outgoing = await this.chain.tools.request({ method: "eth_getLogs", params: [{ fromBlock: fb, toBlock: tb, topics: [transfer as `0x${string}`, padded] }] } as never) as Array<{ address: string; transactionHash: string }>;
+            const incoming = await this.chain.tools.request({ method: "eth_getLogs", params: [{ fromBlock: fb, toBlock: tb, topics: [transfer as `0x${string}`, null, padded] }] } as never) as Array<{ address: string; transactionHash: string }>;
             const moves = [...outgoing.map((l) => ({ dir: "out", token: l.address, tx: l.transactionHash })), ...incoming.map((l) => ({ dir: "in", token: l.address, tx: l.transactionHash }))].slice(0, 30);
             return { wallet, fromBlock: fromBlock.toString(), tokenMoves: moves.length, sample: moves, note: "Tokens this wallet moved recently. Investigate its trades with read_contract; mirror the good ideas." };
           } catch (error) { return { wallet, error: error instanceof Error ? error.message : "watch failed" }; }
         }
         case "get_logs": {
           const address = args.address as Address;
-          const latest = await this.chain.primary.getBlockNumber();
+          const latest = await this.chain.tools.getBlockNumber();
           const WINDOW = 100n; // public RPC caps eth_getLogs at 100 blocks
           let toBlock = args.toBlock != null ? BigInt(String(args.toBlock)) : latest;
           if (toBlock > latest) toBlock = latest;
@@ -233,7 +233,7 @@ export class Scarlet {
           if (toBlock - fromBlock > WINDOW - 1n) { fromBlock = toBlock - (WINDOW - 1n); clamped = true; }
           if (fromBlock < 0n) fromBlock = 0n;
           try {
-            const logs = await this.chain.primary.getLogs({ address, fromBlock, toBlock });
+            const logs = await this.chain.tools.getLogs({ address, fromBlock, toBlock });
             return { address, chainHead: latest.toString(), fromBlock: fromBlock.toString(), toBlock: toBlock.toString(), count: logs.length, ...(clamped ? { note: `clamped to the RPC's ${WINDOW}-block window (most recent slice). To page older, call again with toBlock=${(fromBlock - 1n).toString()}.` } : {}), logs: logs.slice(0, 25).map((l) => ({ block: l.blockNumber?.toString(), tx: l.transactionHash, topics: l.topics, data: l.data })) };
           } catch (error) {
             return { address, chainHead: latest.toString(), error: error instanceof Error ? error.message : "get_logs failed" };
@@ -280,7 +280,7 @@ export class Scarlet {
           try {
             // signature is a runtime string, so parseAbi's literal validation cannot apply.
             const abi = parseAbi([`function ${signature}`] as unknown as readonly string[]);
-            const result = await this.chain.primary.readContract({ address, abi, functionName: fnName as never, args: callArgs as never });
+            const result = await this.chain.tools.readContract({ address, abi, functionName: fnName as never, args: callArgs as never });
             return JSON.parse(JSON.stringify({ address, call: signature, result }, (_k, v) => typeof v === "bigint" ? v.toString() : v));
           } catch (error) {
             return { address, call: signature, error: error instanceof Error ? error.message : "read failed" };
@@ -450,7 +450,7 @@ export class Scarlet {
           if (action === "remove") return { ok: await this.db.removeFollow(chainId, wallet), removed: wallet };
           if (action === "note") return { ok: await this.db.noteFollow(chainId, wallet, String(args.note ?? "")), note: "updated" };
           if (action === "add") {
-            const code = await this.chain.primary.getCode({ address: getAddress(wallet) }).catch(() => undefined);
+            const code = await this.chain.tools.getCode({ address: getAddress(wallet) }).catch(() => undefined);
             if (code && code !== "0x") return { ok: false, reason: "that address is a CONTRACT (dapp/token/pool), not a smart-money wallet — follow EOA trader wallets only" };
             if (!args.note) return { ok: false, reason: "a note is required: why is this wallet worth following?" };
             await this.db.addFollow(chainId, wallet, String(args.note));
@@ -486,7 +486,7 @@ export class Scarlet {
         }
         case "verify_contract_code": {
           const address = getAddress(String(args.address).toLowerCase());
-          const code = await this.chain.primary.getCode({ address });
+          const code = await this.chain.tools.getCode({ address });
           return { address, deployed: Boolean(code && code !== "0x"), bytecodeLength: code ? (code.length - 2) / 2 : 0 };
         }
         default: return { error: `Unknown tool: ${name}` };
