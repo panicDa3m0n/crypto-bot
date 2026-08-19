@@ -1,5 +1,5 @@
 import type { SimulationState, AssetId } from "./state.js";
-import { lifWad, repaidFromSeized, seizeForFullRepay } from "./lending.js";
+import { computeLiquidation } from "./lending.js";
 
 /**
  * TRANSFORMATIONS — the typed edges of the stateful Liquidity Graph. Each is an economic state-transition
@@ -99,43 +99,35 @@ export class FlashBorrowOp implements Transformation {
  * job, never folded in here. `seizeRequest` = collateral we ask to seize (capped to what fully repays). */
 export class LiquidateOp implements Transformation {
   readonly kind = "liquidate";
-  seized = 0n; repaid = 0n; // filled by apply() — the encoder reads these
+  seized = 0n; repaidAssets = 0n; repaidShares = 0n; // filled by apply() — the encoder reads `seized`
   constructor(readonly marketId: string, readonly borrower: string, readonly seizeRequest: bigint) {}
 
   applicable(s: SimulationState): boolean {
     const L = s.lending; if (!L) return false;
     const m = L.market(this.marketId), pos = L.position(this.marketId, this.borrower);
     if (!m || !pos || !pos.protocolLiquidatable(m)) return false;
-    const lif = lifWad(m.params.lltv);
-    const seize = min(this.seizeRequest, seizeForFullRepay(pos.debtAssets, m.oraclePrice, lif, pos.collateral));
-    const repaid = repaidFromSeized(seize, m.oraclePrice, lif);
-    return seize > 0n && s.portfolio.get(m.params.loanToken) >= repaid;
+    const calc = computeLiquidation(m, pos, this.seizeRequest);
+    return !!calc && s.portfolio.get(m.params.loanToken) >= calc.repaidAssets;
   }
 
   apply(s: SimulationState): ApplyResult {
     const L = s.lending; if (!L) return { ok: false, reason: "no lending state" };
-    const m = L.market(this.marketId); const posR = L.position(this.marketId, this.borrower);
-    if (!m || !posR) return { ok: false, reason: "market/position missing" };
-    if (!posR.protocolLiquidatable(m)) return { ok: false, reason: "position not liquidatable (HF≥1)" };
-    const lif = lifWad(m.params.lltv);
-    const seize = min(this.seizeRequest, seizeForFullRepay(posR.debtAssets, m.oraclePrice, lif, posR.collateral));
-    if (seize <= 0n) return { ok: false, reason: "no seizable collateral" };
-    const repaid = repaidFromSeized(seize, m.oraclePrice, lif);
-    if (repaid <= 0n) return { ok: false, reason: "zero repay" };
-    if (!s.portfolio.debit(m.params.loanToken, repaid)) return { ok: false, reason: `insufficient loan to repay (${repaid})` };
-    const pos = L.mutablePosition(this.marketId, this.borrower)!;
-    pos.collateral -= seize; pos.debtAssets -= repaid > pos.debtAssets ? pos.debtAssets : repaid;
-    s.portfolio.credit(m.params.collateralToken, seize);
-    this.seized = seize; this.repaid = repaid;
+    const m = L.market(this.marketId); const pos = L.position(this.marketId, this.borrower);
+    if (!m || !pos) return { ok: false, reason: "market/position missing" };
+    if (!pos.protocolLiquidatable(m)) return { ok: false, reason: "position not liquidatable (HF≥1)" };
+    const calc = computeLiquidation(m, pos, this.seizeRequest);
+    if (!calc) return { ok: false, reason: "no seizable collateral" };
+    if (!s.portfolio.debit(m.params.loanToken, calc.repaidAssets)) return { ok: false, reason: `insufficient loan to repay (${calc.repaidAssets})` };
+    L.applyLiquidation(this.marketId, this.borrower, calc); // share-exact + bad-debt mutation
+    s.portfolio.credit(m.params.collateralToken, calc.seized);
+    this.seized = calc.seized; this.repaidAssets = calc.repaidAssets; this.repaidShares = calc.repaidShares;
     s.gasUnits += this.gas();
-    return { ok: true, note: `liq seize ${seize} repay ${repaid}` };
+    return { ok: true, note: `liq seize ${calc.seized} repay ${calc.repaidAssets} (${calc.repaidShares} sh)` };
   }
 
   gas(): bigint { return 320_000n; } // Morpho accrue + liquidate
   describe(): string { return `liquidate ${this.borrower.slice(0, 10)} @${this.marketId.slice(0, 10)} seize≈${this.seizeRequest}`; }
 }
-
-function min(a: bigint, b: bigint): bigint { return a < b ? a : b; }
 
 /** Repay a flash obligation: `amount` principal + `fee` (Morpho = 0). Fails if funds/obligation short. */
 export class FlashRepayOp implements Transformation {

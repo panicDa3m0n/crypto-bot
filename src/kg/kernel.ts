@@ -3,7 +3,7 @@ import { getTickAtSqrtRatio } from "../router/tick-math.js";
 import { PoolSim, V2PoolSim, V3PoolSim, VenueSnapshot, PortfolioState, type StateVersion, type SimulationState, type AssetId, type SwapTrace } from "./state.js";
 import { SwapOp, FlashBorrowOp, FlashRepayOp, LiquidateOp, type Transformation } from "./operators.js";
 import type { KGCycle } from "./cycle-finder.js";
-import { LendingSnapshot, BorrowerPositionSim, LendingMarketSim, lifWad, repaidFromSeized, seizeForFullRepay } from "./lending.js";
+import { LendingSnapshot, BorrowerPositionSim, LendingMarketSim, computeLiquidation, seizeForFullRepay } from "./lending.js";
 
 /**
  * SIMULATION KERNEL — the deterministic driver over the stateful model. Runs a plan (a list of
@@ -174,16 +174,15 @@ export interface FlashLiquidationPlan {
  * swapOut − repaid. The economic actionability (PnL>0, net>threshold) is the gate's job, not this. */
 export function planFlashLiquidation(market: LendingMarketSim, pos: BorrowerPositionSim, collateralPoolId: string, collateralArchetype: string, provider = "morpho"): FlashLiquidationPlan | null {
   if (!pos.protocolLiquidatable(market)) return null;
-  const lif = lifWad(market.params.lltv);
-  const seized = seizeForFullRepay(pos.debtAssets, market.oraclePrice, lif, pos.collateral);
-  if (seized <= 0n) return null;
-  const repaid = repaidFromSeized(seized, market.oraclePrice, lif);
-  if (repaid <= 0n) return null;
+  // Target full-debt repayment; computeLiquidation caps to collateral/borrowShares and returns the
+  // SHARE-EXACT repaidAssets Morpho will pull → flash exactly that so the on-chain repay can't come short.
+  const calc = computeLiquidation(market, pos, seizeForFullRepay(market, pos));
+  if (!calc) return null;
   const loan = market.params.loanToken, coll = market.params.collateralToken;
-  const liquidateOp = new LiquidateOp(market.marketId, pos.borrower, seized);
+  const liquidateOp = new LiquidateOp(market.marketId, pos.borrower, calc.seized);
   const swapOp = new SwapOp(collateralPoolId, coll, loan, 0n, collateralArchetype, true);
-  const ops: Transformation[] = [new FlashBorrowOp(provider, loan, repaid), liquidateOp, swapOp, new FlashRepayOp(provider, loan, repaid, 0n)];
-  return { ops, numeraire: loan, flashAmount: repaid, seized, repaid, swapPoolId: collateralPoolId, liquidateOp, swapOp };
+  const ops: Transformation[] = [new FlashBorrowOp(provider, loan, calc.repaidAssets), liquidateOp, swapOp, new FlashRepayOp(provider, loan, calc.repaidAssets, 0n)];
+  return { ops, numeraire: loan, flashAmount: calc.repaidAssets, seized: calc.seized, repaid: calc.repaidAssets, swapPoolId: collateralPoolId, liquidateOp, swapOp };
 }
 
 /** Simulate a flash-liquidation plan on forked venue + lending state; realized PnL in the loan token. */

@@ -52,14 +52,11 @@ async function main() {
         rc<bigint>({ address: params.oracle as Address, abi: ORACLE_ABI, functionName: "price" })
       ]);
       const pos = await rc<[bigint, bigint, bigint]>({ address: morpho, abi: MORPHO_ABI, functionName: "position", args: [id, p.borrower as Address] });
-      const totalBorrowAssets = mk[2], totalBorrowShares = mk[3];
       const borrowShares = pos[1], collateral = pos[2];
-      // shares → assets (round up), exactly as Morpho / primitives.readMorphoPosition.
-      const debtAssets = totalBorrowShares > 0n ? (borrowShares * totalBorrowAssets + totalBorrowShares - 1n) / totalBorrowShares : 0n;
-      if (debtAssets <= 0n || collateral <= 0n) continue;
-
-      if (!markets.has(id.toLowerCase())) markets.set(id.toLowerCase(), new LendingMarketSim(id, p.protocol, params, price, totalBorrowAssets, totalBorrowShares));
-      positions.set(posKey(id, p.borrower), new BorrowerPositionSim(id, p.borrower, collateral, debtAssets));
+      if (borrowShares <= 0n || collateral <= 0n) continue;
+      // Market: [totalSupplyAssets, totalSupplyShares, totalBorrowAssets, totalBorrowShares, lastUpdate, fee]
+      if (!markets.has(id.toLowerCase())) markets.set(id.toLowerCase(), new LendingMarketSim(id, p.protocol, params, price, mk[2], mk[3], mk[0], Number(mk[4]), mk[5]));
+      positions.set(posKey(id, p.borrower), new BorrowerPositionSim(id, p.borrower, collateral, borrowShares));
       rowsWithFresh.push({ marketId: id.toLowerCase(), borrower: p.borrower, storedHf: p.hf, loanSym: p.loanSymbol, collSym: p.collateralSymbol });
     } catch { /* skip unreadable */ }
   }

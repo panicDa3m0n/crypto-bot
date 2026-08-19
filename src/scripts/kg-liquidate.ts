@@ -102,10 +102,9 @@ async function main() {
         rc<bigint>({ address: params.oracle as Address, abi: ORACLE_ABI, functionName: "price" })
       ]);
       const pos = await rc<[bigint, bigint, bigint]>({ address: morpho, abi: MORPHO_ABI, functionName: "position", args: [id, p.borrower as Address] });
-      const debtAssets = mk[3] > 0n ? (pos[1] * mk[2] + mk[3] - 1n) / mk[3] : 0n;
       const collateral = pos[2];
-      const market = new LendingMarketSim(id, p.protocol, params, price, mk[2], mk[3]);
-      const position = new BorrowerPositionSim(id, p.borrower, collateral, debtAssets);
+      const market = new LendingMarketSim(id, p.protocol, params, price, mk[2], mk[3], mk[0], Number(mk[4]), mk[5]);
+      const position = new BorrowerPositionSim(id, p.borrower, collateral, pos[1]);
       if (!position.protocolLiquidatable(market)) continue;
       liquidatable++;
 
