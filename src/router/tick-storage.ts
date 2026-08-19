@@ -56,25 +56,45 @@ export interface TickSnapshot { sqrtPriceX96: bigint; tick: number; liquidity: b
 /** Read the COMPLETE tick map @ `block` via Multicall3 (all pinned to the same B). Returns null if the pool
  * is too large for one scan (`words > maxWords`, a cost guard — deferred) or a read fails. */
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+type PoolCall = { address: Address; abi: typeof V3_POOL_ABI; functionName: "tickBitmap" | "ticks"; args: readonly [number] };
+
+// Multicall that retries ONLY the still-failed sub-calls — flaky public/aggregator RPCs return PARTIAL
+// results (random sub-call failures, not clean throttling), and a COMPLETE snapshot needs every read.
+async function mcRetry(client: PublicClient, contracts: readonly PoolCall[], blockNumber: bigint): Promise<unknown[] | null> {
+  const out = new Array<unknown>(contracts.length);
+  let pending = contracts.map((_, i) => i);
+  for (let round = 0; round < 12 && pending.length; round++) {
+    const sub = pending.map((i) => contracts[i]);
+    const r = await client.multicall({ contracts: sub, blockNumber, multicallAddress: MULTICALL3, allowFailure: true }).catch(() => null); // db-first-allow: storage scanner
+    if (r) { const still: number[] = []; for (let j = 0; j < pending.length; j++) { if (r[j].status === "success") out[pending[j]] = r[j].result; else still.push(pending[j]); } pending = still; }
+    if (pending.length) await sleep(250 * (round + 1));
+  }
+  return pending.length ? null : out;
+}
+
+/** Read ONLY the bitmaps → the SET of initialized ticks (the cheap check to certify a subgraph seed: the
+ * external tick-set must equal the on-chain bitmap set exactly, else reject the seed → full storage scan). */
+export async function bitmapTickSet(client: PublicClient, pool: Address, tickSpacing: number, block: number, maxWords = 2000): Promise<Set<number> | null> {
+  const { minWord, maxWord, words } = bitmapWordRange(tickSpacing);
+  if (words > maxWords) return null;
+  const blockNumber = BigInt(block);
+  const set = new Set<number>();
+  for (let w = minWord; w <= maxWord; w += CHUNK) {
+    const hi = Math.min(w + CHUNK - 1, maxWord);
+    const calls: PoolCall[] = []; for (let k = w; k <= hi; k++) calls.push({ address: pool, abi: V3_POOL_ABI, functionName: "tickBitmap", args: [k] });
+    const bitmaps = await mcRetry(client, calls, blockNumber);
+    if (!bitmaps) return null;
+    await sleep(400);
+    for (let i = 0; i < bitmaps.length; i++) { const bm = bitmaps[i] as bigint; if (bm === 0n) continue; const wp = w + i; for (let bit = 0; bit < 256; bit++) if ((bm >> BigInt(bit)) & 1n) set.add((wp * 256 + bit) * tickSpacing); }
+  }
+  return set;
+}
 
 export async function scanTickMap(client: PublicClient, pool: Address, tickSpacing: number, block: number, maxWords = 2000): Promise<TickSnapshot | null> {
   const { minWord, maxWord, words } = bitmapWordRange(tickSpacing);
   if (words > maxWords) return null; // spacing=1 giants → chunked/incremental scan (future), skip for now
   const blockNumber = BigInt(block);
-  // Multicall with backoff+retry — public RPCs throttle rapid aggregate eth_calls (all-failure = rate-limit).
-  // Flaky public/aggregator RPCs return PARTIAL multicall results (random sub-call failures, not throttling).
-  // For a COMPLETE snapshot every read must resolve → retry ONLY the still-failed sub-calls until all land.
-  const mc = async (contracts: readonly { address: Address; abi: typeof V3_POOL_ABI; functionName: "tickBitmap" | "ticks"; args: readonly [number] }[]): Promise<unknown[] | null> => {
-    const out = new Array<unknown>(contracts.length);
-    let pending = contracts.map((_, i) => i);
-    for (let round = 0; round < 12 && pending.length; round++) {
-      const sub = pending.map((i) => contracts[i]);
-      const r = await client.multicall({ contracts: sub, blockNumber, multicallAddress: MULTICALL3, allowFailure: true }).catch(() => null); // db-first-allow: storage scanner
-      if (r) { const still: number[] = []; for (let j = 0; j < pending.length; j++) { if (r[j].status === "success") out[pending[j]] = r[j].result; else still.push(pending[j]); } pending = still; }
-      if (pending.length) await sleep(250 * (round + 1));
-    }
-    return pending.length ? null : out;
-  };
+  const mc = (contracts: readonly PoolCall[]) => mcRetry(client, contracts, blockNumber);
 
   const [slot0, liquidity] = await Promise.all([
     client.readContract({ address: pool, abi: V3_POOL_ABI, functionName: "slot0", blockNumber }).catch(() => null), // db-first-allow: storage scanner (write-side ingestion)
