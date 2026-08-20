@@ -1640,6 +1640,45 @@ export class Database {
   async setObservationPreflight(chainId: number, ckey: string, block: number, status: string): Promise<void> {
     await this.pool.query(`UPDATE kg_candidate_observations SET preflight_status=$4 WHERE chain_id=$1 AND ckey=$2 AND block=$3`, [chainId, ckey, block, status]);
   }
+  /** Watch-tier positions WITH raw amounts (Item A/a1) — the size-specific liquidation-capture analysis needs
+   * collateralRaw/debtRaw + decimals + lltv, not just the USD summaries. */
+  async positionsForCapture(chainId: number, tier = "watch"): Promise<Array<{ marketId: string; borrower: string; collateral: string; collateralSymbol: string | null; loan: string; loanSymbol: string | null; hf: number | null; collateralUsd: number | null; debtUsd: number | null; lltv: bigint | null; collateralRaw: bigint | null; collateralDec: number | null; debtRaw: bigint | null; loanDec: number | null }>> {
+    const r = await this.pool.query<Record<string, unknown>>(
+      `SELECT market_id, borrower, collateral_token, collateral_symbol, loan_token, loan_symbol, hf::float8 hf,
+              collateral_usd::float8 collateral_usd, debt_usd::float8 debt_usd,
+              meta->>'lltv' lltv, meta->>'collateralRaw' craw, meta->>'collateralDecimals' cdec,
+              meta->>'debtRaw' draw, meta->>'loanDecimals' ldec
+       FROM lending_positions WHERE chain_id=$1 AND tier=$2 AND collateral_token IS NOT NULL AND loan_token IS NOT NULL`,
+      [chainId, tier]
+    );
+    const big = (v: unknown) => (v == null ? null : BigInt(String(v).split(".")[0]));
+    const num = (v: unknown) => (v == null ? null : Number(v));
+    return r.rows.map((x) => ({
+      marketId: String(x.market_id), borrower: String(x.borrower),
+      collateral: String(x.collateral_token).toLowerCase(), collateralSymbol: x.collateral_symbol as string | null,
+      loan: String(x.loan_token).toLowerCase(), loanSymbol: x.loan_symbol as string | null,
+      hf: x.hf as number | null, collateralUsd: x.collateral_usd as number | null, debtUsd: x.debt_usd as number | null,
+      lltv: big(x.lltv), collateralRaw: big(x.craw), collateralDec: num(x.cdec), debtRaw: big(x.draw), loanDec: num(x.ldec),
+    }));
+  }
+
+  /** Coverage census: the deepest live pool of each concentrated factory (V3-family AND V4), so a capability
+   * probe can prove there is no protocol on the chain we cannot read. */
+  async topPoolPerFactory(chainId: number, limit = 20): Promise<Array<{ factory: string; archetype: string; pool: string; pools: number; fee: number | null; tickSpacing: number | null }>> {
+    const r = await this.pool.query<Record<string, unknown>>(
+      `WITH c AS (
+         SELECT e.meta->>'factory' factory, e.meta->>'archetype' arch, e.address, ps.liquidity,
+                (e.meta->>'fee')::numeric fee, (e.meta->>'tickSpacing')::numeric ts,
+                count(*) OVER (PARTITION BY e.meta->>'factory') n,
+                row_number() OVER (PARTITION BY e.meta->>'factory' ORDER BY ps.liquidity DESC NULLS LAST) rn
+         FROM entities e JOIN pool_state ps ON ps.chain_id=e.chain_id AND ps.pool=e.address
+         WHERE e.chain_id=$1 AND e.kind='pool' AND e.meta->>'archetype' IN ('v3','v4','slipstream')
+           AND e.meta->>'factory' IS NOT NULL AND ps.liquidity > 0)
+       SELECT factory, arch, address, n, fee, ts FROM c WHERE rn=1 ORDER BY n DESC LIMIT $2`, [chainId, limit]
+    );
+    return r.rows.map((x) => ({ factory: String(x.factory), archetype: String(x.arch), pool: String(x.address), pools: Number(x.n), fee: x.fee == null ? null : Number(x.fee), tickSpacing: x.ts == null ? null : Number(x.ts) }));
+  }
+
   /** REALITY SCORE (Item 6) — per-detector aggregate over the candidate lifecycle table. */
   async realityByDetector(chainId: number): Promise<Array<{ detector: string; candidates: number; executable: number; netPositive: number; exact: number; preflightPass: number; behaviorMismatch: number; profitMoved: number; encodeUnsupported: number; medianNet: number | null; p95Net: number | null; maxNet: number | null; medianLifetime: number | null; p95Lifetime: number | null; maxSeen: number }>> {
     const r = await this.pool.query(
