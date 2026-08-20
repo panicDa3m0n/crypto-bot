@@ -14,6 +14,7 @@ const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000
 const STORAGE_SCAN_INTERVAL_MS = 15_000; // heavy last-resort path (Pinax reliable lane) — bound its cadence
 const GAS_POLL_INTERVAL_MS = 20_000;     // DB-first gas: write-side poller cadence (read-side reads gas_state)
 const DEX_IDENTITY_INTERVAL_MS = 120_000; // factory identity barely changes; its queries are heavy (full pool aggregate)
+const RARE_PASS_INTERVAL_MS = 20_000;   // slow-changing populations: no need to poll them at the hot cadence
 
 const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)", "function tickSpacing() view returns (int24)"]);
 const AERO_STABLE_ABI = parseAbi(["function stable() view returns (bool)"]);
@@ -49,6 +50,7 @@ export class RegistryEnricher {
   private lastStorageScanAt = 0;
   private lastGasAt = 0;
   private lastDexIdentityAt = 0;
+  private lastRareAt = 0;
   private scanClient?: PublicClient | null; // lazy reliable lane (Pinax) for storage-scan certification; null = unconfigured
   private nudged = false; // a nudge has a drain scheduled imminently (coalesces a burst of nudges into one)
 
@@ -95,15 +97,22 @@ export class RegistryEnricher {
     // Block-based tracking: stamp writes/attempts with the indexer's current block (DB-read, no RPC).
     const block = await this.db.getIndexerCursor(this.config.CHAIN_ID).catch(() => null);
     try {
+      // HOT passes: these carry the continuous flow (new pools/tokens from every block) and run every cycle.
       const pools = await this.enrichPools(block);
       const toks = await this.enrichTokens(block);
-      const facs = await this.enrichFactories(block);
-      const rev = await this.enrichFactoryReverse(block);
-      const pfee = await this.enrichProtocolFees(block);
       const syms = await this.enrichSymbols(block);
-      const cls = await this.enrichClassify(block);
-      const dex = await this.enrichDexIdentity(block);
-      const aero = await this.enrichAeroStable(block);
+      // RARE passes: their populations change slowly (a fork's factory set, an unknown archetype, a protocol
+      // fee). Polling them at the hot cadence cost a DB round-trip each, every cycle, to learn there was
+      // nothing to do — and each aggregate is not free. They now run on their own slow beat.
+      const rare = Date.now() - this.lastRareAt > RARE_PASS_INTERVAL_MS;
+      if (rare) this.lastRareAt = Date.now();
+      const idle = { done: 0, rateLimited: false };
+      const facs = rare ? await this.enrichFactories(block) : idle;
+      const rev = rare ? await this.enrichFactoryReverse(block) : idle;
+      const pfee = rare ? await this.enrichProtocolFees(block) : idle;
+      const cls = rare ? await this.enrichClassify(block) : idle;
+      const aero = rare ? await this.enrichAeroStable(block) : idle;
+      const dex = await this.enrichDexIdentity(block); // self-throttled (its queries aggregate every pool)
       did = pools.done + toks.done + facs.done + aero.done + rev.done + pfee.done + syms.done + cls.done + dex.done;
       rateLimited = pools.rateLimited || toks.rateLimited || facs.rateLimited || aero.rateLimited || rev.rateLimited || pfee.rateLimited || syms.rateLimited || cls.rateLimited || dex.rateLimited;
       // ACTIVITY LOG: record only cycles that did work or hit a limit — an idle tick is not news, but a cycle
@@ -173,7 +182,7 @@ export class RegistryEnricher {
     // The dedicated enrichment lane answers SINGLE reads but returns all-failures for BATCHED multicalls
     // (measured: nodies 1/1 ok, 0/40, 0/120 — silently, without throwing). Batch reads therefore go to a
     // multicall-capable lane; the data was always on-chain, only the transport was wrong.
-    const mcClient = this.getScanClient() ?? this.chain.primary;
+    const mcClient = this.bulkClient();
     let pending = wants.map((_, i) => i), transportFailed = false;
     for (let round = 0; round < 3 && pending.length; round++) {
       const sub = pending.map((i) => contracts[i]);
@@ -367,6 +376,15 @@ export class RegistryEnricher {
   /** The reliable read lane for storage scans (a multi-hundred-word tick sweep throttles public RPCs). Pinax
    * (or any archive-grade endpoint) via PINAX_RPC/SCAN_RPC. Lazily built; null (cached) when unconfigured so
    * the storage-scan path simply stays dormant — it never falls back to a flaky lane and mis-certifies. */
+  /**
+   * BULK-READ lane for background enrichment batches. Deliberately NOT the indexer's lane: the indexer is the
+   * urgent, per-block component and must never contend with background work. Enrichment issues ~300 multicall
+   * sub-calls every few seconds — putting that on the indexer's provider is what turns a healthy indexer into
+   * a lagging one. base.org is multicall-capable and fast for this shape (measured 120 sub-calls in ~197ms).
+   */
+  private bulkClient(): PublicClient { return this.chain.primary; }
+
+  /** RELIABLE/archive lane, reserved for the rare heavy storage scan (throttled) — not for per-cycle batches. */
   private getScanClient(): PublicClient | null {
     if (this.scanClient !== undefined) return this.scanClient;
     const url = process.env.PINAX_RPC || process.env.SCAN_RPC || "";
@@ -451,7 +469,7 @@ export class RegistryEnricher {
     const cid = this.config.CHAIN_ID;
     const batch = await this.db.poolsMissingFactory(cid, POOL_BATCH).catch(() => []);
     if (!batch.length) return { done: 0, rateLimited: false };
-    const mc = this.getScanClient() ?? this.chain.primary;
+    const mc = this.bulkClient();
     let res: Array<{ status: string; result?: unknown }>;
     try {
       res = await mc.multicall({ contracts: batch.map((p) => ({ address: p.address as Address, abi: POOL_META_ABI, functionName: "factory" as const })), multicallAddress: MULTICALL3, allowFailure: true }) as Array<{ status: string; result?: unknown }>; // db-first-allow: write-side enrichment
@@ -490,7 +508,7 @@ export class RegistryEnricher {
     if (!batch.length) return { done: 0, rateLimited: false };
     const cands = await this.db.knownFactories(cid, ["v2", "aerodrome", "aerodrome-stable", "solidly"]).catch(() => []);
     if (!cands.length) return { done: 0, rateLimited: false };
-    const mc = this.getScanClient() ?? this.chain.primary;
+    const mc = this.bulkClient();
     let done = 0;
     for (const p of batch) {
       if (!p.token0 || !p.token1) continue;
@@ -599,7 +617,7 @@ export class RegistryEnricher {
     const cid = this.config.CHAIN_ID;
     const batch = await this.db.tokensMissingSymbol(cid, 60).catch(() => [] as string[]);
     if (!batch.length) return { done: 0, rateLimited: false };
-    const mc = this.getScanClient() ?? this.chain.primary;
+    const mc = this.bulkClient();
     let res: Array<{ status: string; result?: unknown }>;
     try { res = await mc.multicall({ contracts: batch.map((a) => ({ address: a as Address, abi: ERC20_META_ABI, functionName: "symbol" as const })), multicallAddress: MULTICALL3, allowFailure: true }) as Array<{ status: string; result?: unknown }>; } // db-first-allow: write-side enrichment
     catch (e) { if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: 0, rateLimited: true }; } return { done: 0, rateLimited: false }; }
@@ -618,7 +636,7 @@ export class RegistryEnricher {
     const cid = this.config.CHAIN_ID;
     const batch = await this.db.poolsNeedingClassification(cid, 20).catch(() => []);
     if (!batch.length) return { done: 0, rateLimited: false };
-    const mc = this.getScanClient() ?? this.chain.primary;
+    const mc = this.bulkClient();
     const calls: Array<Record<string, unknown>> = [];
     for (const p of batch) {
       calls.push({ address: p.address as Address, abi: CLASSIFY_ABI, functionName: "slot0" });
