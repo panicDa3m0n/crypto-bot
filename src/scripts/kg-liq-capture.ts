@@ -35,7 +35,8 @@ async function exitAt(ctx: SurfaceContext, collateral: string, loan: string, amo
   if (!paths.length) return null;
   const raw = paths[0];
   const trusted = paths.find((p) => p.exact && p.clean) ?? null;
-  const executable = paths.find((p) => p.encodable && p.clean) ?? null;
+  // ARMABLE requires exact: without a certified tick map a size-dependent quote is fantasy (see surfaces.ts).
+  const executable = paths.find((p) => p.encodable && p.clean && p.exact) ?? null;
   return { raw, trusted, executable };
 }
 

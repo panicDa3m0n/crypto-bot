@@ -16,11 +16,16 @@ export const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11" as Addres
 const CHUNK = 60; // reads per Multicall3 eth_call (public-RPC gas + reliability)
 
 const V3_POOL_ABI = parseAbi([
-  "function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)",
+  // MINIMAL slot0 — only the two fields every fork shares. Uniswap returns 7 values, Slipstream 6: decoding
+  // with the full Uniswap ABI made every 6-field fork fail, and the failure was silently reported as a "cost
+  // guard" problem (467 Slipstream pools, 0 certified, and a misdiagnosis that cost a whole analysis).
+  "function slot0() view returns (uint160 sqrtPriceX96, int24 tick)",
   "function liquidity() view returns (uint128)",
   "function tickSpacing() view returns (int24)",
   "function tickBitmap(int16 wordPosition) view returns (uint256)",
-  "function ticks(int24 tick) view returns (uint128 liquidityGross, int128 liquidityNet, uint256 feeGrowthOutside0X128, uint256 feeGrowthOutside1X128, int56 tickCumulativeOutside, uint160 secondsPerLiquidityOutsideX128, uint32 secondsOutside, bool initialized)"
+  // MINIMAL ticks() for the same reason: forks extend the struct (Slipstream adds gauge/reward fields), and we
+  // only ever consume liquidityNet. Declaring the full Uniswap tuple breaks decoding on every extended fork.
+  "function ticks(int24 tick) view returns (uint128 liquidityGross, int128 liquidityNet)"
 ]);
 const QUOTER_V2_ABI = parseAbi([
   "function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)"

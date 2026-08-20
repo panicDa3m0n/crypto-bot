@@ -7,7 +7,7 @@ import type { BerachainClients } from "./chain.js";
 import type { Etherscan } from "./etherscan.js";
 import type { Blockscout } from "./blockscout.js";
 import { UNIV3_MINT, UNIV3_BURN, POOL_CREATED, EVENT_DECODERS, type RawLog } from "./indexer/events.js";
-import { scanTickMap, validateSnapshotVsQuoter, tickStorageProfile } from "./router/tick-storage.js";
+import { scanTickMap, validateSnapshotVsQuoter, tickStorageProfile, bitmapWordRange, MULTICALL3 } from "./router/tick-storage.js";
 
 const UNIV3_QUOTER_BASE = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a" as Address; // Uniswap V3 QuoterV2 on Base
 const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 }; // 2500=Pancake tier
@@ -18,6 +18,7 @@ const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "fun
 const AERO_STABLE_ABI = parseAbi(["function stable() view returns (bool)"]);
 const AERO_FACTORY_FEE_ABI = parseAbi(["function getFee(address pool, bool stable) view returns (uint256)"]);
 const ERC20_META_ABI = parseAbi(["function symbol() view returns (string)", "function name() view returns (string)", "function decimals() view returns (uint8)"]);
+const POOL_BATCH = 40;   // one Multicall3 covers the whole batch, so batch size is nearly free now
 const FAST_MS = 400;      // there's a backlog → drain quickly
 const BACKOFF_MS = 6_000; // the enrichment RPC threw a rate-limit → let the buffer WAIT, then resume
 const MAX_ATTEMPTS = 4;   // per-entity in-memory read attempts before giving up (marks checked so we don't loop forever)
@@ -57,6 +58,11 @@ export class RegistryEnricher {
 
   start(): void {
     this.logger.info({ lane: this.chain.enrichmentRpc }, "enrichment worker started (dedicated RPC)");
+    // Give previously-burned entities another chance: an entity marked failed by a WRITE-SIDE fault (flaky
+    // RPC) is a silent data hole downstream. Completeness is the goal, so failures are not permanent.
+    void this.db.resetEnrichFailures(this.config.CHAIN_ID, "pool")
+      .then((n) => { if (n) this.logger.info({ requeued: n }, "enrichment: returned previously-failed pools to the buffer"); })
+      .catch(() => undefined);
     this.schedule(FAST_MS);
   }
   stop(): void { if (this.timer) clearTimeout(this.timer); }
@@ -115,35 +121,75 @@ export class RegistryEnricher {
     }
   }
 
-  /** Fill token0/token1/fee for bare pools discovered by their Swap/Sync (pre-existing pools). Writing
-   * token0 flips `enrich_pending` false automatically (generated column) — no bookkeeping flag needed. */
+  /** Complete a pool's MANDATORY data (token0/token1 + per-pool fee/tickSpacing where the archetype has them).
+   * Reads ONLY the fields that are missing — a pool already carrying its tokens must not re-read them. Data a
+   * calculation depends on is enrichment work: never left to a default downstream. Writing the last missing
+   * field flips `enrich_pending` false automatically (generated column). */
   private async enrichPools(block: number | null): Promise<{ done: number; rateLimited: boolean }> {
-    const batch = await this.db.entitiesNeedingPoolInfo(this.config.CHAIN_ID, this.config.ENRICH_BATCH).catch(() => []);
+    const batch = await this.db.entitiesNeedingPoolInfo(this.config.CHAIN_ID, POOL_BATCH).catch(() => []);
     if (!batch.length) return { done: 0, rateLimited: false };
+    const CONC_FEE = new Set(["v3", "slipstream"]);            // per-pool fee() exists on these
+    const CONC_SPACING = new Set(["v3", "slipstream", "algebra"]); // tickSpacing() is static on all of them
+    // ONE Multicall3 for the WHOLE batch instead of 2-3 sequential eth_calls per pool. The buffer holds
+    // thousands of incomplete pools; per-pool calls on a rate-limited public lane drain slower than discovery
+    // adds, so the backlog never clears. Batching is what makes "the enricher finds the missing data" true.
+    type Want = { address: string; field: "token0" | "token1" | "fee" | "factory" | "tickSpacing" };
+    const wants: Want[] = [];
+    for (const p of batch) {
+      const arch = p.archetype ?? "";
+      if (!p.hasTokens) { wants.push({ address: p.address, field: "token0" }, { address: p.address, field: "token1" }); }
+      if (p.needsFee && CONC_FEE.has(arch)) wants.push({ address: p.address, field: "fee" });
+      wants.push({ address: p.address, field: "factory" }); // own-execution routes each pool to ITS dex router
+      if (p.needsSpacing && CONC_SPACING.has(arch)) wants.push({ address: p.address, field: "tickSpacing" });
+    }
+    if (!wants.length) return { done: 0, rateLimited: false };
+    // Retry ONLY the still-unanswered sub-calls: a flaky/rate-limited lane returns PARTIAL multicall results,
+    // and a transport failure must NEVER be mistaken for "this pool has no such data" — that would burn good
+    // pools into enrich_failed permanently (the classic checked-before-read data loss).
+    const contracts = wants.map((w) => ({ address: w.address as Address, abi: POOL_META_ABI, functionName: w.field }));
+    const results = new Array<{ status: string; result?: unknown } | undefined>(wants.length);
+    // The dedicated enrichment lane answers SINGLE reads but returns all-failures for BATCHED multicalls
+    // (measured: nodies 1/1 ok, 0/40, 0/120 — silently, without throwing). Batch reads therefore go to a
+    // multicall-capable lane; the data was always on-chain, only the transport was wrong.
+    const mcClient = this.getScanClient() ?? this.chain.primary;
+    let pending = wants.map((_, i) => i), transportFailed = false;
+    for (let round = 0; round < 3 && pending.length; round++) {
+      const sub = pending.map((i) => contracts[i]);
+      let r: Array<{ status: string; result?: unknown }> | null = null;
+      try {
+        r = await mcClient.multicall({ contracts: sub, multicallAddress: MULTICALL3, allowFailure: true }) as Array<{ status: string; result?: unknown }>; // db-first-allow: write-side enrichment
+      } catch (e) {
+        if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: 0, rateLimited: true }; }
+        transportFailed = true; // whole-call failure: NOT evidence about any pool's data
+      }
+      if (!r) { await this.pace(); continue; }
+      const before = pending.length;
+      const still: number[] = [];
+      for (let j = 0; j < pending.length; j++) { if (r[j]?.status === "success") results[pending[j]] = r[j]; else still.push(pending[j]); }
+      // ZERO successes across a whole batch is evidence about the LANE, not about 40 pools simultaneously
+      // lacking the same functions. Treating it as definitive is what burned good pools into enrich_failed.
+      if (still.length === before) { transportFailed = true; break; }
+      pending = still;
+      if (pending.length) await this.pace();
+    }
+    const got = new Map<string, Record<string, unknown>>();
+    for (let i = 0; i < wants.length; i++) {
+      if (results[i]?.status !== "success") continue;
+      const w = wants[i], v = results[i]!.result;
+      const m = got.get(w.address) ?? {}; got.set(w.address, m);
+      if (w.field === "token0" || w.field === "token1" || w.field === "factory") m[w.field] = String(v).toLowerCase();
+      else m[w.field] = Number(v);
+    }
     let done = 0;
     for (const p of batch) {
-      try {
-        const [t0, t1] = await Promise.all([
-          this.chain.enrichment.readContract({ address: p.address as Address, abi: POOL_META_ABI, functionName: "token0" }) as Promise<string>,
-          this.chain.enrichment.readContract({ address: p.address as Address, abi: POOL_META_ABI, functionName: "token1" }) as Promise<string>
-        ]);
-        const token0 = t0.toLowerCase(), token1 = t1.toLowerCase();
-        const [fee, factory, tickSpacing] = await Promise.all([
-          p.archetype === "v3" ? this.chain.enrichment.readContract({ address: p.address as Address, abi: POOL_META_ABI, functionName: "fee" }).then(Number).catch(() => undefined) : Promise.resolve(undefined),
-          this.chain.enrichment.readContract({ address: p.address as Address, abi: POOL_META_ABI, functionName: "factory" }).then((f) => (f as string).toLowerCase()).catch(() => undefined), // own-execution routes each pool to ITS dex router
-          // tickSpacing (int24) — filled DB-first for concentrated pools so LocalRouter never reads it live (SlipStream keys by it).
-          p.archetype === "v3" ? this.chain.enrichment.readContract({ address: p.address as Address, abi: POOL_META_ABI, functionName: "tickSpacing" }).then((t) => Number(t)).catch(() => undefined) : Promise.resolve(undefined)
-        ]);
-        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: p.address, kind: "pool", meta: { token0, token1, fee, ...(factory ? { factory } : {}), ...(tickSpacing ? { tickSpacing } : {}) }, source: "enricher", block: block ?? undefined }).catch(() => undefined);
-        // Ensure the two tokens exist as entities so they enter the buffer for decimals enrichment next.
-        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token0, kind: "token", source: "enricher", block: block ?? undefined }).catch(() => undefined);
-        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: token1, kind: "token", source: "enricher", block: block ?? undefined }).catch(() => undefined);
-        done += 1;
-      } catch (e) {
-        if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done, rateLimited: true }; }
-        await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, p.address, "pool", block, MAX_ATTEMPTS).catch(() => undefined);
-      }
-      await this.pace();
+      const meta = got.get(p.address);
+      // Count an attempt ONLY on a definitive answer (the call resolved and the data isn't there). After a
+      // transport failure we leave the pool untouched so it is retried later instead of being burned.
+      if (!meta || !Object.keys(meta).length) { if (!transportFailed) await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, p.address, "pool", block, MAX_ATTEMPTS).catch(() => undefined); continue; }
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: p.address, kind: "pool", meta, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+      // Ensure the two tokens exist as entities so they enter the buffer for decimals enrichment next.
+      for (const f of ["token0", "token1"] as const) { const t = meta[f] as string | undefined; if (t) await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t, kind: "token", source: "enricher", block: block ?? undefined }).catch(() => undefined); }
+      done += 1;
     }
     return { done, rateLimited: false };
   }
@@ -339,7 +385,15 @@ export class RegistryEnricher {
       const B = Math.min(head - 3, cov.continuousThrough); // settled block the lane serves, ≤ our continuous head
       if (B <= 0) return { done: 0, rateLimited: false };
       const snap = await scanTickMap(client, pool, tickSpacing, B);
-      if (!snap) { await this.db.noteTickBootstrapError(cid, pool, "storage scan failed / too large (cost guard)").catch(() => undefined); return { done: 1, rateLimited: false }; }
+      // Report WHAT actually failed. The old message blamed the cost guard for every failure, including ABI
+      // decode errors on 6-field forks — a misleading reason is worse than no reason: it sends you down the
+      // wrong investigation. bitmapWordRange tells us whether the guard is genuinely the cause.
+      if (!snap) {
+        const { words } = bitmapWordRange(tickSpacing);
+        const reason = words > 2000 ? `storage scan: word cost guard (${words} words @spacing ${tickSpacing})` : `storage scan: read/decode failed @spacing ${tickSpacing} (${words} words) — pool ABI or RPC`;
+        await this.db.noteTickBootstrapError(cid, pool, reason).catch(() => undefined);
+        return { done: 1, rateLimited: false };
+      }
       const v = await validateSnapshotVsQuoter(client, profile.quoter, snap, p.token0 as Address, p.token1 as Address, feePips, tickSpacing);
       if (!v.validated) { await this.db.failPoolTickStatus(cid, pool, `storage snapshot did not reproduce Quoter (${v.detail})`).catch(() => undefined); return { done: 1, rateLimited: false }; }
       // Replay live Mint/Burn [B+1, cursor] so the authoritative snapshot is current with the indexer head.

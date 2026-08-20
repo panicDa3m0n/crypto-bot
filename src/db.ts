@@ -402,8 +402,32 @@ export class Database {
       ALTER TABLE entities ADD COLUMN IF NOT EXISTS enrich_failed BOOLEAN NOT NULL DEFAULT false;
       ALTER TABLE entities ADD COLUMN IF NOT EXISTS enrich_attempts INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE entities ADD COLUMN IF NOT EXISTS enrich_checked_block BIGINT;
-      ALTER TABLE entities ADD COLUMN IF NOT EXISTS enrich_pending BOOLEAN
-        GENERATED ALWAYS AS ((kind = 'token' AND decimals IS NULL) OR (kind = 'pool' AND (meta->>'token0') IS NULL)) STORED;
+      -- COMPLETENESS, not "has token0". The old predicate only asked for token0, so a pool with token0 but no
+      -- fee/tickSpacing was INVISIBLE to the enrichment buffer forever (measured: 10,263 pools without fee and
+      -- 7,674 concentrated pools without tickSpacing, while the buffer reported 18 items to do). Missing data
+      -- that calculations depend on is ENRICHMENT WORK — never something to paper over with a default.
+      -- Per-archetype, because "complete" differs: v3/slipstream need per-pool fee+tickSpacing; algebra's fee
+      -- is dynamic (read per block, not stored); v2/aerodrome/solidly have NO per-pool fee at all (it is a
+      -- protocol constant, resolved once per factory); v4 is a poolId, not callable as a pool contract.
+      DO $mig$
+      DECLARE cur text;
+      BEGIN
+        SELECT pg_get_expr(d.adbin, d.adrelid) INTO cur
+          FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+         WHERE d.adrelid = 'entities'::regclass AND a.attname = 'enrich_pending';
+        IF cur IS NULL OR cur NOT LIKE '%tickSpacing%' THEN
+          ALTER TABLE entities DROP COLUMN IF EXISTS enrich_pending;
+          ALTER TABLE entities ADD COLUMN enrich_pending BOOLEAN GENERATED ALWAYS AS (
+            (kind = 'token' AND decimals IS NULL)
+            OR (kind = 'pool' AND (
+                 (meta->>'token0') IS NULL
+              OR (meta->>'token1') IS NULL
+              OR ((meta->>'archetype') IN ('v3','slipstream') AND ((meta->>'fee') IS NULL OR (meta->>'tickSpacing') IS NULL))
+              OR ((meta->>'archetype') = 'algebra' AND (meta->>'tickSpacing') IS NULL)
+            ))
+          ) STORED;
+        END IF;
+      END $mig$;
       -- The BUFFER query index: ONLY the incomplete-and-not-failed subset, keyed for resync-first,
       -- oldest-block-first drain. The enricher's drain touches this subset, never a full-table scan.
       CREATE INDEX IF NOT EXISTS entities_enrich_buffer_idx ON entities(chain_id, kind, enrich_resync DESC, updated_block)
@@ -1196,13 +1220,19 @@ export class Database {
    * (bare pools written on the critical path). The enricher fills token0/1/fee on its dedicated lane. */
   /** ENRICHMENT BUFFER (pools): bare pools missing token0/1 (discovered by a Swap/Sync, no PoolCreated seen),
    * not yet given up on. Same index-backed, resync-first, oldest-first drain as the token buffer. */
-  async entitiesNeedingPoolInfo(chainId: number, limit = 20): Promise<Array<{ address: string; archetype: string | null }>> {
-    const r = await this.pool.query<{ address: string; archetype: string | null }>(
-      `SELECT address, meta->>'archetype' AS archetype FROM entities WHERE chain_id=$1 AND kind='pool' AND enrich_pending AND NOT enrich_failed
+  /** The enrichment BUFFER for pools. Returns WHICH fields are missing so the worker reads only those — a pool
+   * that already has token0/token1 but lacks fee/tickSpacing must not re-read what it already knows. */
+  async entitiesNeedingPoolInfo(chainId: number, limit = 20): Promise<Array<{ address: string; archetype: string | null; hasTokens: boolean; needsFee: boolean; needsSpacing: boolean }>> {
+    const r = await this.pool.query<{ address: string; archetype: string | null; has_tokens: boolean; needs_fee: boolean; needs_spacing: boolean }>(
+      `SELECT address, meta->>'archetype' AS archetype,
+              ((meta->>'token0') IS NOT NULL AND (meta->>'token1') IS NOT NULL) AS has_tokens,
+              ((meta->>'fee') IS NULL) AS needs_fee,
+              ((meta->>'tickSpacing') IS NULL) AS needs_spacing
+       FROM entities WHERE chain_id=$1 AND kind='pool' AND enrich_pending AND NOT enrich_failed
        ORDER BY enrich_resync DESC, updated_block ASC NULLS FIRST LIMIT $2`,
       [chainId, limit]
     );
-    return r.rows;
+    return r.rows.map((x) => ({ address: x.address, archetype: x.archetype, hasTokens: x.has_tokens, needsFee: x.needs_fee, needsSpacing: x.needs_spacing }));
   }
 
   /** ENRICHMENT BUFFER — record a FAILED read attempt on an entity (block-based, persisted; replaces the
@@ -1229,6 +1259,16 @@ export class Database {
 
   /** GATE (resync): how many resync-flagged entities are still incomplete (not yet enriched, not failed).
    * 0 = the resync set is fully resolved → the startup gate may release the acting services. */
+  /** Return entities to the enrichment buffer after a WRITE-SIDE fault (a flaky RPC burned their attempts,
+   * not bad data). Data completeness is the goal — a permanently-failed entity we never re-try is a silent
+   * hole in every downstream calculation. Called on startup so a transient outage cannot cost us data. */
+  async resetEnrichFailures(chainId: number, kind = "pool"): Promise<number> {
+    const r = await this.pool.query(
+      `UPDATE entities SET enrich_failed=false, enrich_attempts=0 WHERE chain_id=$1 AND kind=$2 AND enrich_failed AND enrich_pending`, [chainId, kind]
+    );
+    return r.rowCount ?? 0;
+  }
+
   async countResyncOutstanding(chainId: number): Promise<number> {
     const r = await this.pool.query<{ n: number }>(
       `SELECT count(*)::int n FROM entities WHERE chain_id=$1 AND enrich_resync AND enrich_pending AND NOT enrich_failed`, [chainId]

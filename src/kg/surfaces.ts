@@ -24,7 +24,10 @@ export async function bestExitSurface(ctx: SurfaceContext, asset: string, numera
     const paths = await quoteBestPaths(ctx, asset, numeraire, sz, { maxHops: opts.maxHops ?? 3, topN: 20, deadline: opts.deadline });
     if (!paths.length) { out.push({ amountIn: sz, economicOut: 0n, economicPath: [], economicExact: false, economicEncodable: false, executableOut: null, executablePath: null }); continue; }
     const econ = paths[0]; // sorted desc by amountOut
-    const exe = paths.find((p) => p.encodable && p.clean) ?? null;
+    // ARMABLE value REQUIRES exact: a size-dependent number from a non-certified tick map is fantasy (an
+    // uncertified v3 pool quotes any size with ~no impact, which once produced a $18M quote at 0% slippage).
+    // economicOut keeps its own `economicExact` flag so research still sees the uncertified number, labelled.
+    const exe = paths.find((p) => p.encodable && p.clean && p.exact) ?? null;
     out.push({ amountIn: sz, economicOut: econ.amountOut, economicPath: econ.path, economicExact: econ.exact, economicEncodable: econ.encodable, executableOut: exe?.amountOut ?? null, executablePath: exe?.path ?? null });
   }
   return out;
