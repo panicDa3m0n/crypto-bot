@@ -55,5 +55,28 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # KG Reality Observatory (Item 4-7): continuous block-driven observer + surface intelligence. READ-ONLY +
+  # shadow eth_call only (NO broadcast). A DB advisory singleton lock guarantees only one instance ever
+  # processes blocks, so restart/overlap never double-counts. The time series it records cannot be rebuilt
+  # retroactively → restart: always protects it.
+  kg-observer:
+    build: .
+    command: ["node", "dist/scripts/kg-observer.js"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      SERVICE_ROLE: observer # kg-observer.js ignores this (standalone script); config only validates the enum
+      EXECUTION_ENABLED: "false"
+      SCANNER_ENABLED: "false"
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: always
+
 volumes:
   postgres_data:

@@ -42,6 +42,10 @@ async function main() {
   const logger = createLogger({ ...config, LOG_LEVEL: "info" as never });
   const db = new Database(config.DATABASE_URL);
   await db.migrate().catch(() => undefined);
+  const OWNER = process.env.HOSTNAME || `pid-${process.pid}`; // container id = the singleton owner identity
+  const LEASE_TTL = 600;         // seconds — safely above even a slow surface cycle; standby takes over after this
+  const SURFACE_EVERY_MS = 300_000; // surfaces are slow-moving intelligence → every ~5min, NOT every arb cycle
+  let lastSurfaceAt = 0;
   const chain = new BerachainClients(config, logger);
   const cid = config.CHAIN_ID;
   const weth = config.WBERA_ADDRESS.toLowerCase(), usdc = config.USDC_E_ADDRESS.toLowerCase();
@@ -51,9 +55,15 @@ async function main() {
   const kg = org?.address as Address | undefined, owner = config.WALLET_ADDRESS as Address;
   logger.info({ blockDriven: true, preflightK: PREFLIGHT_K, staleBlocks: STALE_PREFLIGHT_BLOCKS, executor: kg ?? "none" }, "KG observer started (READ-ONLY + shadow preflight; NO broadcast)");
 
-  let lastBlock = 0;
+  let lastBlock = 0, wasStandby = false;
   for (;;) {
     try {
+      // SINGLE-INSTANCE lease heartbeat: only the current lease owner processes blocks.
+      if (!(await db.acquireObserverLease(cid, OWNER, LEASE_TTL).catch(() => false))) {
+        if (!wasStandby) { logger.warn("another kg-observer holds the lease — standing by"); wasStandby = true; }
+        await sleep(POLL_MS * 3); continue;
+      }
+      if (wasStandby) { logger.info("acquired observer lease — taking over"); wasStandby = false; }
       const cs = await db.getChainStatus(cid).catch(() => null);
       const head = cs?.indexedBlock ?? 0;
       if (!cs?.synced || head <= lastBlock) { await sleep(POLL_MS); continue; } // block-driven: only on advance
@@ -86,15 +96,21 @@ async function main() {
           }
         }
       }
-      // SURFACE INTELLIGENCE (Item 7): pair/best-exit surfaces for a bounded target set → time series + gaps.
-      const bl = await db.listBlacklist().catch(() => [] as Array<{ scope: string; value: string }>);
-      const blacklisted = new Set(bl.filter((b) => b.scope === "token").map((b) => b.value.toLowerCase()));
-      const ctx = buildSurfaceContext(db, cid, g, (ps) => router.execCapability(ps) != null, blacklisted);
-      const surf = await runSurfaces(db, config, g, ctx).catch(() => ({ pairRuns: 0, exitRuns: 0, signals: 0 }));
+      // SURFACE INTELLIGENCE (Item 7) — slow-moving; decoupled from the time-sensitive arb cycle so arb detection
+      // stays responsive (~cycle) while surfaces run every ~5min. Keeps most cycles fast → lease always fresh.
+      let surf = { pairRuns: 0, exitRuns: 0, signals: 0, skipped: 0 };
+      if (Date.now() - lastSurfaceAt > SURFACE_EVERY_MS) {
+        lastSurfaceAt = Date.now();
+        const bl = await db.listBlacklist().catch(() => [] as Array<{ scope: string; value: string }>);
+        const blacklisted = new Set(bl.filter((b) => b.scope === "token").map((b) => b.value.toLowerCase()));
+        const ctx = buildSurfaceContext(db, cid, g, (ps) => router.execCapability(ps) != null, blacklisted);
+        await db.acquireObserverLease(cid, OWNER, LEASE_TTL).catch(() => false); // heartbeat before the heavy pass
+        surf = await runSurfaces(db, config, g, ctx, { budgetMs: 60_000 }).catch(() => ({ pairRuns: 0, exitRuns: 0, signals: 0, skipped: 0 }));
+      }
 
       const dt = Date.now() - t0;
       await db.recordObserverRun({ chainId: cid, block: head, durationMs: dt, poolsPriced: g.stats.poolsPriced, multiVenuePairs: stats.multiVenuePairs, sized: stats.sized, economic: stats.economic, economicallyPositive: stats.economicallyPositive, routeEncodable: stats.routeEncodable, executable: stats.executable, preflightAttempted: attempted, preflightPass: pass, detectors: stats.detectors, stats: { unsupportedForks: stats.unsupportedForks, blockedByTicks: stats.blockedByTicks } }).catch(() => undefined);
-      logger.info({ block: head, dt, sized: stats.sized, economicallyPositive: stats.economicallyPositive, executable: stats.executable, preflight: `${pass}/${attempted}`, reused, surfaces: `${surf.pairRuns}pair/${surf.exitRuns}exit/${surf.signals}sig`, outcomes }, "observer cycle");
+      logger.info({ block: head, dt, sized: stats.sized, economicallyPositive: stats.economicallyPositive, executable: stats.executable, preflight: `${pass}/${attempted}`, reused, surfaces: `${surf.pairRuns}pair/${surf.exitRuns}exit/${surf.signals}sig/${surf.skipped}skip`, outcomes }, "observer cycle");
     } catch (e) { logger.error({ err: e instanceof Error ? e.message : String(e) }, "observer cycle failed"); }
     await sleep(POLL_MS);
   }

@@ -17,10 +17,11 @@ export interface ExitPoint {
   executableOut: bigint | null; executablePath: string[] | null; // best path that is encodable AND clean
 }
 
-export async function bestExitSurface(ctx: SurfaceContext, asset: string, numeraire: string, sizes: bigint[], opts: { maxHops?: number } = {}): Promise<ExitPoint[]> {
+export async function bestExitSurface(ctx: SurfaceContext, asset: string, numeraire: string, sizes: bigint[], opts: { maxHops?: number; deadline?: number } = {}): Promise<ExitPoint[]> {
   const out: ExitPoint[] = [];
   for (const sz of sizes) {
-    const paths = await quoteBestPaths(ctx, asset, numeraire, sz, { maxHops: opts.maxHops ?? 3, topN: 20 });
+    if (opts.deadline && Date.now() > opts.deadline) break;
+    const paths = await quoteBestPaths(ctx, asset, numeraire, sz, { maxHops: opts.maxHops ?? 3, topN: 20, deadline: opts.deadline });
     if (!paths.length) { out.push({ amountIn: sz, economicOut: 0n, economicPath: [], economicExact: false, economicEncodable: false, executableOut: null, executablePath: null }); continue; }
     const econ = paths[0]; // sorted desc by amountOut
     const exe = paths.find((p) => p.encodable && p.clean) ?? null;

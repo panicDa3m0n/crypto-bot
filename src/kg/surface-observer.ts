@@ -16,14 +16,17 @@ import { pairSurface, bestExitSurface } from "./surfaces.js";
 
 // Bump when beam width / maxEdgesPerToken / maxHops / hub ranking / sizing ladder changes — so we never
 // compare surfaces from different algorithms as one series.
-export const SURFACE_MODEL_VERSION = "v1:beam4/edge48/hop3/geo7-3";
-const PAIR_K = 15, EXIT_K = 15;
+export const SURFACE_MODEL_VERSION = "v1:beam4/edge32/pairhop3/exithop2/cap4s/geo7-3";
+const PAIR_K = 12, EXIT_K = 12;
 const MATERIAL_GAP_USD = 2, MIN_ECON_USD = 5; // signal only meaningful, capturable-looking value with a real gap
+const DEFAULT_BUDGET_MS = 45_000;             // cap surface work per cycle so the observer loop stays bounded
+const PER_TARGET_MS = 4_000;                  // hard cap per best-exit target (a hub's beam can be huge otherwise)
 
-export interface SurfaceRunSummary { pairRuns: number; exitRuns: number; signals: number }
+export interface SurfaceRunSummary { pairRuns: number; exitRuns: number; signals: number; skipped: number }
 
-export async function runSurfaces(db: Database, config: Config, graph: LiquidityGraph, ctx: SurfaceContext): Promise<SurfaceRunSummary> {
+export async function runSurfaces(db: Database, config: Config, graph: LiquidityGraph, ctx: SurfaceContext, opts: { budgetMs?: number } = {}): Promise<SurfaceRunSummary> {
   const cid = config.CHAIN_ID, block = graph.head;
+  const deadline = Date.now() + (opts.budgetMs ?? DEFAULT_BUDGET_MS);
   const weth = config.WBERA_ADDRESS.toLowerCase(), usdc = config.USDC_E_ADDRESS.toLowerCase();
   const MODELABLE = new Set(["v2", "aerodrome", "aerodrome-stable", "v3", "slipstream"]);
 
@@ -33,10 +36,11 @@ export async function runSurfaces(db: Database, config: Config, graph: Liquidity
   const pairTargets = [...byPair.entries()].filter(([, v]) => v.size >= 2).sort((a, b) => b[1].size - a[1].size).slice(0, PAIR_K).map(([k]) => k.split("|") as [string, string]);
   const exitTargets = [...graph.adjacency.entries()].filter(([t]) => t !== weth && t !== usdc).sort((a, b) => b[1].length - a[1].length).slice(0, EXIT_K).map(([t]) => t);
 
-  let pairRuns = 0, exitRuns = 0, signals = 0;
+  let pairRuns = 0, exitRuns = 0, signals = 0, skipped = 0;
 
   // ── PAIR SURFACES (curve/crossover structure) ──
   for (const [t0, t1] of pairTargets) {
+    if (Date.now() > deadline) { skipped += pairTargets.length - pairRuns; break; }
     const surf = await pairSurface(ctx, t0, t1, { steps: 12 }).catch(() => null);
     if (!surf || !surf.points.length) continue;
     const runId = await db.recordSurfaceRun({ chainId: cid, block, kind: "pair", target: `${t0}|${t1}`, modelVersion: SURFACE_MODEL_VERSION, venues: surf.venues, crossovers: surf.crossovers, optimalSize: surf.optimalSize, maxPnl: surf.maxPnl }).catch(() => 0);
@@ -45,10 +49,11 @@ export async function runSurfaces(db: Database, config: Config, graph: Liquidity
 
   // ── BEST-EXIT SURFACES (economic vs executable → execution_gap signal) ──
   for (const asset of exitTargets) {
+    if (Date.now() > deadline) { skipped += exitTargets.length - exitRuns; break; }
     const dec = graph.decimals.get(asset) ?? 18;
     const unit = 10n ** BigInt(dec);
     const sizes = [unit * 100n, unit * 1000n, unit * 10000n, unit * 100000n];
-    const surf = await bestExitSurface(ctx, asset, usdc, sizes, { maxHops: 3 }).catch(() => null);
+    const surf = await bestExitSurface(ctx, asset, usdc, sizes, { maxHops: 2, deadline: Math.min(deadline, Date.now() + PER_TARGET_MS) }).catch(() => null);
     if (!surf || !surf.length) continue;
     const ref = [...surf].reverse().find((e) => e.economicOut > 0n) ?? surf[0]; // largest size that quotes
     const gap = (o: { economicOut: bigint; executableOut: bigint | null }) => o.economicOut - (o.executableOut ?? 0n);
@@ -63,5 +68,5 @@ export async function runSurfaces(db: Database, config: Config, graph: Liquidity
       signals++;
     }
   }
-  return { pairRuns, exitRuns, signals };
+  return { pairRuns, exitRuns, signals, skipped };
 }

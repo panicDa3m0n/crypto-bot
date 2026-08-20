@@ -65,7 +65,7 @@ export function buildSurfaceContext(db: Database, cid: number, graph: LiquidityG
   return { graph, simFor, capability, blacklisted, adjSorted };
 }
 
-export interface PathOpts { maxHops?: number; beamPerToken?: number; maxEdgesPerToken?: number; topN?: number }
+export interface PathOpts { maxHops?: number; beamPerToken?: number; maxEdgesPerToken?: number; topN?: number; deadline?: number }
 
 /**
  * Best path(s) from assetIn to assetOut for a GIVEN amountIn — bounded beam search. Expands the DEEPEST
@@ -75,14 +75,16 @@ export interface PathOpts { maxHops?: number; beamPerToken?: number; maxEdgesPer
  * paths only (no token revisited) ⇒ each pool used once ⇒ chaining non-mutating quotes is exact for impact.
  */
 export async function quoteBestPaths(ctx: SurfaceContext, assetIn: string, assetOut: string, amountIn: bigint, opts: PathOpts = {}): Promise<PathQuotePoint[]> {
-  const maxHops = opts.maxHops ?? 3, beam = opts.beamPerToken ?? 4, maxEdges = opts.maxEdgesPerToken ?? 48;
+  const maxHops = opts.maxHops ?? 3, beam = opts.beamPerToken ?? 4, maxEdges = opts.maxEdgesPerToken ?? 32;
   interface St { token: string; amount: bigint; path: string[]; pools: string[]; exact: boolean; encodable: boolean; clean: boolean }
   const cmp = (x: St, y: St) => (y.amount > x.amount ? 1 : y.amount < x.amount ? -1 : 0);
   let frontier: St[] = [{ token: assetIn.toLowerCase(), amount: amountIn, path: [assetIn.toLowerCase()], pools: [], exact: true, encodable: true, clean: true }];
   const terminals: St[] = [];
   for (let hop = 0; hop < maxHops && frontier.length; hop++) {
+    if (opts.deadline && Date.now() > opts.deadline) break; // time-bounded: stop expanding, keep terminals so far
     const next: St[] = [];
     for (const st of frontier) {
+      if (opts.deadline && Date.now() > opts.deadline) break;
       const pools = ctx.adjSorted(st.token).slice(0, maxEdges);
       for (const pid of pools) {
         const ps = ctx.graph.pools.get(pid); if (!ps) continue;

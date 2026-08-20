@@ -535,6 +535,12 @@ export class Database {
         dominant_buy TEXT, dominant_sell TEXT, spread_bps INTEGER
       );
       CREATE INDEX IF NOT EXISTS kg_surface_points_run ON kg_surface_points(run_id);
+      -- SINGLE-INSTANCE observer lease (Item 7): TTL heartbeat so exactly one observer processes blocks.
+      CREATE TABLE IF NOT EXISTS kg_observer_lease (
+        chain_id INTEGER PRIMARY KEY,
+        owner TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL
+      );
       -- ECONOMIC-ANOMALY SIGNALS (Item 7 step 6) — NOT trade opportunities: intelligence (e.g. a persistent
       -- execution_gap = value the graph sees we cannot capture). Own lifecycle, distinct from kg_candidates.
       CREATE TABLE IF NOT EXISTS kg_signals (
@@ -1618,6 +1624,19 @@ export class Database {
        ON CONFLICT (chain_id, ckey, block) DO NOTHING`, vals
     );
   }
+  /** SINGLE-INSTANCE lease (Item 7): a DB lease with TTL. The observer calls this each loop (heartbeat); only
+   * the owner whose lease is current processes blocks, so restart/overlap never double-counts, and a standby
+   * instance takes over TTL seconds after the holder dies. Deterministic (no pooled-connection subtleties). */
+  async acquireObserverLease(chainId: number, owner: string, ttlSec: number): Promise<boolean> {
+    const r = await this.pool.query<{ owner: string }>(
+      `INSERT INTO kg_observer_lease(chain_id, owner, expires_at) VALUES($1,$2, now() + make_interval(secs => $3))
+       ON CONFLICT (chain_id) DO UPDATE SET owner=$2, expires_at=now() + make_interval(secs => $3)
+         WHERE kg_observer_lease.expires_at < now() OR kg_observer_lease.owner=$2
+       RETURNING owner`, [chainId, owner, ttlSec]
+    );
+    return r.rows.length > 0 && r.rows[0].owner === owner;
+  }
+
   async setObservationPreflight(chainId: number, ckey: string, block: number, status: string): Promise<void> {
     await this.pool.query(`UPDATE kg_candidate_observations SET preflight_status=$4 WHERE chain_id=$1 AND ckey=$2 AND block=$3`, [chainId, ckey, block, status]);
   }
