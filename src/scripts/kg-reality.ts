@@ -36,6 +36,13 @@ async function main() {
     console.log(`     netUsd: median=$${f(d.medianNet, 4)} p95=$${f(d.p95Net, 4)} max=$${f(d.maxNet, 4)}   lifetime(blocks): median=${f(d.medianLifetime, 0)} p95=${f(d.p95Lifetime, 0)} maxSeen=${d.maxSeen}`);
   }
   if (!byDet.length) console.log(`  (no candidates yet — run the observer to accumulate the time series)`);
+
+  // Surface intelligence (Item 7) — a DIFFERENT scorecard: Best Exit is intelligence (execution_gap), not arb.
+  const sr = await db.surfaceRealitySummary(cid).catch(() => null);
+  if (sr && (sr.pairRuns || sr.exitRuns)) {
+    console.log(`\n[kg-reality] SURFACES: pair runs=${sr.pairRuns} (${sr.targetsPair} targets, avg crossovers=${f(sr.avgCrossovers)})  best-exit runs=${sr.exitRuns} (${sr.targetsExit} targets)`);
+    console.log(`[kg-reality] EXECUTION GAP (value the graph sees but we can't capture): signals=${sr.signals}  median=$${f(sr.medianGap)} p95=$${f(sr.p95Gap)} max=$${f(sr.maxGap)}`);
+  }
   await db.close().catch(() => undefined);
   process.exit(0);
 }

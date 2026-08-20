@@ -15,6 +15,8 @@ import { BerachainClients } from "../chain.js";
 import { LocalRouter } from "../router/router.js";
 import { loadLiquidityGraph } from "../kg/graph-loader.js";
 import { runObservatory } from "../kg/observatory.js";
+import { buildSurfaceContext } from "../kg/path-surface.js";
+import { runSurfaces } from "../kg/surface-observer.js";
 import { encodeCycle } from "../kg/encode.js";
 
 const POLL_MS = 4_000, STALE_PREFLIGHT_BLOCKS = 30, PREFLIGHT_K = 8, MIN_GROSS_BPS = 1;
@@ -84,9 +86,15 @@ async function main() {
           }
         }
       }
+      // SURFACE INTELLIGENCE (Item 7): pair/best-exit surfaces for a bounded target set → time series + gaps.
+      const bl = await db.listBlacklist().catch(() => [] as Array<{ scope: string; value: string }>);
+      const blacklisted = new Set(bl.filter((b) => b.scope === "token").map((b) => b.value.toLowerCase()));
+      const ctx = buildSurfaceContext(db, cid, g, (ps) => router.execCapability(ps) != null, blacklisted);
+      const surf = await runSurfaces(db, config, g, ctx).catch(() => ({ pairRuns: 0, exitRuns: 0, signals: 0 }));
+
       const dt = Date.now() - t0;
       await db.recordObserverRun({ chainId: cid, block: head, durationMs: dt, poolsPriced: g.stats.poolsPriced, multiVenuePairs: stats.multiVenuePairs, sized: stats.sized, economic: stats.economic, economicallyPositive: stats.economicallyPositive, routeEncodable: stats.routeEncodable, executable: stats.executable, preflightAttempted: attempted, preflightPass: pass, detectors: stats.detectors, stats: { unsupportedForks: stats.unsupportedForks, blockedByTicks: stats.blockedByTicks } }).catch(() => undefined);
-      logger.info({ block: head, dt, sized: stats.sized, economicallyPositive: stats.economicallyPositive, executable: stats.executable, preflight: `${pass}/${attempted}`, reused, outcomes }, "observer cycle");
+      logger.info({ block: head, dt, sized: stats.sized, economicallyPositive: stats.economicallyPositive, executable: stats.executable, preflight: `${pass}/${attempted}`, reused, surfaces: `${surf.pairRuns}pair/${surf.exitRuns}exit/${surf.signals}sig`, outcomes }, "observer cycle");
     } catch (e) { logger.error({ err: e instanceof Error ? e.message : String(e) }, "observer cycle failed"); }
     await sleep(POLL_MS);
   }

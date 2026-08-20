@@ -509,6 +509,46 @@ export class Database {
         PRIMARY KEY (chain_id, ckey, block)
       );
       CREATE INDEX IF NOT EXISTS kg_cand_obs_ckey ON kg_candidate_observations(chain_id, ckey, block DESC);
+      -- SURFACE TIME SERIES (Item 7): the geometry of liquidity per block — two levels (identity + points),
+      -- stamped with the surface_model_version so we never compare surfaces from different algorithms as one
+      -- series. Pair Surface and Best Exit share this storage; kind-specific columns are nullable.
+      CREATE TABLE IF NOT EXISTS kg_surface_runs (
+        id BIGSERIAL PRIMARY KEY,
+        chain_id INTEGER NOT NULL,
+        block BIGINT NOT NULL,
+        kind TEXT NOT NULL,             -- 'pair' | 'best-exit'
+        target TEXT NOT NULL,           -- 'a|b' (pair) or asset (best-exit)
+        numeraire TEXT,
+        model_version TEXT NOT NULL,
+        venues INTEGER, crossovers INTEGER, optimal_size NUMERIC, max_pnl NUMERIC,   -- pair summary
+        economic_best NUMERIC, executable_best NUMERIC, execution_gap NUMERIC,        -- best-exit summary (ref size)
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS kg_surface_runs_tgt ON kg_surface_runs(chain_id, kind, target, block DESC);
+      CREATE TABLE IF NOT EXISTS kg_surface_points (
+        run_id BIGINT NOT NULL REFERENCES kg_surface_runs(id) ON DELETE CASCADE,
+        amount_in NUMERIC NOT NULL,
+        economic_out NUMERIC, executable_out NUMERIC,
+        economic_path TEXT[], executable_path TEXT[],
+        exact BOOLEAN, encodable BOOLEAN, clean BOOLEAN,
+        execution_gap NUMERIC,
+        dominant_buy TEXT, dominant_sell TEXT, spread_bps INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS kg_surface_points_run ON kg_surface_points(run_id);
+      -- ECONOMIC-ANOMALY SIGNALS (Item 7 step 6) — NOT trade opportunities: intelligence (e.g. a persistent
+      -- execution_gap = value the graph sees we cannot capture). Own lifecycle, distinct from kg_candidates.
+      CREATE TABLE IF NOT EXISTS kg_signals (
+        chain_id INTEGER NOT NULL,
+        skey TEXT NOT NULL,
+        kind TEXT NOT NULL,             -- 'execution_gap'
+        asset TEXT, numeraire TEXT,
+        economic_usd DOUBLE PRECISION, executable_usd DOUBLE PRECISION, execution_gap_usd DOUBLE PRECISION,
+        ref_size NUMERIC,
+        first_seen_block BIGINT NOT NULL, last_seen_block BIGINT NOT NULL, seen_count INTEGER NOT NULL DEFAULT 1,
+        peak_gap_usd DOUBLE PRECISION,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (chain_id, skey)
+      );
       -- INDEXER COVERAGE (Item 3): the CONTINUOUSLY-observed block range, distinct from the recovery cursor
       -- (indexer_state.last_block) and from current freshness (chain_status). coverage_start = the first
       -- block of the current UNBROKEN ingested sequence (NOT the configured cold-start); continuous_through
@@ -1602,6 +1642,49 @@ export class Database {
        FROM kg_candidates WHERE chain_id=$1 GROUP BY detector ORDER BY detector`, [chainId]
     );
     return r.rows.map((x: Record<string, unknown>) => ({ detector: x.detector as string, candidates: x.candidates as number, executable: x.executable as number, netPositive: x.net_positive as number, exact: x.exact as number, preflightPass: x.preflight_pass as number, behaviorMismatch: x.behavior_mismatch as number, profitMoved: x.profit_moved as number, encodeUnsupported: x.encode_unsupported as number, medianNet: x.median_net as number | null, p95Net: x.p95_net as number | null, maxNet: x.max_net as number | null, medianLifetime: x.median_lifetime as number | null, p95Lifetime: x.p95_lifetime as number | null, maxSeen: x.max_seen as number }));
+  }
+  /** Persist a surface run (Item 7). Returns the run id so points can reference it. */
+  async recordSurfaceRun(r: { chainId: number; block: number; kind: string; target: string; numeraire?: string; modelVersion: string; venues?: number; crossovers?: number; optimalSize?: bigint | null; maxPnl?: bigint; economicBest?: bigint | null; executableBest?: bigint | null; executionGap?: bigint | null }): Promise<number> {
+    const q = await this.pool.query<{ id: string }>(
+      `INSERT INTO kg_surface_runs(chain_id, block, kind, target, numeraire, model_version, venues, crossovers, optimal_size, max_pnl, economic_best, executable_best, execution_gap)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+      [r.chainId, r.block, r.kind, r.target, r.numeraire ?? null, r.modelVersion, r.venues ?? null, r.crossovers ?? null, r.optimalSize?.toString() ?? null, r.maxPnl?.toString() ?? null, r.economicBest?.toString() ?? null, r.executableBest?.toString() ?? null, r.executionGap?.toString() ?? null]
+    );
+    return Number(q.rows[0].id);
+  }
+  async recordSurfacePoints(runId: number, pts: Array<{ amountIn: bigint; economicOut?: bigint | null; executableOut?: bigint | null; economicPath?: string[]; executablePath?: string[] | null; exact?: boolean; encodable?: boolean; clean?: boolean; executionGap?: bigint | null; dominantBuy?: string | null; dominantSell?: string | null; spreadBps?: number | null }>): Promise<void> {
+    if (!pts.length) return;
+    const vals: unknown[] = []; const chunks: string[] = [];
+    pts.forEach((p, i) => { const b = i * 13; chunks.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11},$${b + 12},$${b + 13})`); vals.push(runId, p.amountIn.toString(), p.economicOut?.toString() ?? null, p.executableOut?.toString() ?? null, p.economicPath ?? null, p.executablePath ?? null, p.exact ?? null, p.encodable ?? null, p.clean ?? null, p.executionGap?.toString() ?? null, p.dominantBuy ?? null, p.dominantSell ?? null, p.spreadBps ?? null); });
+    await this.pool.query(
+      `INSERT INTO kg_surface_points(run_id, amount_in, economic_out, executable_out, economic_path, executable_path, exact, encodable, clean, execution_gap, dominant_buy, dominant_sell, spread_bps) VALUES ${chunks.join(",")}`, vals
+    );
+  }
+  /** Economic-anomaly signal lifecycle (Item 7 step 6) — same-key updates grow first/last/peak. */
+  async upsertSignal(s: { chainId: number; skey: string; kind: string; asset: string; numeraire: string; economicUsd: number | null; executableUsd: number | null; executionGapUsd: number; refSize: bigint; block: number }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO kg_signals(chain_id, skey, kind, asset, numeraire, economic_usd, executable_usd, execution_gap_usd, ref_size, first_seen_block, last_seen_block, seen_count, peak_gap_usd)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,1,$8)
+       ON CONFLICT (chain_id, skey) DO UPDATE SET economic_usd=$6, executable_usd=$7, execution_gap_usd=$8, ref_size=$9, last_seen_block=$10, seen_count=kg_signals.seen_count+1, peak_gap_usd=GREATEST(kg_signals.peak_gap_usd, $8), updated_at=NOW()`,
+      [s.chainId, s.skey, s.kind, s.asset, s.numeraire, s.economicUsd, s.executableUsd, s.executionGapUsd, s.refSize.toString(), s.block]
+    );
+  }
+  async surfaceRealitySummary(chainId: number): Promise<{ pairRuns: number; exitRuns: number; targetsPair: number; targetsExit: number; signals: number; medianGap: number | null; p95Gap: number | null; maxGap: number | null; avgCrossovers: number | null }> {
+    const r = await this.pool.query(
+      `SELECT
+        count(*) filter(where kind='pair')::int pair_runs,
+        count(*) filter(where kind='best-exit')::int exit_runs,
+        count(distinct target) filter(where kind='pair')::int targets_pair,
+        count(distinct target) filter(where kind='best-exit')::int targets_exit,
+        avg(crossovers) filter(where kind='pair') avg_crossovers
+       FROM kg_surface_runs WHERE chain_id=$1`, [chainId]);
+    const s = await this.pool.query(
+      `SELECT count(*)::int signals,
+        percentile_cont(0.5) within group(order by execution_gap_usd) median_gap,
+        percentile_cont(0.95) within group(order by execution_gap_usd) p95_gap,
+        max(execution_gap_usd) max_gap FROM kg_signals WHERE chain_id=$1`, [chainId]);
+    const a = r.rows[0] as Record<string, unknown>, b = s.rows[0] as Record<string, unknown>;
+    return { pairRuns: a.pair_runs as number, exitRuns: a.exit_runs as number, targetsPair: a.targets_pair as number, targetsExit: a.targets_exit as number, signals: b.signals as number, medianGap: b.median_gap as number | null, p95Gap: b.p95_gap as number | null, maxGap: b.max_gap as number | null, avgCrossovers: a.avg_crossovers as number | null };
   }
   async recentObserverRuns(chainId: number, limit = 12): Promise<Array<{ block: number; durationMs: number; sized: number; economic: number; economicallyPositive: number; routeEncodable: number; executable: number; preflightAttempted: number; preflightPass: number }>> {
     const r = await this.pool.query(`SELECT block::text, duration_ms, sized, economic, economically_positive, route_encodable, executable, preflight_attempted, preflight_pass FROM kg_observer_runs WHERE chain_id=$1 ORDER BY block DESC LIMIT $2`, [chainId, limit]);
