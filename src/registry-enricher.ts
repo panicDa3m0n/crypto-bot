@@ -258,6 +258,12 @@ export class RegistryEnricher {
         const l = reverted.get(w.address) ?? []; l.push(w.field); reverted.set(w.address, l);
       }
     }
+    // A pass that returns "nothing happened" must be able to say WHY. Silence here is what let the pool queue
+    // sit at 62 for hours while every other pass reported progress: the cycle log only records what advanced.
+    if (!got.size) {
+      this.logger.warn({ batch: batch.length, wants: wants.length, answered: results.filter((r) => r?.status === "success").length, reverted: reverted.size, transportFailed, lane: "bulk" },
+        "enrichment: pool batch produced no data — no field on any pool in the batch could be read");
+    }
     let done = 0;
     for (const p of batch) {
       const meta = got.get(p.address);
