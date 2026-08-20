@@ -20,6 +20,9 @@ import { evaluateExecutable, type GateContext } from "./opportunity.js";
 const CONC = new Set<Archetype>(["v3", "v4", "slipstream"]);
 const MODELABLE = new Set(["v2", "aerodrome", "aerodrome-stable", "v3", "slipstream"]);
 
+/** Compact deterministic hash (djb2 → hex) — for the candidate state fingerprint, not security. */
+function hash(s: string): string { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(16); }
+
 export interface Candidate {
   detector: "cycle" | "pair-curve";
   ckey: string; numeraire: string; route: string; pools: string[];
@@ -27,6 +30,7 @@ export interface Candidate {
   simulationExact: boolean; executable: boolean; rejectionReason?: string;
   legs: SwapTrace[];            // per-hop exact amounts — lets the shadow-preflight re-encode without re-sizing
   minProfitNumeraire: bigint;   // the on-chain minProfit floor the execution calldata would carry
+  fingerprint: string;          // hash(route pools + their state blocks + amountIn + minProfit) — preflight dedup
 }
 export interface ObserveStats {
   detectors: Record<string, number>; sized: number; economic: number;
@@ -66,10 +70,11 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
   const gas = await db.getGasState(cid).catch(() => null);
   const gasStale = !gas || gas.ageMs > gasMaxAgeMs;
   const gasPriceWei = gas?.gasPriceWei ?? 0n;
-  // Executability-layer token quality (Item 4.4): a token is exec-quality only if it's a flash numéraire OR
-  // it's ENRICHED (known decimals) AND not blacklisted. Unenriched/blacklisted tokens still appear in the
-  // graph (economic layer) but never make a candidate `executable` — the preflight/learning loop populates
-  // the blacklist from behavior mismatches. Keeps model-mismatch signals visible without pretending they trade.
+  // Executability-layer token gate (Item 4.4): a route token blocks `executable` ONLY when it is CERTAIN-bad,
+  // i.e. blacklisted (incl. tokens the preflight learning loop flagged from a behavior mismatch). Unenriched
+  // tokens are NOT blocked — a round-trip's PnL is numéraire-in/out so an intermediate token's decimals don't
+  // affect it; such a token reaches preflight once, and if it misbehaves the loop blacklists it. Blacklisted
+  // tokens stay VISIBLE in the graph (economic layer) — we just never pretend they trade.
   const bl = await db.listBlacklist().catch(() => [] as Array<{ scope: string; value: string }>);
   const blacklisted = new Set(bl.filter((b) => b.scope === "token").map((b) => b.value.toLowerCase()));
 
@@ -87,6 +92,7 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
   let sized = 0, executable = 0, economic = 0, economicallyPositive = 0, routeEncodableN = 0;
   const unsupported = new Map<string, { candidates: number; peakUsd: number }>(); // unencodable positive edges by fork
   const blocked = { candidates: 0, sumPeakUsd: 0 }; const blockedFactory = new Map<string, number>(), blockedPool = new Map<string, number>();
+  const observations: Array<{ ckey: string; detector: string; netUsd: number | null; grossUsd: number | null; executable: boolean; simulationExact: boolean; rejectionReason?: string }> = [];
   const seenKeys = new Set<string>();
   const sym = (t: string) => t === weth ? "WETH" : t === usdc ? "USDC" : t.slice(0, 8);
 
@@ -131,13 +137,17 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
       for (const e of cycle.edges) if (CONC.has(e.archetype as Archetype)) { const p = graph.pools.get(e.pool); const f = p?.factory ?? "(unknown)"; blockedFactory.set(f, (blockedFactory.get(f) ?? 0) + usd); blockedPool.set(e.pool, (blockedPool.get(e.pool) ?? 0) + usd); }
     }
     detectors[detector]++;
+    // State fingerprint: same route pools @ same state blocks + same amount + same floor ⇒ same on-chain
+    // result → the observer can REUSE the last preflight instead of spending another eth_call.
+    const fp = hash(cycle.edges.map((e) => `${e.pool}@${graph.pools.get(e.pool)?.block ?? 0}`).sort().join("|") + `|${sizedCyc.amountIn}|${opp.minProfitNumeraire}`);
     const cand: Candidate = {
       detector, ckey, numeraire: num, route: cycle.tokens.map(sym).join("→"), pools,
       amountIn: sizedCyc.amountIn, grossUsd: opp.grossPnlUsd, gasUnits: sizedCyc.gasUnits, gasUsd: opp.gasCostUsd,
       netUsd: opp.netPnlUsd, simulationExact: sizedCyc.simulationExact, executable: isExec, rejectionReason: reason,
-      legs: sizedCyc.legs, minProfitNumeraire: opp.minProfitNumeraire,
+      legs: sizedCyc.legs, minProfitNumeraire: opp.minProfitNumeraire, fingerprint: fp,
     };
     candidates.push(cand);
+    observations.push({ ckey, detector, netUsd: cand.netUsd, grossUsd: cand.grossUsd, executable: isExec, simulationExact: cand.simulationExact, rejectionReason: reason });
     await db.upsertCandidate({ chainId: cid, ckey, detector, numeraire: num, route: cand.route, pools, amountIn: cand.amountIn, grossUsd: cand.grossUsd, gasUnits: cand.gasUnits, gasUsd: cand.gasUsd, netUsd: cand.netUsd, simulationExact: cand.simulationExact, executable: isExec, rejectionReason: reason, block: graph.head }).catch(() => undefined);
     // Demand-driven certification (Item 3, via DB): a positive edge blocked ONLY by partial coverage → P0 its
     // concentrated legs so the enricher certifies them; it re-qualifies once complete.
@@ -184,6 +194,7 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
     if (ok) await emit("pair-curve", rc, sims);
   }
 
+  await db.recordObservations(cid, graph.head, observations).catch(() => undefined); // time-series (Item 5)
   const top = <V,>(m: Map<string, V>, val: (v: V) => number, n = 8) => [...m.entries()].sort((a, b) => val(b[1]) - val(a[1])).slice(0, n);
   return {
     candidates,

@@ -474,10 +474,41 @@ export class Database {
         peak_net_usd DOUBLE PRECISION,
         preflight_status TEXT,          -- null=not tried, 'pass'/'fail'/reason (Item 4.4 shadow preflight)
         preflight_block BIGINT,
+        preflight_fingerprint TEXT,     -- state signature the last preflight was run against (dedup, Item 4/5)
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (chain_id, ckey)
       );
       CREATE INDEX IF NOT EXISTS kg_candidates_net ON kg_candidates(chain_id, executable, net_usd DESC);
+      ALTER TABLE kg_candidates ADD COLUMN IF NOT EXISTS preflight_fingerprint TEXT;
+      -- OBSERVER TIME SERIES (Item 5/6): a snapshot per observer cycle + the value of each candidate at each
+      -- block it was seen. Time is a dimension we cannot reconstruct retroactively — record it now.
+      CREATE TABLE IF NOT EXISTS kg_observer_runs (
+        id BIGSERIAL PRIMARY KEY,
+        chain_id INTEGER NOT NULL,
+        block BIGINT NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        pools_priced INTEGER, multi_venue_pairs INTEGER, sized INTEGER,
+        economic INTEGER, economically_positive INTEGER, route_encodable INTEGER, executable INTEGER,
+        preflight_attempted INTEGER, preflight_pass INTEGER,
+        detectors JSONB, stats JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS kg_observer_runs_blk ON kg_observer_runs(chain_id, block DESC);
+      CREATE TABLE IF NOT EXISTS kg_candidate_observations (
+        chain_id INTEGER NOT NULL,
+        ckey TEXT NOT NULL,
+        block BIGINT NOT NULL,
+        detector TEXT NOT NULL,
+        net_usd DOUBLE PRECISION,
+        gross_usd DOUBLE PRECISION,
+        executable BOOLEAN NOT NULL,
+        simulation_exact BOOLEAN NOT NULL,
+        rejection_reason TEXT,
+        preflight_status TEXT,          -- filled when this observation was (re)preflighted this cycle
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (chain_id, ckey, block)
+      );
+      CREATE INDEX IF NOT EXISTS kg_cand_obs_ckey ON kg_candidate_observations(chain_id, ckey, block DESC);
       -- INDEXER COVERAGE (Item 3): the CONTINUOUSLY-observed block range, distinct from the recovery cursor
       -- (indexer_state.last_block) and from current freshness (chain_status). coverage_start = the first
       -- block of the current UNBROKEN ingested sequence (NOT the configured cold-start); continuous_through
@@ -1520,8 +1551,61 @@ export class Database {
     );
     return r.rows.map((x) => ({ ckey: x.ckey, detector: x.detector, numeraire: x.numeraire, route: x.route, pools: x.pools, amountIn: BigInt(x.amount_in.split(".")[0]), netUsd: x.net_usd, grossUsd: x.gross_usd, simulationExact: x.simulation_exact, executable: x.executable, seenCount: x.seen_count, firstSeenBlock: Number(x.first_seen_block), lastSeenBlock: Number(x.last_seen_block), peakNetUsd: x.peak_net_usd }));
   }
-  async setCandidatePreflight(chainId: number, ckey: string, status: string, block: number): Promise<void> {
-    await this.pool.query(`UPDATE kg_candidates SET preflight_status=$3, preflight_block=$4, updated_at=NOW() WHERE chain_id=$1 AND ckey=$2`, [chainId, ckey, status, block]);
+  async setCandidatePreflight(chainId: number, ckey: string, status: string, block: number, fingerprint?: string): Promise<void> {
+    await this.pool.query(`UPDATE kg_candidates SET preflight_status=$3, preflight_block=$4, preflight_fingerprint=COALESCE($5,preflight_fingerprint), updated_at=NOW() WHERE chain_id=$1 AND ckey=$2`, [chainId, ckey, status, block, fingerprint ?? null]);
+  }
+  /** Preflight dedup source: the state signature + result of a candidate's LAST preflight (Item 5). */
+  async getCandidatePreflightMeta(chainId: number, ckey: string): Promise<{ fingerprint: string | null; status: string | null; block: number | null } | null> {
+    const r = await this.pool.query<{ preflight_fingerprint: string | null; preflight_status: string | null; preflight_block: string | null }>(`SELECT preflight_fingerprint, preflight_status, preflight_block::text FROM kg_candidates WHERE chain_id=$1 AND ckey=$2`, [chainId, ckey]);
+    const row = r.rows[0];
+    return row ? { fingerprint: row.preflight_fingerprint, status: row.preflight_status, block: row.preflight_block ? Number(row.preflight_block) : null } : null;
+  }
+  /** Record the per-cycle snapshot (Item 6 Reality Score source). */
+  async recordObserverRun(r: { chainId: number; block: number; durationMs: number; poolsPriced: number; multiVenuePairs: number; sized: number; economic: number; economicallyPositive: number; routeEncodable: number; executable: number; preflightAttempted: number; preflightPass: number; detectors: unknown; stats: unknown }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO kg_observer_runs(chain_id, block, duration_ms, pools_priced, multi_venue_pairs, sized, economic, economically_positive, route_encodable, executable, preflight_attempted, preflight_pass, detectors, stats)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+      [r.chainId, r.block, r.durationMs, r.poolsPriced, r.multiVenuePairs, r.sized, r.economic, r.economicallyPositive, r.routeEncodable, r.executable, r.preflightAttempted, r.preflightPass, JSON.stringify(r.detectors), JSON.stringify(r.stats)]
+    );
+  }
+  /** Append the time-series observation of each candidate at this block (Item 5). One row per (ckey, block). */
+  async recordObservations(chainId: number, block: number, rows: Array<{ ckey: string; detector: string; netUsd: number | null; grossUsd: number | null; executable: boolean; simulationExact: boolean; rejectionReason?: string; preflightStatus?: string }>): Promise<void> {
+    if (!rows.length) return;
+    const vals: unknown[] = []; const chunks: string[] = [];
+    rows.forEach((o, i) => { const b = i * 9; chunks.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9})`); vals.push(chainId, o.ckey, block, o.detector, o.netUsd, o.grossUsd, o.executable, o.simulationExact, o.rejectionReason ?? null); });
+    await this.pool.query(
+      `INSERT INTO kg_candidate_observations(chain_id, ckey, block, detector, net_usd, gross_usd, executable, simulation_exact, rejection_reason) VALUES ${chunks.join(",")}
+       ON CONFLICT (chain_id, ckey, block) DO NOTHING`, vals
+    );
+  }
+  async setObservationPreflight(chainId: number, ckey: string, block: number, status: string): Promise<void> {
+    await this.pool.query(`UPDATE kg_candidate_observations SET preflight_status=$4 WHERE chain_id=$1 AND ckey=$2 AND block=$3`, [chainId, ckey, block, status]);
+  }
+  /** REALITY SCORE (Item 6) — per-detector aggregate over the candidate lifecycle table. */
+  async realityByDetector(chainId: number): Promise<Array<{ detector: string; candidates: number; executable: number; netPositive: number; exact: number; preflightPass: number; behaviorMismatch: number; profitMoved: number; encodeUnsupported: number; medianNet: number | null; p95Net: number | null; maxNet: number | null; medianLifetime: number | null; p95Lifetime: number | null; maxSeen: number }>> {
+    const r = await this.pool.query(
+      `SELECT detector,
+        count(*)::int candidates,
+        count(*) filter(where executable)::int executable,
+        count(*) filter(where net_usd>0)::int net_positive,
+        count(*) filter(where simulation_exact)::int exact,
+        count(*) filter(where preflight_status='pass')::int preflight_pass,
+        count(*) filter(where preflight_status like '%BEHAVIOR_MISMATCH%')::int behavior_mismatch,
+        count(*) filter(where preflight_status='PROFIT_MOVED')::int profit_moved,
+        count(*) filter(where preflight_status='ENCODE_UNSUPPORTED')::int encode_unsupported,
+        percentile_cont(0.5) within group(order by net_usd) filter(where net_usd>0) median_net,
+        percentile_cont(0.95) within group(order by net_usd) filter(where net_usd>0) p95_net,
+        max(net_usd) max_net,
+        percentile_cont(0.5) within group(order by (last_seen_block-first_seen_block)) median_lifetime,
+        percentile_cont(0.95) within group(order by (last_seen_block-first_seen_block)) p95_lifetime,
+        max(seen_count)::int max_seen
+       FROM kg_candidates WHERE chain_id=$1 GROUP BY detector ORDER BY detector`, [chainId]
+    );
+    return r.rows.map((x: Record<string, unknown>) => ({ detector: x.detector as string, candidates: x.candidates as number, executable: x.executable as number, netPositive: x.net_positive as number, exact: x.exact as number, preflightPass: x.preflight_pass as number, behaviorMismatch: x.behavior_mismatch as number, profitMoved: x.profit_moved as number, encodeUnsupported: x.encode_unsupported as number, medianNet: x.median_net as number | null, p95Net: x.p95_net as number | null, maxNet: x.max_net as number | null, medianLifetime: x.median_lifetime as number | null, p95Lifetime: x.p95_lifetime as number | null, maxSeen: x.max_seen as number }));
+  }
+  async recentObserverRuns(chainId: number, limit = 12): Promise<Array<{ block: number; durationMs: number; sized: number; economic: number; economicallyPositive: number; routeEncodable: number; executable: number; preflightAttempted: number; preflightPass: number }>> {
+    const r = await this.pool.query(`SELECT block::text, duration_ms, sized, economic, economically_positive, route_encodable, executable, preflight_attempted, preflight_pass FROM kg_observer_runs WHERE chain_id=$1 ORDER BY block DESC LIMIT $2`, [chainId, limit]);
+    return r.rows.map((x: Record<string, unknown>) => ({ block: Number(x.block), durationMs: x.duration_ms as number, sized: x.sized as number, economic: x.economic as number, economicallyPositive: x.economically_positive as number, routeEncodable: x.route_encodable as number, executable: x.executable as number, preflightAttempted: x.preflight_attempted as number, preflightPass: x.preflight_pass as number }));
   }
   // --- Item 3: indexer coverage / gaps / per-pool tick-map completeness -------
   async getIndexerCoverage(chainId: number): Promise<{ coverageStart: number; continuousThrough: number; generation: number } | null> {

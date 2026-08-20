@@ -40,6 +40,7 @@ async function main() {
   const config = loadConfig();
   const logger = createLogger({ ...config, LOG_LEVEL: "silent" as never });
   const db = new Database(config.DATABASE_URL);
+  await db.migrate().catch(() => undefined);
   const chain = new BerachainClients(config, logger);
   const cid = config.CHAIN_ID;
   const weth = config.WBERA_ADDRESS.toLowerCase(), usdc = config.USDC_E_ADDRESS.toLowerCase();
