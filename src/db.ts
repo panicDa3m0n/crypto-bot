@@ -443,6 +443,16 @@ export class Database {
       -- oldest-block-first drain. The enricher's drain touches this subset, never a full-table scan.
       CREATE INDEX IF NOT EXISTS entities_enrich_buffer_idx ON entities(chain_id, kind, enrich_resync DESC, updated_block)
         WHERE enrich_pending AND NOT enrich_failed;
+      -- GRAPH DEGREE of a token = how many pools reference it. The enrichment buffer is consumed by LEVERAGE
+      -- (a token held by 500 pools unlocks 500 pools' worth of valuation; a token held by 1 unlocks 1), so the
+      -- degree lookup must be an index probe, not a scan of every pool per candidate.
+      CREATE INDEX IF NOT EXISTS entities_pool_token0_idx ON entities(chain_id, (lower(meta->>'token0'))) WHERE kind='pool';
+      CREATE INDEX IF NOT EXISTS entities_pool_token1_idx ON entities(chain_id, (lower(meta->>'token1'))) WHERE kind='pool';
+      -- The T0 (multiplier) probes ask "is there any pool still missing its factory / archetype": without these
+      -- an EXISTS with no match degrades to a full scan of every pool, every drain cycle.
+      CREATE INDEX IF NOT EXISTS entities_pool_no_factory_idx ON entities(chain_id) WHERE kind='pool' AND NOT (meta ? 'factory');
+      CREATE INDEX IF NOT EXISTS entities_pool_unknown_arch_idx ON entities(chain_id) WHERE kind='pool' AND COALESCE(meta->>'archetype','unknown')='unknown';
+      CREATE INDEX IF NOT EXISTS entities_pool_aero_unchecked_idx ON entities(chain_id) WHERE kind='pool' AND NOT (meta ? 'stableChecked');
       -- Scarlet's token JUDGMENT history (append-only). Her verdicts on a token live here, address-keyed,
       -- so she reconstructs HER past decisions on it. The token FACTS (identity/provenance/security) live
       -- on the entity; this is only the layer of opinion, kept as a timeline (not a single latest value).
@@ -1123,12 +1133,54 @@ export class Database {
    * scan, even at millions of entities. Resync set first (the boot/gap entities the gate waits for), then
    * oldest-block-first (NULLS FIRST = never-updated ahead of stale). */
   async entitiesNeedingDecimals(chainId: number, limit = 20): Promise<Array<{ address: string }>> {
+    // LEVERAGE ORDER, not age order. Entities are not independent: a token's decimals unlock the valuation of
+    // EVERY pool holding it, so the token with the highest graph degree is worth resolving first. We rank a
+    // bounded candidate window (index-backed buffer scan) by degree — ranking the whole buffer would cost more
+    // than it saves. Age/resync still decides which candidates enter the window, so nothing can starve.
     const r = await this.pool.query<{ address: string }>(
-      `SELECT address FROM entities WHERE chain_id=$1 AND kind='token' AND enrich_pending AND NOT enrich_failed
-       ORDER BY enrich_resync DESC, updated_block ASC NULLS FIRST LIMIT $2`,
-      [chainId, limit]
+      `WITH cand AS (
+         SELECT address FROM entities WHERE chain_id=$1 AND kind='token' AND enrich_pending AND NOT enrich_failed
+         ORDER BY enrich_resync DESC, updated_block ASC NULLS FIRST LIMIT $3
+       )
+       SELECT c.address FROM cand c
+       LEFT JOIN LATERAL (
+         SELECT count(*) AS d FROM entities p
+          WHERE p.chain_id=$1 AND p.kind='pool'
+            AND (lower(p.meta->>'token0')=c.address OR lower(p.meta->>'token1')=c.address)
+       ) deg ON TRUE
+       ORDER BY deg.d DESC NULLS LAST LIMIT $2`,
+      [chainId, limit, Math.max(limit * 5, 100)]
     );
     return r.rows;
+  }
+
+  /**
+   * QUEUE SIGNALS — one round-trip that answers "does this pass have anything to do?" for the passes whose OWN
+   * query is expensive (pool-wide aggregates). Booleans, not counts: an EXISTS stops at the first matching row,
+   * so an idle probe is an index touch instead of an aggregate over every pool.
+   *
+   * This is what lets the drain be ordered by LEVERAGE instead of by a fixed sequence or a timer: a pass with a
+   * non-empty queue runs immediately at full speed (60 factories never wait behind 4,000 pools), and a pass with
+   * an empty queue costs nothing at all.
+   */
+  async enrichmentQueueSignals(chainId: number): Promise<{ poolFactory: boolean; factoryReverse: boolean; classify: boolean; aeroStable: boolean; protocolFee: boolean; dexIdentity: boolean }> {
+    const r = await this.pool.query<{ pool_factory: boolean; factory_reverse: boolean; classify: boolean; aero_stable: boolean; protocol_fee: boolean; dex_identity: boolean }>(
+      `SELECT
+         EXISTS(SELECT 1 FROM entities WHERE chain_id=$1 AND kind='pool' AND NOT (meta ? 'factory')
+                  AND COALESCE((meta->>'factoryAttempts')::int,0) < 3) AS pool_factory,
+         EXISTS(SELECT 1 FROM entities WHERE chain_id=$1 AND kind='pool' AND NOT (meta ? 'factory')
+                  AND COALESCE((meta->>'factoryAttempts')::int,0) >= 3 AND NOT (meta ? 'factoryResolvedBy')
+                  AND meta->>'token0' IS NOT NULL AND meta->>'token1' IS NOT NULL) AS factory_reverse,
+         EXISTS(SELECT 1 FROM entities WHERE chain_id=$1 AND kind='pool' AND COALESCE(meta->>'archetype','unknown')='unknown'
+                  AND COALESCE((meta->>'classifyAttempts')::int,0) < 3) AS classify,
+         EXISTS(SELECT 1 FROM entities WHERE chain_id=$1 AND kind='pool' AND meta->>'archetype' IN ('aerodrome','aerodrome-stable')
+                  AND NOT (meta ? 'stableChecked')) AS aero_stable,
+         EXISTS(SELECT 1 FROM entities WHERE chain_id=$1 AND kind='dex' AND NOT (meta ? 'feePpm')) AS protocol_fee,
+         EXISTS(SELECT 1 FROM entities WHERE chain_id=$1 AND kind='dex' AND (NOT (meta ? 'type') OR name IS NULL)) AS dex_identity`,
+      [chainId]
+    );
+    const x = r.rows[0];
+    return { poolFactory: !!x?.pool_factory, factoryReverse: !!x?.factory_reverse, classify: !!x?.classify, aeroStable: !!x?.aero_stable, protocolFee: !!x?.protocol_fee, dexIdentity: !!x?.dex_identity };
   }
 
   // --- DISPLAY prices (Lane A: indicative, cached, batch-refreshed — never a decision input) ---

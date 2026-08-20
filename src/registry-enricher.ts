@@ -14,7 +14,9 @@ const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000
 const STORAGE_SCAN_INTERVAL_MS = 15_000; // heavy last-resort path (Pinax reliable lane) — bound its cadence
 const GAS_POLL_INTERVAL_MS = 20_000;     // DB-first gas: write-side poller cadence (read-side reads gas_state)
 const DEX_IDENTITY_INTERVAL_MS = 120_000; // factory identity barely changes; its queries are heavy (full pool aggregate)
-const RARE_PASS_INTERVAL_MS = 20_000;   // slow-changing populations: no need to poll them at the hot cadence
+const T0_IDLE_PROBE_MS = 10_000;        // T0 queues empty → probe rarely; while they have work the probe runs every cycle
+const T0_BUSY_PROBE_MS = 1_000;         // while T0 has work, re-probe often — but never once per 400ms drain tick
+const PROTO_FEE_INTERVAL_MS = 30_000;   // the protocol-fee pass owns an expensive DISTINCT-ON; bound its cadence
 
 const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)", "function tickSpacing() view returns (int24)"]);
 const AERO_STABLE_ABI = parseAbi(["function stable() view returns (bool)"]);
@@ -50,7 +52,10 @@ export class RegistryEnricher {
   private lastStorageScanAt = 0;
   private lastGasAt = 0;
   private lastDexIdentityAt = 0;
-  private lastRareAt = 0;
+  private lastProbeAt = 0;
+  private lastProtoFeeAt = 0;
+  private t0Busy = true;   // assume work at boot so the first cycle probes before deciding
+  private q = { poolFactory: true, factoryReverse: false, classify: false, aeroStable: false, protocolFee: true, dexIdentity: true };
   private scanClient?: PublicClient | null; // lazy reliable lane (Pinax) for storage-scan certification; null = unconfigured
   private nudged = false; // a nudge has a drain scheduled imminently (coalesces a burst of nudges into one)
 
@@ -97,22 +102,41 @@ export class RegistryEnricher {
     // Block-based tracking: stamp writes/attempts with the indexer's current block (DB-read, no RPC).
     const block = await this.db.getIndexerCursor(this.config.CHAIN_ID).catch(() => null);
     try {
-      // HOT passes: these carry the continuous flow (new pools/tokens from every block) and run every cycle.
-      const pools = await this.enrichPools(block);
-      const toks = await this.enrichTokens(block);
-      const syms = await this.enrichSymbols(block);
-      // RARE passes: their populations change slowly (a fork's factory set, an unknown archetype, a protocol
-      // fee). Polling them at the hot cadence cost a DB round-trip each, every cycle, to learn there was
-      // nothing to do — and each aggregate is not free. They now run on their own slow beat.
-      const rare = Date.now() - this.lastRareAt > RARE_PASS_INTERVAL_MS;
-      if (rare) this.lastRareAt = Date.now();
+      // ── BUFFER CASCADE, ORDERED BY LEVERAGE ────────────────────────────────────────────────────────────
+      // The entities are not independent — they are the graph. Resolving one can unlock many others, and the
+      // ratio is not marginal: measured on Base, ONE protocol-fee read on a single factory completes 6,793
+      // pools, while the most connected pending token unlocks 2. So the buffer is consumed by how much an
+      // entity UNLOCKS, not by how long it has waited nor by a fixed position in a sequence.
+      //
+      //   T0 multipliers — 1 read → N entities: factory attribution, protocol fee, archetype classification.
+      //   T1 structural  — creates new entities: pool token0/token1 spawn the token entities T2 then resolves.
+      //   T2 leaves      — decimals, symbol, aero stable flag (ordered internally by graph degree).
+      //
+      // A time-based throttle would be wrong here: it is right only while a queue is EMPTY and exactly wrong
+      // when a backlog appears (60 high-leverage factories must not sit behind 4,000 pools). So the gate is the
+      // QUEUE ITSELF — one cheap EXISTS probe — and a pass with work runs immediately at full speed.
       const idle = { done: 0, rateLimited: false };
-      const facs = rare ? await this.enrichFactories(block) : idle;
-      const rev = rare ? await this.enrichFactoryReverse(block) : idle;
-      const pfee = rare ? await this.enrichProtocolFees(block) : idle;
-      const cls = rare ? await this.enrichClassify(block) : idle;
-      const aero = rare ? await this.enrichAeroStable(block) : idle;
-      const dex = await this.enrichDexIdentity(block); // self-throttled (its queries aggregate every pool)
+      if (Date.now() - this.lastProbeAt > (this.t0Busy ? T0_BUSY_PROBE_MS : T0_IDLE_PROBE_MS)) {
+        this.lastProbeAt = Date.now();
+        this.q = await this.db.enrichmentQueueSignals(this.config.CHAIN_ID).catch(() => this.q);
+      }
+      const facs = this.q.poolFactory ? await this.enrichFactories(block) : idle;
+      const rev = this.q.factoryReverse ? await this.enrichFactoryReverse(block) : idle;
+      const cls = this.q.classify ? await this.enrichClassify(block) : idle;
+      // protocol-fee: gated by the queue AND by a timer — its own query is a DISTINCT ON over every pool, so
+      // "there is a fee-less factory" must not translate into that aggregate every 400ms.
+      let pfee = idle;
+      if (this.q.protocolFee && Date.now() - this.lastProtoFeeAt > PROTO_FEE_INTERVAL_MS) { this.lastProtoFeeAt = Date.now(); pfee = await this.enrichProtocolFees(block); }
+      const dex = this.q.dexIdentity ? await this.enrichDexIdentity(block) : idle; // additionally self-throttled
+      const t0Done = facs.done + rev.done + cls.done + pfee.done + dex.done;
+      // dexIdentity is deliberately NOT part of `t0Busy`: a factory whose name is genuinely unobtainable keeps
+      // that signal true forever, and a permanently-true "busy" would pin the probe at the hot cadence.
+      this.t0Busy = this.q.poolFactory || this.q.factoryReverse || this.q.classify || this.q.protocolFee;
+      // T1/T2 yield to a busy T0 — bounded, because the T0 queues are attempt-capped and small by construction.
+      const pools = t0Done ? idle : await this.enrichPools(block);
+      const toks = t0Done ? idle : await this.enrichTokens(block);
+      const syms = t0Done ? idle : await this.enrichSymbols(block);
+      const aero = !t0Done && this.q.aeroStable ? await this.enrichAeroStable(block) : idle;
       did = pools.done + toks.done + facs.done + aero.done + rev.done + pfee.done + syms.done + cls.done + dex.done;
       rateLimited = pools.rateLimited || toks.rateLimited || facs.rateLimited || aero.rateLimited || rev.rateLimited || pfee.rateLimited || syms.rateLimited || cls.rateLimited || dex.rateLimited;
       // ACTIVITY LOG: record only cycles that did work or hit a limit — an idle tick is not news, but a cycle
