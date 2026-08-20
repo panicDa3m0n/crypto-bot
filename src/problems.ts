@@ -12,13 +12,26 @@ import { join } from "node:path";
 
 export interface Problem {
   level: "warn" | "error" | "fatal";
+  /** fault = something is wrong. config = a deliberate steady state announced at warn level (a disabled
+   * component, a retired subsystem). Mixing them makes the list unreadable: intentional states repeat on
+   * every restart and drown real faults, so they are separated instead of hidden. */
+  category: "fault" | "config";
   component: string;
   message: string;
   detail?: string;
   count: number;
   firstSeen: string;
   lastSeen: string;
+  /** Still happening (seen within the recency window) vs already stopped. Without this a fault that was fixed
+   * an hour ago still reads as a live alarm — the count alone cannot tell you if it is over. */
+  active: boolean;
 }
+
+// Deliberate configuration states, logged as warnings by design. Kept visible, but out of the fault list.
+const CONFIG_STATE = [
+  /DISABLED by config/i, /RETIRED by config/i, /disabled — skipping/i,
+  /NOT started\. .*still run/i, /Set [A-Z_]+=true to re-enable/i,
+];
 
 const LEVEL_NAME: Record<number, Problem["level"]> = { 40: "warn", 50: "error", 60: "fatal" };
 const TAIL_BYTES = 1_500_000; // enough for a meaningful window without reading whole rotated logs
@@ -40,7 +53,7 @@ function signature(s: string): string {
   return s.replace(/0x[a-fA-F0-9]{6,}/g, "0x…").replace(/\b\d[\d.,]*\b/g, "N").slice(0, 200);
 }
 
-export function readProblems(logDir = "logs", opts: { minLevel?: number; limit?: number } = {}): { problems: Problem[]; scannedFiles: string[]; note?: string } {
+export function readProblems(logDir = "logs", opts: { minLevel?: number; limit?: number; activeWindowMs?: number } = {}): { problems: Problem[]; configStates?: Problem[]; scannedFiles: string[]; note?: string } {
   const minLevel = opts.minLevel ?? 40;
   let files: string[] = [];
   try { files = readdirSync(logDir).filter((f) => f.endsWith(".log") && f.startsWith("system-")).map((f) => join(logDir, f)); }
@@ -63,15 +76,18 @@ export function readProblems(logDir = "logs", opts: { minLevel?: number; limit?:
       const component = String(o.role ?? o.service ?? "system");
       const when = String(o.time ?? new Date().toISOString());
       const iso = /^\d+$/.test(when) ? new Date(Number(when)).toISOString() : when;
+      const category: Problem["category"] = CONFIG_STATE.some((re) => re.test(msg)) ? "config" : "fault";
       const key = `${level}|${component}|${signature(msg)}|${signature(detail ?? "")}`;
       const cur = byKey.get(key);
       if (cur) { cur.count++; if (iso > cur.lastSeen) cur.lastSeen = iso; if (iso < cur.firstSeen) cur.firstSeen = iso; }
-      else byKey.set(key, { level, component, message: msg, detail, count: 1, firstSeen: iso, lastSeen: iso });
+      else byKey.set(key, { level, category, component, message: msg, detail, count: 1, firstSeen: iso, lastSeen: iso, active: false });
     }
   }
+  // ACTIVE = seen in the recency window. A stopped fault must not read as a live alarm.
+  const activeSince = new Date(Date.now() - (opts.activeWindowMs ?? 5 * 60_000)).toISOString();
+  for (const p of byKey.values()) p.active = p.lastSeen >= activeSince;
   const rank = { fatal: 0, error: 1, warn: 2 };
-  const problems = [...byKey.values()]
-    .sort((a, b) => rank[a.level] - rank[b.level] || b.lastSeen.localeCompare(a.lastSeen) || b.count - a.count)
-    .slice(0, opts.limit ?? 120);
-  return { problems, scannedFiles: files };
+  const all = [...byKey.values()].sort((a, b) => Number(b.active) - Number(a.active) || rank[a.level] - rank[b.level] || b.lastSeen.localeCompare(a.lastSeen) || b.count - a.count);
+  const limit = opts.limit ?? 120;
+  return { problems: all.filter((p) => p.category === "fault").slice(0, limit), configStates: all.filter((p) => p.category === "config").slice(0, 20), scannedFiles: files };
 }

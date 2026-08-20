@@ -934,10 +934,11 @@ const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head
     <div class="rounded-xl border border-line bg-panel overflow-hidden">
       <template x-if="!problems.length"><div class="p-4 text-dim text-xs">Nessun problema nella finestra letta. ✓</div></template>
       <template x-for="p in problems" :key="p.level+p.message+p.detail">
-        <div class="border-b border-line/60 last:border-0 p-3 hover:bg-panel2">
+        <div class="border-b border-line/60 last:border-0 p-3 hover:bg-panel2" :class="p.active?'':'opacity-50'">
           <div class="flex items-start gap-2">
             <span class="px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0"
-                  :class="p.level==='fatal'?'bg-neg/20 text-neg':p.level==='error'?'bg-neg/15 text-neg':'bg-warn/15 text-warn'" x-text="p.level"></span>
+                  :class="p.active?(p.level==='fatal'?'bg-neg/20 text-neg':p.level==='error'?'bg-neg/15 text-neg':'bg-warn/15 text-warn'):'bg-line/40 text-dim'"
+                  x-text="p.active?p.level:'cessato'"></span>
             <span class="text-[10px] text-dim font-mono shrink-0" x-text="p.component"></span>
             <span class="text-xs" x-text="p.message"></span>
             <span class="ml-auto text-[10px] font-mono shrink-0" :class="p.count>50?'text-neg':'text-dim'" x-text="'×'+p.count"></span>
@@ -946,6 +947,17 @@ const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head
           <div class="text-[10px] text-dim mt-1" x-text="'dal '+fmt(p.firstSeen)+' · ultimo '+fmt(p.lastSeen)"></div>
         </div>
       </template>
+    </div>
+    <!-- Stati VOLUTI: non guasti. Separati perché si ripetono a ogni riavvio e annegherebbero il segnale. -->
+    <div class="mt-2" x-show="(configStates||[]).length">
+      <button @click="showCfg=!showCfg" class="text-[10px] text-dim hover:text-energy">
+        <span x-text="showCfg?'▾':'▸'"></span> Stati di configurazione voluti (<span x-text="configStates.length"></span>) — non sono guasti
+      </button>
+      <div x-show="showCfg" class="mt-1 rounded-xl border border-line/60 bg-panel/60 p-2 space-y-1">
+        <template x-for="c in configStates" :key="c.message">
+          <div class="text-[11px] text-dim"><span class="font-mono text-[10px]" x-text="c.component"></span> · <span x-text="c.message.slice(0,150)"></span> <span class="font-mono" x-text="'×'+c.count"></span></div>
+        </template>
+      </div>
     </div>
   </div>
 
@@ -1074,11 +1086,11 @@ const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head
 </div>
 <script>
 function health(){ return {
-  h:{}, problems:[], clock:'', minLevel:'40',
+  h:{}, problems:[], configStates:[], showCfg:false, clock:"", minLevel:"40",
   async init(){ await this.load(); setInterval(()=>this.load(), 15000); },
   async load(){ await Promise.all([this.loadHealth(), this.loadProblems()]); this.clock=new Date().toLocaleTimeString(); },
   async loadHealth(){ try{ this.h = await (await fetch('/api/health')).json(); }catch(e){} },
-  async loadProblems(){ try{ const d=await (await fetch('/api/problems?min='+this.minLevel)).json(); this.problems=d.problems||[]; }catch(e){} },
+  async loadProblems(){ try{ const d=await (await fetch('/api/problems?min='+this.minLevel)).json(); this.problems=d.problems||[]; this.configStates=d.configStates||[]; }catch(e){} },
   miss(r,f){ const conc=['v3','slipstream','algebra'].includes(r.archetype); return conc && (f==='fee'? r.missing_fee : r.missing_spacing) > 0; },
   pct(a,b){ return b? Math.round(100*a/b)+'%' : '0%'; },
   fmt(t){ try{ return new Date(t).toLocaleString(); }catch(e){ return t; } },
@@ -1094,8 +1106,8 @@ function health(){ return {
     L.push({label:'Gas', value:h.gas?fmtAgeS(gasAge):'assente', ok: gasAge<120000?'ok':'bad', note:'serve per il net PnL'});
     const tp=(h.ticks||[]).reduce((a,r)=>({c:a.c+Number(r.certified),p:a.p+Number(r.pools)}),{c:0,p:0});
     L.push({label:'Tick certificati', value:this.pct(tp.c,tp.p), ok: tp.p&&tp.c/tp.p>0.5?'ok':(tp.c?'warn':'bad'), note:tp.c+'/'+tp.p+' pool concentrated'});
-    const err=this.problems.filter(p=>p.level!=='warn').reduce((a,p)=>a+p.count,0);
-    L.push({label:'Errori', value:String(err), ok: err===0?'ok':(err<20?'warn':'bad'), note:this.problems.length+' problemi distinti'});
+    const act=this.problems.filter(p=>p.active); const err=act.filter(p=>p.level!=='warn').reduce((a,p)=>a+p.count,0);
+    L.push({label:'Errori', value:String(err), ok: err===0?'ok':(err<20?'warn':'bad'), note:act.length+' attivi · '+this.problems.length+' totali'});
     return L; },
 } }
 function fmtAgeS(ms){ const s=Math.round(Number(ms||0)/1000); if(s<60) return s+'s'; if(s<3600) return Math.round(s/60)+'m'; return Math.round(s/3600)+'h'; }
