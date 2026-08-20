@@ -194,7 +194,10 @@ export class RegistryEnricher {
       const arch = p.archetype ?? "";
       if (!p.hasTokens) { wants.push({ address: p.address, field: "token0" }, { address: p.address, field: "token1" }); }
       if (p.needsFee && CONC_FEE.has(arch)) wants.push({ address: p.address, field: "fee" });
-      wants.push({ address: p.address, field: "factory" }); // own-execution routes each pool to ITS dex router
+      // Ask for `factory` only when it is MISSING. Re-reading a field we already hold wasted one sub-call per
+      // pool per cycle AND — because the answer landed in `got` — counted the pool as `done` every cycle. That
+      // faked progress: a pool blocked on fee/tickSpacing looked like it was advancing while nothing changed.
+      if (!p.hasFactory) wants.push({ address: p.address, field: "factory" }); // own-execution routes per dex router
       if (p.needsSpacing && CONC_SPACING.has(arch)) wants.push({ address: p.address, field: "tickSpacing" });
     }
     if (!wants.length) return { done: 0, rateLimited: false };
@@ -235,12 +238,32 @@ export class RegistryEnricher {
       if (w.field === "token0" || w.field === "token1" || w.field === "factory") m[w.field] = String(v).toLowerCase();
       else m[w.field] = Number(v);
     }
+    // Which requested fields came back REVERTED rather than unanswered. Inside a batch that produced other
+    // successes the transport is proven working, so a still-failing sub-call is the chain saying "this contract
+    // does not expose that function" — a fact about the entity, not about the lane.
+    const reverted = new Map<string, string[]>();
+    if (!transportFailed) {
+      for (let i = 0; i < wants.length; i++) {
+        if (results[i]?.status === "success") continue;
+        const w = wants[i];
+        const l = reverted.get(w.address) ?? []; l.push(w.field); reverted.set(w.address, l);
+      }
+    }
     let done = 0;
     for (const p of batch) {
       const meta = got.get(p.address);
+      const blocked = reverted.get(p.address);
+      // A pool that answers SOME fields and reverts on the rest is the case that used to loop forever: it was
+      // counted as done (a field was written) and never accrued an attempt, so it came back every cycle for
+      // ever. A definitive revert is evidence — record WHICH field the chain refuses, and count the attempt so
+      // the cap eventually applies. The residue stays visible in `enrichBlockedBy` instead of silently cycling.
+      if (blocked?.length) {
+        await this.db.mergeEntityMeta(this.config.CHAIN_ID, p.address, "pool", { enrichBlockedBy: blocked }).catch(() => undefined);
+        await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, p.address, "pool", block, MAX_ATTEMPTS).catch(() => undefined);
+      }
       // Count an attempt ONLY on a definitive answer (the call resolved and the data isn't there). After a
       // transport failure we leave the pool untouched so it is retried later instead of being burned.
-      if (!meta || !Object.keys(meta).length) { if (!transportFailed) await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, p.address, "pool", block, MAX_ATTEMPTS).catch(() => undefined); continue; }
+      if (!meta || !Object.keys(meta).length) { if (!transportFailed && !blocked?.length) await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, p.address, "pool", block, MAX_ATTEMPTS).catch(() => undefined); continue; }
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: p.address, kind: "pool", meta, source: "enricher", block: block ?? undefined }).catch(() => undefined);
       // Ensure the two tokens exist as entities so they enter the buffer for decimals enrichment next.
       for (const f of ["token0", "token1"] as const) { const t = meta[f] as string | undefined; if (t) await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t, kind: "token", source: "enricher", block: block ?? undefined }).catch(() => undefined); }

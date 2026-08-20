@@ -1298,17 +1298,18 @@ export class Database {
    * not yet given up on. Same index-backed, resync-first, oldest-first drain as the token buffer. */
   /** The enrichment BUFFER for pools. Returns WHICH fields are missing so the worker reads only those — a pool
    * that already has token0/token1 but lacks fee/tickSpacing must not re-read what it already knows. */
-  async entitiesNeedingPoolInfo(chainId: number, limit = 20): Promise<Array<{ address: string; archetype: string | null; hasTokens: boolean; needsFee: boolean; needsSpacing: boolean }>> {
-    const r = await this.pool.query<{ address: string; archetype: string | null; has_tokens: boolean; needs_fee: boolean; needs_spacing: boolean }>(
+  async entitiesNeedingPoolInfo(chainId: number, limit = 20): Promise<Array<{ address: string; archetype: string | null; hasTokens: boolean; hasFactory: boolean; needsFee: boolean; needsSpacing: boolean }>> {
+    const r = await this.pool.query<{ address: string; archetype: string | null; has_tokens: boolean; has_factory: boolean; needs_fee: boolean; needs_spacing: boolean }>(
       `SELECT address, meta->>'archetype' AS archetype,
               ((meta->>'token0') IS NOT NULL AND (meta->>'token1') IS NOT NULL) AS has_tokens,
+              ((meta->>'factory') IS NOT NULL) AS has_factory,
               ((meta->>'fee') IS NULL) AS needs_fee,
               ((meta->>'tickSpacing') IS NULL) AS needs_spacing
        FROM entities WHERE chain_id=$1 AND kind='pool' AND enrich_pending AND NOT enrich_failed
        ORDER BY enrich_resync DESC, updated_block ASC NULLS FIRST LIMIT $2`,
       [chainId, limit]
     );
-    return r.rows.map((x) => ({ address: x.address, archetype: x.archetype, hasTokens: x.has_tokens, needsFee: x.needs_fee, needsSpacing: x.needs_spacing }));
+    return r.rows.map((x) => ({ address: x.address, archetype: x.archetype, hasTokens: x.has_tokens, hasFactory: x.has_factory, needsFee: x.needs_fee, needsSpacing: x.needs_spacing }));
   }
 
   /** ENRICHMENT BUFFER — record a FAILED read attempt on an entity (block-based, persisted; replaces the
@@ -1980,6 +1981,15 @@ export class Database {
                 AND (COALESCE(meta->>'archetype','') NOT IN ('v3','v4','slipstream','algebra')
                      OR ((meta->>'fee') IS NOT NULL AND (meta->>'tickSpacing') IS NOT NULL)))::int complete
        FROM entities WHERE chain_id=$1 AND kind='pool' GROUP BY 1,3,4 ORDER BY total DESC`, [chainId]);
+    // WHY an entity cannot be completed. A datum the chain genuinely refuses (the contract does not expose the
+    // function) is a bounded, knowable gap — but only if it is NAMED. Left as a bare "failed" count it looks
+    // like a pipeline defect; named, it is a fact about those contracts that a human can act on.
+    const blocked = await q(
+      `SELECT COALESCE(meta->>'archetype','(none)') archetype,
+              (SELECT string_agg(v, ',' ORDER BY v) FROM jsonb_array_elements_text(meta->'enrichBlockedBy') v) fields,
+              count(*)::int pools, bool_or(enrich_failed) any_failed
+       FROM entities WHERE chain_id=$1 AND kind='pool' AND meta ? 'enrichBlockedBy'
+       GROUP BY 1,2 ORDER BY pools DESC LIMIT 12`, [chainId]);
     // Protocol-level fee coverage: for CP pools the fee lives on the FACTORY, so completeness is measured there.
     const protocolFees = await q(
       `SELECT COALESCE(e.meta->>'factory','(none)') factory, COALESCE(e.meta->>'archetype','?') archetype, count(*)::int pools,
@@ -2044,7 +2054,7 @@ export class Database {
     const execCoverage = this.execCovCache.rows;
     const lending = await q(`SELECT tier, count(*)::int n, round(sum(debt_usd)::numeric,0)::text debt_usd FROM lending_positions WHERE chain_id=$1 GROUP BY 1 ORDER BY n DESC`, [chainId]).catch(() => []);
 
-    return { completeness, protocolFees, execCoverage, tokens, buffer, ticks, tickErrors, chain, coverage, gaps, gas, poolState, kg, lastRun, lending, now: new Date().toISOString() };
+    return { completeness, blocked, protocolFees, execCoverage, tokens, buffer, ticks, tickErrors, chain, coverage, gaps, gas, poolState, kg, lastRun, lending, now: new Date().toISOString() };
   }
 
   /** Coverage census: the deepest live pool of each concentrated factory (V3-family AND V4), so a capability

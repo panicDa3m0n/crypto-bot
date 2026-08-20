@@ -1002,6 +1002,26 @@ const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head
         </tbody>
       </table>
     </div>
+    <!-- PERCHÉ un dato manca. Un buco che la catena rifiuta è un fatto conoscibile e limitato — ma solo se ha
+         un NOME. Come semplice conteggio "falliti" sembra un difetto della pipeline; nominato, è una proprietà
+         di quei contratti su cui una persona può decidere. -->
+    <div class="mt-2 rounded-xl border border-line bg-panel p-3" x-show="(h.blocked||[]).length">
+      <div class="text-[10px] text-dim uppercase mb-1.5">Dati che la catena rifiuta <span class="normal-case text-dim/70">— la funzione non esiste sul contratto, non è un errore di rete</span></div>
+      <table class="w-full text-xs">
+        <thead class="text-dim text-[10px] uppercase"><tr class="border-b border-line">
+          <th class="text-left p-1.5">Archetipo</th><th class="text-left p-1.5">Campi non esposti</th><th class="text-right p-1.5">Pool</th><th class="text-right p-1.5">Stato</th></tr></thead>
+        <tbody>
+          <template x-for="b in h.blocked||[]" :key="b.archetype+'/'+(b.fields||'')">
+            <tr class="border-b border-line/40">
+              <td class="p-1.5 font-mono" x-text="b.archetype"></td>
+              <td class="p-1.5 font-mono text-warn" x-text="b.fields||'—'"></td>
+              <td class="p-1.5 text-right font-mono" x-text="Number(b.pools).toLocaleString()"></td>
+              <td class="p-1.5 text-right font-mono text-[10px]" :class="b.any_failed?'text-neg':'text-dim'" x-text="b.any_failed?'cap tentativi raggiunto':'in ritentativo'"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
     <div class="mt-2 rounded-xl border border-line bg-panel p-3">
       <div class="text-[10px] text-dim uppercase mb-1">Token — <span class="font-mono text-txt" x-text="Number(h.tokens?.total||0).toLocaleString()"></span> totali</div>
       <div class="grid grid-cols-2 gap-3">
