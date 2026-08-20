@@ -974,14 +974,23 @@ const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head
     <div class="rounded-xl border border-line bg-panel overflow-x-auto">
       <table class="w-full text-xs">
         <thead class="text-dim text-[10px] uppercase"><tr class="border-b border-line">
-          <th class="text-left p-2">Archetipo</th><th class="text-right p-2">Pool</th><th class="text-right p-2">no token0</th>
+          <th class="text-left p-2">Archetipo</th><th class="text-right p-2">Pool</th><th class="text-left p-2 w-40">Completi</th><th class="text-right p-2">no token0</th>
           <th class="text-right p-2">no fee</th><th class="text-right p-2">no tickSpacing</th><th class="text-right p-2">no factory</th>
           <th class="text-right p-2">in buffer</th><th class="text-right p-2">falliti</th></tr></thead>
         <tbody>
           <template x-for="r in h.completeness||[]" :key="r.archetype">
             <tr class="border-b border-line/40 hover:bg-panel2">
               <td class="p-2 font-mono" x-text="r.archetype"></td>
-              <td class="p-2 text-right font-mono" x-text="r.total"></td>
+              <td class="p-2 text-right font-mono" x-text="Number(r.total).toLocaleString()"></td>
+              <td class="p-2">
+                <div class="flex items-center gap-1.5">
+                  <div class="flex-1 h-1.5 rounded bg-line/60 overflow-hidden min-w-[54px]">
+                    <div class="h-full rounded" :class="pctN(r.complete,r.total)>=99.5?'bg-pos':pctN(r.complete,r.total)>=90?'bg-stable':'bg-warn'" :style="'width:'+pctN(r.complete,r.total)+'%'"></div>
+                  </div>
+                  <span class="font-mono text-[10px] shrink-0" :class="pctN(r.complete,r.total)>=99.5?'text-pos':'text-dim'" x-text="pct(r.complete,r.total)"></span>
+                </div>
+                <div class="text-[9px] text-dim font-mono" x-text="Number(r.complete).toLocaleString()+' / '+Number(r.total).toLocaleString()"></div>
+              </td>
               <td class="p-2 text-right font-mono" :class="r.missing_token0?'text-neg':'text-dim'" x-text="r.missing_token0"></td>
               <td class="p-2 text-right font-mono" :class="!r.fee_applies?'text-dim/50':(r.missing_fee?'text-warn':'text-pos')" x-text="r.fee_applies? r.missing_fee : 'n/a'" :title="r.fee_applies?'':'fee di protocollo, non per-pool'"></td>
               <td class="p-2 text-right font-mono" :class="!r.spacing_applies?'text-dim/50':(r.missing_spacing?'text-warn':'text-pos')" x-text="r.spacing_applies? r.missing_spacing : 'n/a'" :title="r.spacing_applies?'':'non è liquidità concentrata'"></td>
@@ -993,10 +1002,24 @@ const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head
         </tbody>
       </table>
     </div>
+    <div class="mt-2 rounded-xl border border-line bg-panel p-3">
+      <div class="text-[10px] text-dim uppercase mb-1">Token — <span class="font-mono text-txt" x-text="Number(h.tokens?.total||0).toLocaleString()"></span> totali</div>
+      <div class="grid grid-cols-2 gap-3">
+        <template x-for="f in [{k:'decimals',have:h.tokens?.have_decimals,miss:h.tokens?.missing_decimals,crit:true},{k:'symbol',have:h.tokens?.have_symbol,miss:h.tokens?.missing_symbol,crit:false}]" :key="f.k">
+          <div>
+            <div class="flex justify-between text-[11px]">
+              <span class="text-dim" x-text="f.k + (f.crit?' (critico per i prezzi)':' (leggibilità)')"></span>
+              <span class="font-mono" :class="pctN(f.have,h.tokens?.total)>=99.5?'text-pos':(f.crit?'text-neg':'text-warn')" x-text="pct(f.have,h.tokens?.total)"></span>
+            </div>
+            <div class="h-1.5 rounded bg-line/60 overflow-hidden mt-1">
+              <div class="h-full rounded" :class="pctN(f.have,h.tokens?.total)>=99.5?'bg-pos':(f.crit?'bg-neg':'bg-stable')" :style="'width:'+pctN(f.have,h.tokens?.total)+'%'"></div>
+            </div>
+            <div class="text-[9px] text-dim font-mono mt-0.5" x-text="Number(f.have||0).toLocaleString()+' completi · '+Number(f.miss||0).toLocaleString()+' da fare'"></div>
+          </div>
+        </template>
+      </div>
+    </div>
     <div class="text-[10px] text-dim mt-1">
-      Token: <span class="font-mono" x-text="h.tokens?.total"></span> totali ·
-      <span class="font-mono" :class="h.tokens?.missing_decimals?'text-neg':'text-pos'" x-text="h.tokens?.missing_decimals"></span> senza decimals ·
-      <span class="font-mono" x-text="h.tokens?.missing_symbol"></span> senza symbol
       <span class="ml-2 text-dim">— "n/a" = non applicabile a quell'archetipo, non un buco</span>
     </div>
     <!-- Dove la fee VIVE davvero per i pool constant-product: sulla factory. -->
@@ -1012,6 +1035,34 @@ const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head
               <td class="p-2 text-right font-mono" x-text="f.pools"></td>
               <td class="p-2 text-right font-mono" :class="f.fee_ppm?'text-pos':'text-neg'" x-text="f.fee_ppm? (Number(f.fee_ppm)/10000)+'%' : 'MANCA'"></td>
               <td class="p-2 text-[10px]" :class="f.fee_source?'text-dim':'text-neg'" x-text="f.fee_source||'da risolvere'"></td>
+            </tr></template></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- COPERTURA DI ESECUZIONE: la metrica che spiega perché il KG non può agire su un pool -->
+  <div class="px-5 mt-5">
+    <h2 class="text-sm font-semibold mb-2">Copertura di esecuzione
+      <span class="text-[10px] text-dim font-normal">— una factory senza router rende NON eseguibili tutti i suoi pool (è ciò che limita routeEncodable)</span>
+    </h2>
+    <div class="rounded-xl border border-line bg-panel p-3">
+      <div class="flex items-baseline gap-3 mb-2">
+        <span class="text-2xl font-mono" :class="execPct>=50?'text-pos':execPct>=20?'text-warn':'text-neg'" x-text="execPct.toFixed(1)+'%'"></span>
+        <span class="text-[11px] text-dim">dei pool indicizzati è dietro una factory con router
+          (<span class="font-mono" x-text="Number(execPools).toLocaleString()"></span> / <span class="font-mono" x-text="Number(execTotal).toLocaleString()"></span>)</span>
+      </div>
+      <div class="h-2 rounded bg-line/60 overflow-hidden mb-2"><div class="h-full rounded" :class="execPct>=50?'bg-pos':'bg-warn'" :style="'width:'+execPct+'%'"></div></div>
+      <div class="max-h-56 overflow-y-auto">
+        <table class="w-full text-xs"><thead class="text-dim text-[10px] uppercase"><tr class="border-b border-line">
+          <th class="text-left p-1">Factory</th><th class="text-left p-1">Nome</th><th class="text-left p-1">Tipo</th><th class="text-right p-1">Pool</th><th class="text-center p-1">Router</th></tr></thead>
+          <tbody><template x-for="d in h.execCoverage||[]" :key="d.factory">
+            <tr class="border-b border-line/40 hover:bg-panel2" :class="d.hasRouter?'':'opacity-70'">
+              <td class="p-1 font-mono text-[10px]" x-text="(d.factory||'').slice(0,12)"></td>
+              <td class="p-1 text-[11px]" :class="d.name?'':'text-dim'" x-text="d.name||'anonima'"></td>
+              <td class="p-1 text-[10px] font-mono" :class="d.type?'text-dim':'text-warn'" x-text="d.type||'—'"></td>
+              <td class="p-1 text-right font-mono" x-text="Number(d.pools).toLocaleString()"></td>
+              <td class="p-1 text-center" x-text="d.hasRouter?'✓':'✗'" :class="d.hasRouter?'text-pos':'text-neg'"></td>
             </tr></template></tbody>
         </table>
       </div>
@@ -1142,7 +1193,11 @@ function health(){ return {
   async loadEnrich(){ try{ this.en = await (await fetch('/api/enrichment')).json(); }catch(e){} },
   async loadProblems(){ try{ const d=await (await fetch('/api/problems?min='+this.minLevel)).json(); this.problems=d.problems||[]; this.configStates=d.configStates||[]; }catch(e){} },
   miss(r,f){ const conc=['v3','slipstream','algebra'].includes(r.archetype); return conc && (f==='fee'? r.missing_fee : r.missing_spacing) > 0; },
-  pct(a,b){ return b? Math.round(100*a/b)+'%' : '0%'; },
+  pct(a,b){ if(!b) return '—'; const p=100*Number(a||0)/Number(b); const s=(p>=99 && p<100)? p.toFixed(1) : String(Math.round(p)); return s+'%'; },
+  pctN(a,b){ return b? Math.min(100, 100*Number(a||0)/Number(b)) : 0; },
+  get execTotal(){ return (this.h.execCoverage||[]).reduce(function(s,d){ return s+Number(d.pools||0); },0); },
+  get execPools(){ return (this.h.execCoverage||[]).filter(function(d){ return d.hasRouter; }).reduce(function(s,d){ return s+Number(d.pools||0); },0); },
+  get execPct(){ var t=this.execTotal; return t? 100*this.execPools/t : 0; },
   fmt(t){ try{ return new Date(t).toLocaleString(); }catch(e){ return t; } },
   fmtAge(ms){ const s=Math.round(Number(ms||0)/1000); if(s<60) return s+'s'; if(s<3600) return Math.round(s/60)+'m'; return Math.round(s/3600)+'h'; },
   get lights(){ const h=this.h, L=[];

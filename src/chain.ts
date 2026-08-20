@@ -13,6 +13,18 @@ export const monad = defineChain({
 });
 
 /** Builds the active viem chain from config — a chain switch (e.g. Monad→Base) is env-only. */
+/** Strip provider credentials from an RPC URL before it is logged. Several providers carry the API key in
+ * the PATH (…/v1/<key>), so logging the lane verbatim leaks it into every log file and into the dashboard's
+ * problem feed. Keep the host (the useful part) and mask the secret. */
+export function redactRpc(url: string | undefined): string {
+  if (!url) return "";
+  try {
+    const u = new URL(url);
+    const masked = u.pathname.split("/").map((seg) => (seg.length >= 24 && /^[A-Za-z0-9_-]+$/.test(seg) ? "<key>" : seg)).join("/");
+    return `${u.protocol}//${u.host}${masked}${u.search ? "?<redacted>" : ""}`;
+  } catch { return url.replace(/[A-Za-z0-9_-]{24,}/g, "<key>"); }
+}
+
 function chainFrom(config: Config) {
   return defineChain({
     id: config.CHAIN_ID,
@@ -104,7 +116,7 @@ export class BerachainClients {
     this.exec = createPublicClient({ chain, transport: http(this.executionRpc, { timeout: 12_000, retryCount: 1 }) });
     // TRACEABILITY: one authoritative line mapping every purpose → its endpoint, so we always know which
     // RPC is used for what (and can swap any via env). Grep "RPC lanes" to audit.
-    this.logger?.info({ indexer: this.indexerRpc, enrichment: this.enrichmentRpc, tools: this.toolsRpc, execution: this.executionRpc, primary: this.primaryRpc, secondary: this.secondaryRpc, precision: this.precisionRpc, fallback: this.fallbackRpc, dedicatedExecution: this.executionRpc !== this.primaryRpc, dedicatedIndexer: this.indexerRpc !== this.primaryRpc, toolsAlignedWithIndexer: this.toolsRpc === this.indexerRpc }, "RPC lanes");
+    this.logger?.info({ indexer: redactRpc(this.indexerRpc), enrichment: redactRpc(this.enrichmentRpc), tools: redactRpc(this.toolsRpc), execution: redactRpc(this.executionRpc), primary: redactRpc(this.primaryRpc), secondary: redactRpc(this.secondaryRpc), precision: redactRpc(this.precisionRpc), fallback: redactRpc(this.fallbackRpc), dedicatedExecution: this.executionRpc !== this.primaryRpc, dedicatedIndexer: this.indexerRpc !== this.primaryRpc, toolsAlignedWithIndexer: this.toolsRpc === this.indexerRpc }, "RPC lanes");
   }
 
   /** Log an RPC lane failure AT THE MOMENT it happens (rule: no status polling — surface KO on error).

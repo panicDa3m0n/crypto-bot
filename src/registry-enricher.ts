@@ -13,6 +13,7 @@ const UNIV3_QUOTER_BASE = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a" as Addres
 const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 }; // 2500=Pancake tier
 const STORAGE_SCAN_INTERVAL_MS = 15_000; // heavy last-resort path (Pinax reliable lane) — bound its cadence
 const GAS_POLL_INTERVAL_MS = 20_000;     // DB-first gas: write-side poller cadence (read-side reads gas_state)
+const DEX_IDENTITY_INTERVAL_MS = 120_000; // factory identity barely changes; its queries are heavy (full pool aggregate)
 
 const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)", "function tickSpacing() view returns (int24)"]);
 const AERO_STABLE_ABI = parseAbi(["function stable() view returns (bool)"]);
@@ -47,6 +48,7 @@ export class RegistryEnricher {
   private lastVerifiedAt = 0;
   private lastStorageScanAt = 0;
   private lastGasAt = 0;
+  private lastDexIdentityAt = 0;
   private scanClient?: PublicClient | null; // lazy reliable lane (Pinax) for storage-scan certification; null = unconfigured
   private nudged = false; // a nudge has a drain scheduled imminently (coalesces a burst of nudges into one)
 
@@ -100,13 +102,14 @@ export class RegistryEnricher {
       const pfee = await this.enrichProtocolFees(block);
       const syms = await this.enrichSymbols(block);
       const cls = await this.enrichClassify(block);
+      const dex = await this.enrichDexIdentity(block);
       const aero = await this.enrichAeroStable(block);
-      did = pools.done + toks.done + facs.done + aero.done + rev.done + pfee.done + syms.done + cls.done;
-      rateLimited = pools.rateLimited || toks.rateLimited || facs.rateLimited || aero.rateLimited || rev.rateLimited || pfee.rateLimited || syms.rateLimited || cls.rateLimited;
+      did = pools.done + toks.done + facs.done + aero.done + rev.done + pfee.done + syms.done + cls.done + dex.done;
+      rateLimited = pools.rateLimited || toks.rateLimited || facs.rateLimited || aero.rateLimited || rev.rateLimited || pfee.rateLimited || syms.rateLimited || cls.rateLimited || dex.rateLimited;
       // ACTIVITY LOG: record only cycles that did work or hit a limit — an idle tick is not news, but a cycle
       // where the buffer is non-empty and NOTHING advanced is exactly what we need to be able to see.
       const passes: Record<string, number> = {};
-      for (const [k, v] of [["pool", pools.done], ["token", toks.done], ["factory", facs.done], ["factoryReverse", rev.done], ["protocolFee", pfee.done], ["symbol", syms.done], ["classify", cls.done], ["aeroStable", aero.done]] as const) if (v) passes[k] = v;
+      for (const [k, v] of [["pool", pools.done], ["token", toks.done], ["factory", facs.done], ["factoryReverse", rev.done], ["protocolFee", pfee.done], ["symbol", syms.done], ["classify", cls.done], ["aeroStable", aero.done], ["dexIdentity", dex.done]] as const) if (v) passes[k] = v;
       if (did || rateLimited) {
         await this.db.logEnrichmentCycle(this.config.CHAIN_ID, block, passes, rateLimited, rateLimited ? "RPC lane rate-limited — buffer waits and resumes" : undefined).catch(() => undefined);
       } else {
@@ -536,6 +539,55 @@ export class RegistryEnricher {
         //    source is a fact about the protocol, not a silent default.
         if (f.archetype === "v2") { await this.db.setFactoryFee(cid, f.factory, 3000, "protocol-constant:univ2-0.30%"); done++; }
       } catch (e) { if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done, rateLimited: true }; } }
+      await this.pace();
+    }
+    return { done, rateLimited: false };
+  }
+
+  /**
+   * FACTORY IDENTITY — the `dex` kind was structurally excluded from enrichment (only token/pool could ever
+   * be "pending"), leaving 134 of 140 factories anonymous. That matters far beyond tidiness: a factory without
+   * an identity has no router, and without a router every pool it created is NOT own-executable — which is
+   * exactly what caps `routeEncodable` in the KG funnel.
+   *
+   * `type` needs NO network call: a factory's family is the archetype of the pools it created, and we have
+   * indexed thousands of them. `name` comes from the verified contract name we already fetch. The ROUTER is
+   * deliberately not attempted here — it is not readable from the factory and needs its own derivation.
+   */
+  private async enrichDexIdentity(block: number | null): Promise<{ done: number; rateLimited: boolean }> {
+    const cid = this.config.CHAIN_ID;
+    // THROTTLE + CHEAP PRE-CHECK. Both queries below aggregate every pool row by factory (JSONB extraction,
+    // no index) — fine occasionally, ruinous in a 400ms loop: running them every cycle starved Postgres and
+    // BLOCKED THE INDEXER's writes on an LWLock. An index-backed count decides whether the heavy work is
+    // needed at all, and the pass is bounded to a slow cadence because factory identity barely changes.
+    if (Date.now() - this.lastDexIdentityAt < DEX_IDENTITY_INTERVAL_MS) return { done: 0, rateLimited: false };
+    const pendingDex = await this.db.countPendingByKind(cid, "dex").catch(() => 0);
+    if (!pendingDex) { this.lastDexIdentityAt = Date.now(); return { done: 0, rateLimited: false }; }
+    this.lastDexIdentityAt = Date.now();
+    // 1) TYPE in bulk, from data we already hold — one SQL statement, no network, no pacing. Do this FIRST so
+    //    a derivable field is never queued behind a field that needs a (possibly failing) external lookup.
+    const typed = await this.db.deriveFactoryTypes(cid).catch(() => 0);
+    // 2) NAME is the only part that needs the network; it is best-effort and bounded.
+    const batch = await this.db.factoriesNeedingIdentity(cid, 15).catch(() => []);
+    if (!batch.length) return { done: typed, rateLimited: false };
+    const TYPE_OF: Record<string, string> = { v3: "uni-v3", v4: "uni-v4", slipstream: "slipstream", algebra: "algebra", v2: "uni-v2", aerodrome: "aerodrome", "aerodrome-stable": "aerodrome", solidly: "solidly" };
+    let done = typed;
+    for (const f of batch) {
+      const patch: Record<string, unknown> = {};
+      if (!f.hasType && f.poolArchetype && TYPE_OF[f.poolArchetype]) { patch.type = TYPE_OF[f.poolArchetype]; patch.typeSource = `pools:${f.poolArchetype}(${f.pools})`; }
+      let name: string | undefined;
+      if (!f.hasName) {
+        name = f.contractName ?? undefined;                       // already fetched by the verified pass
+        // BOUNDED best-effort: an unverified contract has no name to give, so asking again every cycle only
+        // burns a rate-limited third-party API. Try a couple of times, then stop and keep the factory usable.
+        if (!name && this.etherscan.available && f.nameAttempts < 2) {
+          name = (await this.etherscan.contractMeta(f.address).catch(() => undefined))?.contractName ?? undefined;
+          if (!name) patch.nameAttempts = f.nameAttempts + 1;
+        }
+      }
+      if (!Object.keys(patch).length && !name) continue;
+      await this.db.upsertEntity({ chainId: cid, address: f.address, kind: "dex", name, meta: patch, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+      done++;
       await this.pace();
     }
     return { done, rateLimited: false };

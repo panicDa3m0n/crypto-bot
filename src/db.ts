@@ -66,6 +66,9 @@ export type ProtocolVerification = {
 
 export class Database {
   readonly pool: pg.Pool;
+  /** Cache for the factory-coverage aggregate: it scans every pool row, so it must not run at dashboard
+   * polling frequency — doing so contended with the indexer's writes on the same table. */
+  private execCovCache?: { at: number; rows: Array<{ factory: string; name: string | null; type: string | null; hasRouter: boolean; pools: number }> };
 
   constructor(connectionString: string) {
     this.pool = new pg.Pool({ connectionString, max: 8 });
@@ -415,7 +418,7 @@ export class Database {
         SELECT pg_get_expr(d.adbin, d.adrelid) INTO cur
           FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
          WHERE d.adrelid = 'entities'::regclass AND a.attname = 'enrich_pending';
-        IF cur IS NULL OR cur NOT LIKE '%tickSpacing%' THEN
+        IF cur IS NULL OR cur NOT LIKE '%tickSpacing%' OR cur NOT LIKE '%dex%' OR cur LIKE '%name IS NULL%' THEN
           ALTER TABLE entities DROP COLUMN IF EXISTS enrich_pending;
           ALTER TABLE entities ADD COLUMN enrich_pending BOOLEAN GENERATED ALWAYS AS (
             (kind = 'token' AND decimals IS NULL)
@@ -425,6 +428,14 @@ export class Database {
               OR ((meta->>'archetype') IN ('v3','slipstream') AND ((meta->>'fee') IS NULL OR (meta->>'tickSpacing') IS NULL))
               OR ((meta->>'archetype') = 'algebra' AND (meta->>'tickSpacing') IS NULL)
             ))
+            -- A FACTORY is an entity too. It was structurally excluded (only token/pool could ever be
+            -- "pending"), which left 134 of 140 factories anonymous — and a factory without its identity is
+            -- what makes its pools non-executable downstream. ONLY the type is required: it is always derivable
+            -- from the archetype of the pools the factory created. The name (a verified-contract nicety) and the
+            -- router are NOT required — neither is guaranteed obtainable, and requiring an unobtainable field
+            -- keeps the entity pending forever, which means retrying a rate-limited external API every cycle
+            -- for a value that will never arrive. A queue predicate must only demand what CAN be filled.
+            OR (kind = 'dex' AND (meta->>'type') IS NULL)
           ) STORED;
         END IF;
       END $mig$;
@@ -1280,6 +1291,70 @@ export class Database {
     if (Math.random() < 0.02) await this.pool.query(`DELETE FROM enrichment_log WHERE chain_id=$1 AND created_at < now() - interval '6 hours'`, [chainId]).catch(() => undefined);
   }
 
+  /** Factories needing identity, WITH the answer already in the data: a factory's family is simply the
+   * archetype its pools have. No RPC needed for `type` — we already indexed thousands of its pools. */
+  async factoriesNeedingIdentity(chainId: number, limit = 20): Promise<Array<{ address: string; poolArchetype: string | null; pools: number; hasName: boolean; hasType: boolean; contractName: string | null; nameAttempts: number }>> {
+    const r = await this.pool.query<Record<string, unknown>>(
+      `WITH by_factory AS (
+         SELECT lower(p.meta->>'factory') f, p.meta->>'archetype' arch, count(*)::int n,
+                row_number() OVER (PARTITION BY lower(p.meta->>'factory') ORDER BY count(*) DESC) rn
+         FROM entities p WHERE p.chain_id=$1 AND p.kind='pool' AND p.meta->>'factory' IS NOT NULL
+         GROUP BY 1,2)
+       SELECT d.address, b.arch pool_archetype, COALESCE(b.n,0)::int pools,
+              (d.name IS NOT NULL) has_name, ((d.meta->>'type') IS NOT NULL) has_type,
+              d.meta->>'contractName' contract_name, COALESCE((d.meta->>'nameAttempts')::int,0) name_attempts
+       FROM entities d LEFT JOIN by_factory b ON b.f = d.address AND b.rn = 1
+       WHERE d.chain_id=$1 AND d.kind='dex' AND ((d.meta->>'type') IS NULL OR (d.name IS NULL AND COALESCE((d.meta->>'nameAttempts')::int,0) < 2))
+       ORDER BY COALESCE(b.n,0) DESC LIMIT $2`, [chainId, limit]);
+    return r.rows.map((x) => ({ address: String(x.address), poolArchetype: (x.pool_archetype as string) ?? null, pools: Number(x.pools), hasName: !!x.has_name, hasType: !!x.has_type, contractName: (x.contract_name as string) ?? null, nameAttempts: Number(x.name_attempts ?? 0) }));
+  }
+
+  /**
+   * Derive every factory's TYPE in ONE statement. A factory's family is the archetype of the pools it created
+   * — data we already hold — so this is pure SQL: no RPC, no per-entity pacing, no batching. Deriving a
+   * derivable field one-at-a-time through a network-paced loop was the reason it crawled at ~2/cycle while
+   * factories that only lacked an (often unobtainable) name monopolised the batch.
+   */
+  async deriveFactoryTypes(chainId: number): Promise<number> {
+    const r = await this.pool.query(
+      `WITH dom AS (
+         SELECT lower(p.meta->>'factory') f, p.meta->>'archetype' arch, count(*) n,
+                row_number() OVER (PARTITION BY lower(p.meta->>'factory') ORDER BY count(*) DESC) rn
+         FROM entities p WHERE p.chain_id=$1 AND p.kind='pool' AND p.meta->>'factory' IS NOT NULL
+           AND p.meta->>'archetype' IS NOT NULL AND p.meta->>'archetype' <> 'unknown'
+         GROUP BY 1,2)
+       UPDATE entities d SET meta = d.meta || jsonb_build_object(
+                'type', CASE dom.arch WHEN 'v3' THEN 'uni-v3' WHEN 'v4' THEN 'uni-v4' WHEN 'slipstream' THEN 'slipstream'
+                                      WHEN 'algebra' THEN 'algebra' WHEN 'v2' THEN 'uni-v2'
+                                      WHEN 'aerodrome' THEN 'aerodrome' WHEN 'aerodrome-stable' THEN 'aerodrome'
+                                      WHEN 'solidly' THEN 'solidly' ELSE NULL END,
+                'typeSource', 'pools:' || dom.arch || '(' || dom.n || ')'),
+              updated_at = NOW()
+       FROM dom
+       WHERE d.chain_id=$1 AND d.kind='dex' AND d.address = dom.f AND dom.rn = 1
+         AND (d.meta->>'type') IS NULL
+         AND dom.arch IN ('v3','v4','slipstream','algebra','v2','aerodrome','aerodrome-stable','solidly')`, [chainId]);
+    return r.rowCount ?? 0;
+  }
+
+  /** Own-execution coverage: how much of the indexed liquidity sits behind a factory we can actually route
+   * through. This is the number that gates `routeEncodable` in the KG — and it was never measured. */
+  async executionCoverage(chainId: number): Promise<Array<{ factory: string; name: string | null; type: string | null; hasRouter: boolean; pools: number }>> {
+    const r = await this.pool.query<Record<string, unknown>>(
+      `SELECT lower(p.meta->>'factory') factory, max(d.name) name, max(d.meta->>'type') type,
+              bool_or((d.meta->>'router') IS NOT NULL) has_router, count(*)::int pools
+       FROM entities p LEFT JOIN entities d ON d.chain_id=p.chain_id AND d.address=lower(p.meta->>'factory') AND d.kind='dex'
+       WHERE p.chain_id=$1 AND p.kind='pool' AND p.meta->>'factory' IS NOT NULL
+       GROUP BY 1 ORDER BY pools DESC LIMIT 25`, [chainId]);
+    return r.rows.map((x) => ({ factory: String(x.factory), name: (x.name as string) ?? null, type: (x.type as string) ?? null, hasRouter: !!x.has_router, pools: Number(x.pools) }));
+  }
+
+  /** Cheap, index-backed "is there anything to do for this kind" check — used to gate expensive passes. */
+  async countPendingByKind(chainId: number, kind: string): Promise<number> {
+    const r = await this.pool.query<{ n: number }>(`SELECT count(*)::int n FROM entities WHERE chain_id=$1 AND kind=$2 AND enrich_pending AND NOT enrich_failed`, [chainId, kind]);
+    return r.rows[0]?.n ?? 0;
+  }
+
   async countEnrichPending(chainId: number): Promise<number> {
     const r = await this.pool.query<{ n: number }>(`SELECT count(*)::int n FROM entities WHERE chain_id=$1 AND enrich_pending AND NOT enrich_failed`, [chainId]);
     return r.rows[0]?.n ?? 0;
@@ -1846,7 +1921,12 @@ export class Database {
               count(*) FILTER (WHERE meta->>'tickSpacing' IS NULL)::int missing_spacing,
               count(*) FILTER (WHERE meta->>'factory' IS NULL)::int missing_factory,
               count(*) FILTER (WHERE enrich_pending)::int pending,
-              count(*) FILTER (WHERE enrich_failed)::int failed
+              count(*) FILTER (WHERE enrich_failed)::int failed,
+              -- COMPLETE = every field that APPLIES to this archetype is present. Showing progress, not only
+              -- gaps: "8945/8951 complete" tells you the pipeline is winning; a gap count alone never does.
+              count(*) FILTER (WHERE (meta->>'token0') IS NOT NULL AND (meta->>'token1') IS NOT NULL
+                AND (COALESCE(meta->>'archetype','') NOT IN ('v3','v4','slipstream','algebra')
+                     OR ((meta->>'fee') IS NOT NULL AND (meta->>'tickSpacing') IS NOT NULL)))::int complete
        FROM entities WHERE chain_id=$1 AND kind='pool' GROUP BY 1,3,4 ORDER BY total DESC`, [chainId]);
     // Protocol-level fee coverage: for CP pools the fee lives on the FACTORY, so completeness is measured there.
     const protocolFees = await q(
@@ -1858,6 +1938,8 @@ export class Database {
     const tokens = await one(
       `SELECT count(*)::int total, count(*) FILTER (WHERE decimals IS NULL)::int missing_decimals,
               count(*) FILTER (WHERE symbol IS NULL)::int missing_symbol,
+              count(*) FILTER (WHERE decimals IS NOT NULL)::int have_decimals,
+              count(*) FILTER (WHERE symbol IS NOT NULL)::int have_symbol,
               count(*) FILTER (WHERE enrich_pending)::int pending, count(*) FILTER (WHERE enrich_failed)::int failed
        FROM entities WHERE chain_id=$1 AND kind='token'`, [chainId]);
 
@@ -1900,9 +1982,17 @@ export class Database {
               (SELECT count(*)::int FROM kg_observer_runs WHERE chain_id=$1) observer_runs,
               (SELECT count(*)::int FROM kg_surface_runs WHERE chain_id=$1) surface_runs`, [chainId]).catch(() => ({}));
     const lastRun = await one(`SELECT block::text, duration_ms, sized, executable, preflight_pass, (EXTRACT(EPOCH FROM (now()-created_at))*1000)::bigint::text age_ms FROM kg_observer_runs WHERE chain_id=$1 ORDER BY created_at DESC LIMIT 1`, [chainId]).catch(() => ({}));
+    // CACHED: this aggregates every pool row by factory (JSONB, no index). The dashboard polls every 15s, and
+    // running it that often competed with the indexer's writes for the same table. Factory→router coverage
+    // changes on the order of hours, so a 5-minute cache costs nothing and keeps the hot path free.
+    const now = Date.now();
+    if (!this.execCovCache || now - this.execCovCache.at > 300_000) {
+      this.execCovCache = { at: now, rows: await this.executionCoverage(chainId).catch(() => []) };
+    }
+    const execCoverage = this.execCovCache.rows;
     const lending = await q(`SELECT tier, count(*)::int n, round(sum(debt_usd)::numeric,0)::text debt_usd FROM lending_positions WHERE chain_id=$1 GROUP BY 1 ORDER BY n DESC`, [chainId]).catch(() => []);
 
-    return { completeness, protocolFees, tokens, buffer, ticks, tickErrors, chain, coverage, gaps, gas, poolState, kg, lastRun, lending, now: new Date().toISOString() };
+    return { completeness, protocolFees, execCoverage, tokens, buffer, ticks, tickErrors, chain, coverage, gaps, gas, poolState, kg, lastRun, lending, now: new Date().toISOString() };
   }
 
   /** Coverage census: the deepest live pool of each concentrated factory (V3-family AND V4), so a capability

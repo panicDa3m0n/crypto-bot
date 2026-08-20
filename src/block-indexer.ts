@@ -281,6 +281,7 @@ export class BlockIndexer {
     const conc = this.config.INDEXER_SYNC_CONCURRENCY;
     let processed = 0, swaps = 0, discovered = 0, lending = 0;
     let cur = from;
+    let stuckRounds = 0;   // bounded no-progress guard: never spin forever on a failing lane
     while (cur <= target) {
       const blocks: number[] = [];
       for (let b = cur; b <= target && blocks.length < conc; b++) blocks.push(b);
@@ -292,7 +293,17 @@ export class BlockIndexer {
         processed += 1; swaps += r.swaps; discovered += r.discovered; lending += r.lending;
         cur = item.b + 1; advanced = true;
       }
-      if (!advanced) await new Promise<void>((resolve) => setTimeout(resolve, 500)); // whole batch failed → brief backoff
+      if (!advanced) {
+        // BOUNDED. Previously this retried forever: with a persistently failing lane the tick never returned,
+        // so nothing was logged, chain_status stopped being written, and the indexer looked "silent" rather
+        // than broken — it stalled invisibly for minutes. Give up the TICK (not the work): the caller logs,
+        // freshness telemetry is written, and the next tick retries from the same contiguous cursor.
+        if (++stuckRounds >= 5) {
+          this.logger.warn({ from: cur, target, processed, lanes: lanes.length }, "catch-up made no progress after 5 rounds — ending tick (will retry); check the indexer/exec RPC lanes");
+          break;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 500));
+      } else stuckRounds = 0;
     }
     return { processed, swaps, discovered, lending };
   }
