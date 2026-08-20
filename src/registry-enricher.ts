@@ -26,6 +26,9 @@ const SOLIDLY_FACTORY_ABI = parseAbi(["function getPair(address,address,bool) vi
 // ABI fingerprint used to classify an unknown pool: which of these it answers tells us its family.
 const CLASSIFY_ABI = parseAbi(["function slot0() view returns (uint160,int24)","function globalState() view returns (uint160,int24,uint16,uint16,uint16,bool)","function stable() view returns (bool)","function getReserves() view returns (uint112,uint112,uint32)"]);
 const ERC20_META_ABI = parseAbi(["function symbol() view returns (string)", "function name() view returns (string)", "function decimals() view returns (uint8)"]);
+// POSITIVE CONTROL for lane liveness: Multicall3 is deployed at the same address on every chain and this
+// call cannot revert, so a failure to answer it is proof about the TRANSPORT rather than about any pool.
+const MULTICALL3_PROBE_ABI = parseAbi(["function getBlockNumber() view returns (uint256)"]);
 const POOL_BATCH = 40;   // one Multicall3 covers the whole batch, so batch size is nearly free now
 const FAST_MS = 400;      // there's a backlog → drain quickly
 const BACKOFF_MS = 6_000; // the enrichment RPC threw a rate-limit → let the buffer WAIT, then resume
@@ -224,9 +227,15 @@ export class RegistryEnricher {
       const before = pending.length;
       const still: number[] = [];
       for (let j = 0; j < pending.length; j++) { if (r[j]?.status === "success") results[pending[j]] = r[j]; else still.push(pending[j]); }
-      // ZERO successes across a whole batch is evidence about the LANE, not about 40 pools simultaneously
-      // lacking the same functions. Treating it as definitive is what burned good pools into enrich_failed.
-      if (still.length === before) { transportFailed = true; break; }
+      // ZERO successes across a whole batch is AMBIGUOUS: a dead lane and a batch of contracts that genuinely
+      // lack these functions produce the identical result. Assuming "lane" burned good pools into enrich_failed;
+      // assuming "contracts" would loop for ever on a flaky RPC. So don't assume — ask a POSITIVE CONTROL: one
+      // call that must succeed on a healthy lane. If it answers, the transport is proven and the batch's
+      // failures are real reverts; if it doesn't, the lane is at fault and no pool is judged.
+      if (still.length === before) {
+        transportFailed = !(await mcClient.readContract({ address: MULTICALL3, abi: MULTICALL3_PROBE_ABI, functionName: "getBlockNumber" }).then(() => true).catch(() => false));
+        break;
+      }
       pending = still;
       if (pending.length) await this.pace();
     }
