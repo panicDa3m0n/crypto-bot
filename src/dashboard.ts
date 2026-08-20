@@ -149,6 +149,13 @@ export function startDashboard(deps: Deps): { close: () => void } | undefined {
         res.end(JSON.stringify({ ...out, now: new Date().toISOString() }));
         return;
       }
+      // What the enrichment is DOING (per pass), not just how much is left.
+      if (url.pathname.startsWith("/api/enrichment")) {
+        const act = await deps.db.enrichmentActivity(deps.config.CHAIN_ID, 25).catch((e) => ({ error: String(e) }));
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "access-control-allow-origin": "*" });
+        res.end(JSON.stringify(act, bigintReplacer));
+        return;
+      }
       if (url.pathname === "/health") { res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); res.end(HEALTH_PAGE); return; }
       if (url.pathname === "/scarlet") { res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); res.end(SCARLET_PAGE); return; }
       if (url.pathname === "/explorer") {
@@ -976,8 +983,8 @@ const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head
               <td class="p-2 font-mono" x-text="r.archetype"></td>
               <td class="p-2 text-right font-mono" x-text="r.total"></td>
               <td class="p-2 text-right font-mono" :class="r.missing_token0?'text-neg':'text-dim'" x-text="r.missing_token0"></td>
-              <td class="p-2 text-right font-mono" :class="miss(r,'fee')?'text-warn':'text-dim'" x-text="r.missing_fee"></td>
-              <td class="p-2 text-right font-mono" :class="miss(r,'spacing')?'text-warn':'text-dim'" x-text="r.missing_spacing"></td>
+              <td class="p-2 text-right font-mono" :class="!r.fee_applies?'text-dim/50':(r.missing_fee?'text-warn':'text-pos')" x-text="r.fee_applies? r.missing_fee : 'n/a'" :title="r.fee_applies?'':'fee di protocollo, non per-pool'"></td>
+              <td class="p-2 text-right font-mono" :class="!r.spacing_applies?'text-dim/50':(r.missing_spacing?'text-warn':'text-pos')" x-text="r.spacing_applies? r.missing_spacing : 'n/a'" :title="r.spacing_applies?'':'non è liquidità concentrata'"></td>
               <td class="p-2 text-right font-mono" :class="r.missing_factory?'text-warn':'text-dim'" x-text="r.missing_factory"></td>
               <td class="p-2 text-right font-mono text-energy" x-text="r.pending"></td>
               <td class="p-2 text-right font-mono" :class="r.failed?'text-neg':'text-dim'" x-text="r.failed"></td>
@@ -990,7 +997,24 @@ const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head
       Token: <span class="font-mono" x-text="h.tokens?.total"></span> totali ·
       <span class="font-mono" :class="h.tokens?.missing_decimals?'text-neg':'text-pos'" x-text="h.tokens?.missing_decimals"></span> senza decimals ·
       <span class="font-mono" x-text="h.tokens?.missing_symbol"></span> senza symbol
-      <span class="ml-2 text-dim">— per v2/aerodrome/solidly la fee è una costante di PROTOCOLLO, non un dato per-pool</span>
+      <span class="ml-2 text-dim">— "n/a" = non applicabile a quell'archetipo, non un buco</span>
+    </div>
+    <!-- Dove la fee VIVE davvero per i pool constant-product: sulla factory. -->
+    <div class="mt-3" x-show="(h.protocolFees||[]).length">
+      <h3 class="text-xs font-semibold mb-1">Fee di protocollo <span class="text-[10px] text-dim font-normal">— per i pool constant-product la fee sta sulla FACTORY, non sul pool</span></h3>
+      <div class="rounded-xl border border-line bg-panel overflow-x-auto">
+        <table class="w-full text-xs"><thead class="text-dim text-[10px] uppercase"><tr class="border-b border-line">
+          <th class="text-left p-2">Factory</th><th class="text-left p-2">Archetipo</th><th class="text-right p-2">Pool</th><th class="text-right p-2">Fee</th><th class="text-left p-2">Fonte</th></tr></thead>
+          <tbody><template x-for="f in h.protocolFees||[]" :key="f.factory+f.archetype">
+            <tr class="border-b border-line/40 hover:bg-panel2">
+              <td class="p-2 font-mono text-[10px]" x-text="f.factory.slice(0,14)"></td>
+              <td class="p-2 font-mono text-[10px]" x-text="f.archetype"></td>
+              <td class="p-2 text-right font-mono" x-text="f.pools"></td>
+              <td class="p-2 text-right font-mono" :class="f.fee_ppm?'text-pos':'text-neg'" x-text="f.fee_ppm? (Number(f.fee_ppm)/10000)+'%' : 'MANCA'"></td>
+              <td class="p-2 text-[10px]" :class="f.fee_source?'text-dim':'text-neg'" x-text="f.fee_source||'da risolvere'"></td>
+            </tr></template></tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -1005,6 +1029,31 @@ const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head
         <div class="flex justify-between"><span class="text-dim">con tentativi &gt; 0</span><span class="font-mono" x-text="h.buffer?.with_attempts"></span></div>
         <div class="flex justify-between"><span class="text-dim">scritture ultimi 2 min</span><span class="font-mono" :class="h.buffer?.written_last_2min?'text-pos':'text-warn'" x-text="h.buffer?.written_last_2min"></span></div>
         <div class="text-[10px] text-dim pt-1 border-t border-line/50">Se "in coda" è alto ma le scritture sono 0, l'enrichment è fermo — non lento.</div>
+      </div>
+      <!-- ATTIVITÀ: cosa sta facendo, per pass. Distingue "sta lavorando" da "è bloccato". -->
+      <div class="mt-2 rounded-xl border border-line bg-panel p-3">
+        <div class="flex items-center gap-2 mb-1">
+          <span class="text-[10px] text-dim uppercase">Attività enrichment</span>
+          <span class="text-[10px] text-dim">ultimi 60 min</span>
+          <span class="ml-auto text-[10px]" :class="(en.rateLimitedCycles||0)>0?'text-warn':'text-dim'" x-text="(en.rateLimitedCycles||0)+' cicli rate-limited'"></span>
+        </div>
+        <div class="flex flex-wrap gap-1 mb-2">
+          <template x-if="!Object.keys(en.totals||{}).length"><span class="text-[11px] text-dim">nessun completamento nell'ultima ora</span></template>
+          <template x-for="[k,v] in Object.entries(en.totals||{})" :key="k">
+            <span class="px-1.5 py-0.5 rounded bg-pos/10 border border-pos/30 text-[10px] font-mono text-pos" x-text="k+': '+v"></span>
+          </template>
+        </div>
+        <div class="max-h-52 overflow-y-auto space-y-0.5">
+          <template x-for="(r,i) in en.recent||[]" :key="i">
+            <div class="text-[10px] font-mono flex gap-2" :class="r.note&&!Object.keys(r.passes||{}).length?'text-warn':'text-dim'">
+              <span class="shrink-0" x-text="r.at"></span>
+              <span class="shrink-0 text-dim/70" x-text="'blk '+(r.block||'—')"></span>
+              <span x-text="Object.keys(r.passes||{}).length ? Object.entries(r.passes).map(([k,v])=>k+'×'+v).join(' · ') : (r.note||'—')"></span>
+              <span x-show="r.rate_limited" class="text-warn shrink-0">⏳</span>
+            </div>
+          </template>
+          <template x-if="!(en.recent||[]).length"><div class="text-[11px] text-dim">nessuna attività registrata (buffer vuoto = tutto completo)</div></template>
+        </div>
       </div>
     </div>
     <div>
@@ -1086,10 +1135,11 @@ const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head
 </div>
 <script>
 function health(){ return {
-  h:{}, problems:[], configStates:[], showCfg:false, clock:"", minLevel:"40",
+  h:{}, en:{}, problems:[], configStates:[], showCfg:false, clock:"", minLevel:"40",
   async init(){ await this.load(); setInterval(()=>this.load(), 15000); },
-  async load(){ await Promise.all([this.loadHealth(), this.loadProblems()]); this.clock=new Date().toLocaleTimeString(); },
+  async load(){ await Promise.all([this.loadHealth(), this.loadProblems(), this.loadEnrich()]); this.clock=new Date().toLocaleTimeString(); },
   async loadHealth(){ try{ this.h = await (await fetch('/api/health')).json(); }catch(e){} },
+  async loadEnrich(){ try{ this.en = await (await fetch('/api/enrichment')).json(); }catch(e){} },
   async loadProblems(){ try{ const d=await (await fetch('/api/problems?min='+this.minLevel)).json(); this.problems=d.problems||[]; this.configStates=d.configStates||[]; }catch(e){} },
   miss(r,f){ const conc=['v3','slipstream','algebra'].includes(r.archetype); return conc && (f==='fee'? r.missing_fee : r.missing_spacing) > 0; },
   pct(a,b){ return b? Math.round(100*a/b)+'%' : '0%'; },

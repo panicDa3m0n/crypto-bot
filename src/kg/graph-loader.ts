@@ -62,6 +62,9 @@ export async function loadLiquidityGraph(db: Database, cid: number, opts: LoadOp
     tokens.add(m.token0.toLowerCase()); tokens.add(m.token1.toLowerCase());
     parsed.push({ address: r.address.toLowerCase(), m, row: r });
   }
+  // Protocol-level fees (factory → ppm). A constant-product pool has NO per-pool fee, so its real fee comes
+  // from its protocol. Resolving it HERE is what lets every consumer stop falling back to a guessed 0.30%.
+  const protoFees = await db.protocolFees(cid).catch(() => new Map<string, number>());
   const decMeta = await db.tokenMeta(cid, [...tokens]).catch(() => new Map());
   const decimals = new Map<string, number>();
   for (const [t, meta] of decMeta) if (meta.decimals != null) decimals.set(t.toLowerCase(), meta.decimals);
@@ -80,10 +83,14 @@ export async function loadLiquidityGraph(db: Database, cid: number, opts: LoadOp
     const d0 = scale(t0), d1 = scale(t1);
     if (d0 === undefined || d1 === undefined) decimalsMissing++;
     if (archetype === "aerodrome-stable") stable++;
+    const factory = m.factory?.toLowerCase();
+    // Per-pool fee when the archetype has one; otherwise the PROTOCOL fee of its factory. 0 stays 0 (unknown)
+    // so downstream can fail closed — but with the protocol fee resolved, "unknown" is now genuinely rare.
+    const feePpm = Number(m.fee) > 0 ? Number(m.fee) : (factory ? protoFees.get(factory) ?? 0 : 0);
     const ps: PoolState = {
       address, archetype, token0: t0, token1: t1,
-      feePpm: Number(m.fee) > 0 ? Number(m.fee) : 0,
-      factory: m.factory?.toLowerCase(),
+      feePpm,
+      factory,
       r0: row.r0, r1: row.r1, sqrtPriceX96: row.sqrtPrice, liquidity: row.liquidity,
       tickSpacing: Number(m.tickSpacing) > 0 ? Number(m.tickSpacing) : undefined,
       dec0: d0, dec1: d1,

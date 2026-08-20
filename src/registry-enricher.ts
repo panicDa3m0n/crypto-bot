@@ -17,6 +17,10 @@ const GAS_POLL_INTERVAL_MS = 20_000;     // DB-first gas: write-side poller cade
 const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)", "function tickSpacing() view returns (int24)"]);
 const AERO_STABLE_ABI = parseAbi(["function stable() view returns (bool)"]);
 const AERO_FACTORY_FEE_ABI = parseAbi(["function getFee(address pool, bool stable) view returns (uint256)"]);
+const V2_FACTORY_ABI = parseAbi(["function getPair(address,address) view returns (address)"]);
+const SOLIDLY_FACTORY_ABI = parseAbi(["function getPair(address,address,bool) view returns (address)","function isPair(address) view returns (bool)"]);
+// ABI fingerprint used to classify an unknown pool: which of these it answers tells us its family.
+const CLASSIFY_ABI = parseAbi(["function slot0() view returns (uint160,int24)","function globalState() view returns (uint160,int24,uint16,uint16,uint16,bool)","function stable() view returns (bool)","function getReserves() view returns (uint112,uint112,uint32)"]);
 const ERC20_META_ABI = parseAbi(["function symbol() view returns (string)", "function name() view returns (string)", "function decimals() view returns (uint8)"]);
 const POOL_BATCH = 40;   // one Multicall3 covers the whole batch, so batch size is nearly free now
 const FAST_MS = 400;      // there's a backlog → drain quickly
@@ -92,9 +96,24 @@ export class RegistryEnricher {
       const pools = await this.enrichPools(block);
       const toks = await this.enrichTokens(block);
       const facs = await this.enrichFactories(block);
+      const rev = await this.enrichFactoryReverse(block);
+      const pfee = await this.enrichProtocolFees(block);
+      const syms = await this.enrichSymbols(block);
+      const cls = await this.enrichClassify(block);
       const aero = await this.enrichAeroStable(block);
-      did = pools.done + toks.done + facs.done + aero.done;
-      rateLimited = pools.rateLimited || toks.rateLimited || facs.rateLimited || aero.rateLimited;
+      did = pools.done + toks.done + facs.done + aero.done + rev.done + pfee.done + syms.done + cls.done;
+      rateLimited = pools.rateLimited || toks.rateLimited || facs.rateLimited || aero.rateLimited || rev.rateLimited || pfee.rateLimited || syms.rateLimited || cls.rateLimited;
+      // ACTIVITY LOG: record only cycles that did work or hit a limit — an idle tick is not news, but a cycle
+      // where the buffer is non-empty and NOTHING advanced is exactly what we need to be able to see.
+      const passes: Record<string, number> = {};
+      for (const [k, v] of [["pool", pools.done], ["token", toks.done], ["factory", facs.done], ["factoryReverse", rev.done], ["protocolFee", pfee.done], ["symbol", syms.done], ["classify", cls.done], ["aeroStable", aero.done]] as const) if (v) passes[k] = v;
+      if (did || rateLimited) {
+        await this.db.logEnrichmentCycle(this.config.CHAIN_ID, block, passes, rateLimited, rateLimited ? "RPC lane rate-limited — buffer waits and resumes" : undefined).catch(() => undefined);
+      } else {
+        // Nothing advanced: say WHY, so "stuck" is distinguishable from "finished".
+        const left = await this.db.countEnrichPending(this.config.CHAIN_ID).catch(() => 0);
+        if (left > 0) await this.db.logEnrichmentCycle(this.config.CHAIN_ID, block, {}, false, `${left} entità in coda ma nessun avanzamento — candidati non risolvibili o cap tentativi raggiunto`).catch(() => undefined);
+      }
       // Tick-map bootstrap (Item 3.2): P0 (demand-driven, KG-requested) runs ALWAYS so it's never starved;
       // P1–P3 (background historical) only when the fast queues are idle.
       const tb0 = await this.enrichTickBootstrap(0); did += tb0.done; rateLimited = rateLimited || tb0.rateLimited;
@@ -426,19 +445,148 @@ export class RegistryEnricher {
    * manual resync `factory` task). A pool whose factory() can't be read is block-marked so it isn't retried
    * forever. Runs on the enrichment lane, paced; NOT gate-blocking (factory isn't in the resync buffer). */
   private async enrichFactories(block: number | null): Promise<{ done: number; rateLimited: boolean }> {
-    const batch = await this.db.poolsMissingFactory(this.config.CHAIN_ID, this.config.ENRICH_BATCH).catch(() => [] as string[]);
+    const cid = this.config.CHAIN_ID;
+    const batch = await this.db.poolsMissingFactory(cid, POOL_BATCH).catch(() => []);
+    if (!batch.length) return { done: 0, rateLimited: false };
+    const mc = this.getScanClient() ?? this.chain.primary;
+    let res: Array<{ status: string; result?: unknown }>;
+    try {
+      res = await mc.multicall({ contracts: batch.map((p) => ({ address: p.address as Address, abi: POOL_META_ABI, functionName: "factory" as const })), multicallAddress: MULTICALL3, allowFailure: true }) as Array<{ status: string; result?: unknown }>; // db-first-allow: write-side enrichment
+    } catch (e) {
+      if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: 0, rateLimited: true }; }
+      return { done: 0, rateLimited: false }; // transport fault: no evidence about any pool → retry later untouched
+    }
+    let done = 0, unexposed = 0;
+    for (let i = 0; i < batch.length; i++) {
+      const p = batch[i];
+      if (res[i]?.status === "success") {
+        await this.db.upsertEntity({ chainId: cid, address: p.address, kind: "pool", meta: { factory: String(res[i].result).toLowerCase() }, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+        done++;
+      } else {
+        // Count the attempt (bounded) instead of excluding forever. Once the cap is hit the pool moves to the
+        // REVERSE-LOOKUP pass — the datum is recoverable another way, so it is never simply dropped.
+        const prev = await this.db.getEntity(cid, p.address).catch(() => []);
+        const n = Number(((prev[0]?.meta ?? {}) as { factoryAttempts?: unknown }).factoryAttempts ?? 0) + 1;
+        await this.db.mergeEntityMeta(cid, p.address, "pool", { factoryAttempts: n }).catch(() => undefined);
+        unexposed++;
+      }
+    }
+    if (unexposed) this.logger.debug({ unexposed }, "factory() not exposed — queued for reverse lookup");
+    return { done, rateLimited: false };
+  }
+
+  /**
+   * FACTORY REVERSE LOOKUP — some pools genuinely do not expose factory() (verified on a real Solidly-family
+   * pool). The datum is still recoverable: ask each CANDIDATE factory whether it created this pair. The one
+   * whose getPair(token0, token1[, stable]) returns our address IS the factory. Finding the data by another
+   * route beats recording a permanent hole.
+   */
+  private async enrichFactoryReverse(block: number | null): Promise<{ done: number; rateLimited: boolean }> {
+    const cid = this.config.CHAIN_ID;
+    const batch = await this.db.poolsForFactoryReverseLookup(cid, 12).catch(() => []);
+    if (!batch.length) return { done: 0, rateLimited: false };
+    const cands = await this.db.knownFactories(cid, ["v2", "aerodrome", "aerodrome-stable", "solidly"]).catch(() => []);
+    if (!cands.length) return { done: 0, rateLimited: false };
+    const mc = this.getScanClient() ?? this.chain.primary;
+    let done = 0;
+    for (const p of batch) {
+      if (!p.token0 || !p.token1) continue;
+      const calls: Array<Record<string, unknown>> = [];
+      const meta: Array<{ factory: string; stable?: boolean; membership?: boolean }> = [];
+      for (const f of cands) {
+        // isPair(pool) is a DIRECT membership test — independent of token ordering and of the fork's mapping
+        // shape, so it succeeds where getPair(t0,t1,…) fails. Try it first, then the getPair variants.
+        calls.push({ address: f as Address, abi: SOLIDLY_FACTORY_ABI, functionName: "isPair", args: [p.address] }); meta.push({ factory: f, membership: true });
+        for (const st of [false, true]) { calls.push({ address: f as Address, abi: SOLIDLY_FACTORY_ABI, functionName: "getPair", args: [p.token0, p.token1, st] }); meta.push({ factory: f, stable: st }); }
+        calls.push({ address: f as Address, abi: V2_FACTORY_ABI, functionName: "getPair", args: [p.token0, p.token1] }); meta.push({ factory: f });
+      }
+      let res: Array<{ status: string; result?: unknown }>;
+      try { res = await mc.multicall({ contracts: calls as never, multicallAddress: MULTICALL3, allowFailure: true }) as Array<{ status: string; result?: unknown }>; } // db-first-allow: write-side enrichment
+      catch (e) { if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done, rateLimited: true }; } return { done, rateLimited: false }; }
+      const hit = res.findIndex((r, i) => r?.status === "success" && meta[i] && (meta[i].membership ? r.result === true : String(r.result).toLowerCase() === p.address.toLowerCase()));
+      if (hit >= 0) {
+        const m = meta[hit];
+        const patch: Record<string, unknown> = { factory: m.factory.toLowerCase(), factoryResolvedBy: "reverse-getPair" };
+        if (m.stable !== undefined) patch.stableFlag = m.stable; // the factory also tells us the curve variant
+        await this.db.upsertEntity({ chainId: cid, address: p.address, kind: "pool", meta: patch, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+        done++;
+      } else {
+        await this.db.mergeEntityMeta(cid, p.address, "pool", { factoryResolvedBy: "none (no candidate factory claims it)" }).catch(() => undefined);
+      }
+    }
+    return { done, rateLimited: false };
+  }
+
+  /**
+   * PROTOCOL FEE — for constant-product families the fee is NOT a per-pool datum (a V2 pair has no fee()); it
+   * belongs to the protocol. Resolve it ONCE per factory and record its SOURCE, so a protocol constant stays
+   * distinguishable from a value we actually read. This is what removes the `fee || 3000` guesses downstream.
+   */
+  private async enrichProtocolFees(block: number | null): Promise<{ done: number; rateLimited: boolean }> {
+    const cid = this.config.CHAIN_ID;
+    const batch = await this.db.factoriesNeedingFee(cid, 8).catch(() => []);
     if (!batch.length) return { done: 0, rateLimited: false };
     let done = 0;
-    for (const pool of batch) {
+    for (const f of batch) {
       try {
-        const f = (await this.chain.enrichment.readContract({ address: pool as Address, abi: POOL_META_ABI, functionName: "factory" }) as string).toLowerCase();
-        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: pool, kind: "pool", meta: { factory: f }, source: "enricher", block: block ?? undefined }).catch(() => undefined);
-        done += 1;
-      } catch (e) {
-        if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done, rateLimited: true }; }
-        await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { factoryCheckedAt: block ?? 0 }).catch(() => undefined); // block-based marker (was timestamp)
-      }
+        // 1) Ask the factory (Aerodrome/Solidly expose getFee) — a READ beats any assumption.
+        const read = await this.chain.enrichment.readContract({ address: f.factory as Address, abi: AERO_FACTORY_FEE_ABI, functionName: "getFee", args: [f.samplePool as Address, f.stable] }).then(Number).catch(() => null); // db-first-allow: write-side enrichment
+        if (read != null && read > 0) { await this.db.setFactoryFee(cid, f.factory, read * 100, "factory.getFee"); done++; await this.pace(); continue; } // bps → ppm
+        // 2) Otherwise it is a protocol CONSTANT (UniV2-style pairs hardcode 0.30%). Recording it with its
+        //    source is a fact about the protocol, not a silent default.
+        if (f.archetype === "v2") { await this.db.setFactoryFee(cid, f.factory, 3000, "protocol-constant:univ2-0.30%"); done++; }
+      } catch (e) { if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done, rateLimited: true }; } }
       await this.pace();
+    }
+    return { done, rateLimited: false };
+  }
+
+  /** SYMBOL backfill — a plain ERC20 call we simply were not making (symbol was only ever taken from a
+   * third-party API while filling decimals, so a token that already had decimals was never revisited). */
+  private async enrichSymbols(block: number | null): Promise<{ done: number; rateLimited: boolean }> {
+    const cid = this.config.CHAIN_ID;
+    const batch = await this.db.tokensMissingSymbol(cid, 60).catch(() => [] as string[]);
+    if (!batch.length) return { done: 0, rateLimited: false };
+    const mc = this.getScanClient() ?? this.chain.primary;
+    let res: Array<{ status: string; result?: unknown }>;
+    try { res = await mc.multicall({ contracts: batch.map((a) => ({ address: a as Address, abi: ERC20_META_ABI, functionName: "symbol" as const })), multicallAddress: MULTICALL3, allowFailure: true }) as Array<{ status: string; result?: unknown }>; } // db-first-allow: write-side enrichment
+    catch (e) { if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: 0, rateLimited: true }; } return { done: 0, rateLimited: false }; }
+    let done = 0;
+    for (let i = 0; i < batch.length; i++) {
+      const v = res[i]?.status === "success" ? String(res[i].result).slice(0, 32) : null;
+      if (v && v !== "?") { await this.db.upsertEntity({ chainId: cid, address: batch[i], kind: "token", symbol: v, source: "enricher", block: block ?? undefined }).catch(() => undefined); done++; }
+      else await this.db.mergeEntityMeta(cid, batch[i], "token", { symbolAttempts: 1 }).catch(() => undefined);
+    }
+    return { done, rateLimited: false };
+  }
+
+  /** CLASSIFY unknown-archetype pools from their ABI fingerprint — they are ACTIVE pools we simply never
+   * identified, and an unclassified pool is invisible to every archetype-aware query downstream. */
+  private async enrichClassify(block: number | null): Promise<{ done: number; rateLimited: boolean }> {
+    const cid = this.config.CHAIN_ID;
+    const batch = await this.db.poolsNeedingClassification(cid, 20).catch(() => []);
+    if (!batch.length) return { done: 0, rateLimited: false };
+    const mc = this.getScanClient() ?? this.chain.primary;
+    const calls: Array<Record<string, unknown>> = [];
+    for (const p of batch) {
+      calls.push({ address: p.address as Address, abi: CLASSIFY_ABI, functionName: "slot0" });
+      calls.push({ address: p.address as Address, abi: CLASSIFY_ABI, functionName: "globalState" });
+      calls.push({ address: p.address as Address, abi: CLASSIFY_ABI, functionName: "stable" });
+      calls.push({ address: p.address as Address, abi: CLASSIFY_ABI, functionName: "getReserves" });
+    }
+    let res: Array<{ status: string; result?: unknown }>;
+    try { res = await mc.multicall({ contracts: calls as never, multicallAddress: MULTICALL3, allowFailure: true }) as Array<{ status: string; result?: unknown }>; } // db-first-allow: write-side enrichment
+    catch (e) { if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: 0, rateLimited: true }; } return { done: 0, rateLimited: false }; }
+    let done = 0;
+    for (let i = 0; i < batch.length; i++) {
+      const [hasSlot0, hasGlobal, stableRes, hasReserves] = [res[i * 4], res[i * 4 + 1], res[i * 4 + 2], res[i * 4 + 3]];
+      let archetype: string | null = null;
+      if (hasSlot0?.status === "success") archetype = "v3";
+      else if (hasGlobal?.status === "success") archetype = "v3";                       // Algebra-family (concentrated)
+      else if (stableRes?.status === "success") archetype = stableRes.result === true ? "aerodrome-stable" : "aerodrome";
+      else if (hasReserves?.status === "success") archetype = "v2";
+      if (archetype) { await this.db.upsertEntity({ chainId: cid, address: batch[i].address, kind: "pool", meta: { archetype, archetypeSource: "abi-fingerprint" }, source: "enricher", block: block ?? undefined }).catch(() => undefined); done++; }
+      else await this.db.mergeEntityMeta(cid, batch[i].address, "pool", { classifyAttempts: 1 }).catch(() => undefined);
     }
     return { done, rateLimited: false };
   }

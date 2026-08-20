@@ -559,6 +559,19 @@ export class Database {
         dominant_buy TEXT, dominant_sell TEXT, spread_bps INTEGER
       );
       CREATE INDEX IF NOT EXISTS kg_surface_points_run ON kg_surface_points(run_id);
+      -- ENRICHMENT ACTIVITY LOG — what each drain cycle actually DID, per pass. The buffer snapshot answers
+      -- "how much is left"; this answers "is it working, on what, and why is something not advancing". Only
+      -- cycles that did work / hit a limit / failed are recorded, so idle ticks never flood it.
+      CREATE TABLE IF NOT EXISTS enrichment_log (
+        id BIGSERIAL PRIMARY KEY,
+        chain_id INTEGER NOT NULL,
+        block BIGINT,
+        passes JSONB NOT NULL,        -- {pass: completed} for the passes that did something
+        rate_limited BOOLEAN NOT NULL DEFAULT false,
+        note TEXT,                    -- why nothing progressed (transport fault, no candidates, cap reached…)
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS enrichment_log_recent ON enrichment_log(chain_id, created_at DESC);
       -- SINGLE-INSTANCE observer lease (Item 7): TTL heartbeat so exactly one observer processes blocks.
       CREATE TABLE IF NOT EXISTS kg_observer_lease (
         chain_id INTEGER PRIMARY KEY,
@@ -1259,6 +1272,33 @@ export class Database {
 
   /** GATE (resync): how many resync-flagged entities are still incomplete (not yet enriched, not failed).
    * 0 = the resync set is fully resolved → the startup gate may release the acting services. */
+  /** Record one enrichment cycle. Called only when something happened, and self-trimming so the table stays
+   * a rolling window rather than unbounded history. */
+  async logEnrichmentCycle(chainId: number, block: number | null, passes: Record<string, number>, rateLimited: boolean, note?: string): Promise<void> {
+    await this.pool.query(`INSERT INTO enrichment_log(chain_id, block, passes, rate_limited, note) VALUES($1,$2,$3,$4,$5)`,
+      [chainId, block, JSON.stringify(passes), rateLimited, note ?? null]).catch(() => undefined);
+    if (Math.random() < 0.02) await this.pool.query(`DELETE FROM enrichment_log WHERE chain_id=$1 AND created_at < now() - interval '6 hours'`, [chainId]).catch(() => undefined);
+  }
+
+  async countEnrichPending(chainId: number): Promise<number> {
+    const r = await this.pool.query<{ n: number }>(`SELECT count(*)::int n FROM entities WHERE chain_id=$1 AND enrich_pending AND NOT enrich_failed`, [chainId]);
+    return r.rows[0]?.n ?? 0;
+  }
+
+  /** Recent enrichment activity + per-pass totals: "is it working, on what, and what is stuck". */
+  async enrichmentActivity(chainId: number, limit = 25): Promise<{ recent: Array<Record<string, unknown>>; totals: Record<string, number>; windowMin: number; rateLimitedCycles: number }> {
+    const r = await this.pool.query<Record<string, unknown>>(
+      `SELECT block::text, passes, rate_limited, note, to_char(created_at,'HH24:MI:SS') at,
+              (EXTRACT(EPOCH FROM (now()-created_at)))::int age_s
+       FROM enrichment_log WHERE chain_id=$1 ORDER BY created_at DESC LIMIT $2`, [chainId, limit]);
+    const agg = await this.pool.query<{ passes: Record<string, number>; rl: boolean }>(
+      `SELECT passes, rate_limited rl FROM enrichment_log WHERE chain_id=$1 AND created_at > now() - interval '60 minutes'`, [chainId]);
+    const totals: Record<string, number> = {};
+    let rateLimitedCycles = 0;
+    for (const row of agg.rows) { if (row.rl) rateLimitedCycles++; for (const [k, v] of Object.entries(row.passes ?? {})) totals[k] = (totals[k] ?? 0) + Number(v); }
+    return { recent: r.rows, totals, windowMin: 60, rateLimitedCycles };
+  }
+
   /** Return entities to the enrichment buffer after a WRITE-SIDE fault (a flaky RPC burned their attempts,
    * not bad data). Data completeness is the goal — a permanently-failed entity we never re-try is a silent
    * hole in every downstream calculation. Called on startup so a transient outage cannot cost us data. */
@@ -1269,9 +1309,17 @@ export class Database {
     return r.rowCount ?? 0;
   }
 
+  /** Entities whose incompleteness would make an ACTING component WRONG — the only thing worth holding the
+   * startup gate for. Scoped deliberately: a token without decimals mis-prices everything, and a pool without
+   * its tokens cannot be modelled at all. A pool merely missing fee/tickSpacing is NOT counted: every
+   * size-dependent claim on it already fails closed downstream, so blocking the whole system on thousands of
+   * pool-metadata rows delays liquidations without making anything safer. */
   async countResyncOutstanding(chainId: number): Promise<number> {
     const r = await this.pool.query<{ n: number }>(
-      `SELECT count(*)::int n FROM entities WHERE chain_id=$1 AND enrich_resync AND enrich_pending AND NOT enrich_failed`, [chainId]
+      `SELECT count(*)::int n FROM entities
+       WHERE chain_id=$1 AND enrich_resync AND enrich_pending AND NOT enrich_failed
+         AND ( (kind='token' AND decimals IS NULL)
+            OR (kind='pool' AND ((meta->>'token0') IS NULL OR (meta->>'token1') IS NULL)) )`, [chainId]
     );
     return r.rows[0]?.n ?? 0;
   }
@@ -1288,12 +1336,85 @@ export class Database {
     );
     return r.rows.map((x) => x.address);
   }
-  async poolsMissingFactory(chainId: number, limit = 200): Promise<string[]> {
-    const r = await this.pool.query<{ address: string }>(
-      `SELECT address FROM entities WHERE chain_id=$1 AND kind='pool' AND NOT (meta ? 'factory') AND NOT (meta ? 'factoryCheckedAt') ORDER BY updated_at DESC LIMIT $2`,
-      [chainId, limit]
+  /** Pools still missing their factory. A single failed read must NOT exclude a pool forever (that silently
+   * cost us 131 pools): we bound RETRIES instead, and `factoryUnavailable` is set only when we have positive
+   * evidence the contract does not expose it — those go to the reverse-lookup pass instead of being dropped. */
+  async poolsMissingFactory(chainId: number, limit = 200, maxAttempts = 3): Promise<Array<{ address: string; archetype: string | null; token0: string | null; token1: string | null }>> {
+    const r = await this.pool.query<{ address: string; archetype: string | null; t0: string | null; t1: string | null }>(
+      `SELECT address, meta->>'archetype' archetype, meta->>'token0' t0, meta->>'token1' t1
+       FROM entities WHERE chain_id=$1 AND kind='pool' AND NOT (meta ? 'factory')
+         AND COALESCE((meta->>'factoryAttempts')::int, 0) < $3
+       ORDER BY updated_at DESC LIMIT $2`, [chainId, limit, maxAttempts]
     );
+    return r.rows.map((x) => ({ address: x.address, archetype: x.archetype, token0: x.t0, token1: x.t1 }));
+  }
+
+  /** Pools whose factory() is genuinely not exposed → recover it by REVERSE LOOKUP on candidate factories. */
+  async poolsForFactoryReverseLookup(chainId: number, limit = 40): Promise<Array<{ address: string; archetype: string | null; token0: string | null; token1: string | null }>> {
+    const r = await this.pool.query<{ address: string; archetype: string | null; t0: string | null; t1: string | null }>(
+      `SELECT address, meta->>'archetype' archetype, meta->>'token0' t0, meta->>'token1' t1
+       FROM entities WHERE chain_id=$1 AND kind='pool' AND NOT (meta ? 'factory')
+         AND COALESCE((meta->>'factoryAttempts')::int, 0) >= 3 AND NOT (meta ? 'factoryResolvedBy')
+         AND meta->>'token0' IS NOT NULL AND meta->>'token1' IS NOT NULL
+       ORDER BY updated_at DESC LIMIT $2`, [chainId, limit]
+    );
+    return r.rows.map((x) => ({ address: x.address, archetype: x.archetype, token0: x.t0, token1: x.t1 }));
+  }
+
+  /** Distinct factories we already know, per archetype — the candidate set for the reverse lookup. */
+  async knownFactories(chainId: number, archetypes: string[]): Promise<string[]> {
+    const r = await this.pool.query<{ f: string }>(
+      `SELECT DISTINCT meta->>'factory' f FROM entities WHERE chain_id=$1 AND kind='pool'
+         AND meta->>'factory' IS NOT NULL AND meta->>'archetype' = ANY($2::text[])`, [chainId, archetypes]);
+    return r.rows.map((x) => x.f).filter(Boolean);
+  }
+
+  /** Tokens missing a SYMBOL (readability, not price). Kept OUT of enrich_pending so it never blocks the
+   * startup gate, but no longer invisible: symbol() is a plain ERC20 call we simply were not making. */
+  async tokensMissingSymbol(chainId: number, limit = 60, maxAttempts = 3): Promise<string[]> {
+    const r = await this.pool.query<{ address: string }>(
+      `SELECT address FROM entities WHERE chain_id=$1 AND kind='token' AND symbol IS NULL
+         AND COALESCE((meta->>'symbolAttempts')::int, 0) < $3
+       ORDER BY updated_block DESC NULLS LAST LIMIT $2`, [chainId, limit, maxAttempts]);
     return r.rows.map((x) => x.address);
+  }
+
+  /** Pools whose archetype is unknown but that are ACTIVE — classify them from their ABI fingerprint. */
+  async poolsNeedingClassification(chainId: number, limit = 40): Promise<Array<{ address: string; token0: string | null; token1: string | null }>> {
+    const r = await this.pool.query<{ address: string; t0: string | null; t1: string | null }>(
+      `SELECT address, meta->>'token0' t0, meta->>'token1' t1 FROM entities
+       WHERE chain_id=$1 AND kind='pool' AND COALESCE(meta->>'archetype','unknown')='unknown'
+         AND COALESCE((meta->>'classifyAttempts')::int, 0) < 3
+       ORDER BY updated_at DESC LIMIT $2`, [chainId, limit]);
+    return r.rows.map((x) => ({ address: x.address, token0: x.t0, token1: x.t1 }));
+  }
+
+  /** Factories still without a resolved protocol fee (the CP families where fee is NOT per-pool). */
+  async factoriesNeedingFee(chainId: number, limit = 20): Promise<Array<{ factory: string; archetype: string; samplePool: string; stable: boolean }>> {
+    const r = await this.pool.query<{ factory: string; archetype: string; pool: string; stable: boolean }>(
+      `SELECT DISTINCT ON (e.meta->>'factory', e.meta->>'archetype')
+              e.meta->>'factory' factory, e.meta->>'archetype' archetype, e.address pool,
+              (e.meta->>'archetype' = 'aerodrome-stable') stable
+       FROM entities e LEFT JOIN entities f ON f.chain_id=e.chain_id AND f.address=e.meta->>'factory' AND f.kind='dex'
+       WHERE e.chain_id=$1 AND e.kind='pool' AND e.meta->>'factory' IS NOT NULL
+         AND e.meta->>'archetype' IN ('v2','aerodrome','aerodrome-stable','solidly')
+         AND (f.meta->>'feePpm') IS NULL
+       LIMIT $2`, [chainId, limit]);
+    return r.rows.map((x) => ({ factory: x.factory, archetype: x.archetype, samplePool: x.pool, stable: x.stable }));
+  }
+
+  /** Protocol-level fee lives on the FACTORY entity, with its SOURCE recorded (read vs protocol constant) —
+   * a constant is a FACT about the protocol, not a guessed default, and the difference must stay visible. */
+  async setFactoryFee(chainId: number, factory: string, feePpm: number, source: string): Promise<void> {
+    await this.upsertEntity({ chainId, address: factory, kind: "dex", meta: { feePpm, feeSource: source }, source: "enricher" });
+  }
+  /** factory → protocol fee (ppm), for the loader to resolve a CP pool's real fee. */
+  async protocolFees(chainId: number): Promise<Map<string, number>> {
+    const r = await this.pool.query<{ address: string; fee: string }>(
+      `SELECT address, meta->>'feePpm' fee FROM entities WHERE chain_id=$1 AND kind='dex' AND meta->>'feePpm' IS NOT NULL`, [chainId]);
+    const m = new Map<string, number>();
+    for (const row of r.rows) { const n = Number(row.fee); if (Number.isFinite(n) && n > 0) m.set(row.address.toLowerCase(), n); }
+    return m;
   }
 
   /** Token symbol+decimals for a set of addresses, FROM THE REGISTRY (the source of truth). Consumers
@@ -1713,15 +1834,27 @@ export class Database {
     const one = async (sql: string, params: unknown[] = []) => (await q(sql, params))[0] ?? {};
 
     // 1) DATA COMPLETENESS — per archetype, exactly which mandatory field is missing.
+    // `fee_applies` / `spacing_applies`: a constant-product pool has NO per-pool fee (it is a protocol
+    // constant) and NO tickSpacing. Reporting those as "missing" invents thousands of phantom gaps and makes
+    // the real ones invisible — the view must distinguish NOT-APPLICABLE from MISSING.
     const completeness = await q(
       `SELECT COALESCE(meta->>'archetype','(none)') archetype, count(*)::int total,
+              (COALESCE(meta->>'archetype','') IN ('v3','v4','slipstream','algebra')) fee_applies,
+              (COALESCE(meta->>'archetype','') IN ('v3','v4','slipstream','algebra')) spacing_applies,
               count(*) FILTER (WHERE meta->>'token0' IS NULL)::int missing_token0,
               count(*) FILTER (WHERE meta->>'fee' IS NULL)::int missing_fee,
               count(*) FILTER (WHERE meta->>'tickSpacing' IS NULL)::int missing_spacing,
               count(*) FILTER (WHERE meta->>'factory' IS NULL)::int missing_factory,
               count(*) FILTER (WHERE enrich_pending)::int pending,
               count(*) FILTER (WHERE enrich_failed)::int failed
-       FROM entities WHERE chain_id=$1 AND kind='pool' GROUP BY 1 ORDER BY total DESC`, [chainId]);
+       FROM entities WHERE chain_id=$1 AND kind='pool' GROUP BY 1,3,4 ORDER BY total DESC`, [chainId]);
+    // Protocol-level fee coverage: for CP pools the fee lives on the FACTORY, so completeness is measured there.
+    const protocolFees = await q(
+      `SELECT COALESCE(e.meta->>'factory','(none)') factory, COALESCE(e.meta->>'archetype','?') archetype, count(*)::int pools,
+              (f.meta->>'feePpm') fee_ppm, (f.meta->>'feeSource') fee_source
+       FROM entities e LEFT JOIN entities f ON f.chain_id=e.chain_id AND f.address=e.meta->>'factory' AND f.kind='dex'
+       WHERE e.chain_id=$1 AND e.kind='pool' AND COALESCE(e.meta->>'archetype','') IN ('v2','aerodrome','aerodrome-stable','solidly')
+       GROUP BY 1,2,4,5 ORDER BY pools DESC LIMIT 15`, [chainId]);
     const tokens = await one(
       `SELECT count(*)::int total, count(*) FILTER (WHERE decimals IS NULL)::int missing_decimals,
               count(*) FILTER (WHERE symbol IS NULL)::int missing_symbol,
@@ -1769,7 +1902,7 @@ export class Database {
     const lastRun = await one(`SELECT block::text, duration_ms, sized, executable, preflight_pass, (EXTRACT(EPOCH FROM (now()-created_at))*1000)::bigint::text age_ms FROM kg_observer_runs WHERE chain_id=$1 ORDER BY created_at DESC LIMIT 1`, [chainId]).catch(() => ({}));
     const lending = await q(`SELECT tier, count(*)::int n, round(sum(debt_usd)::numeric,0)::text debt_usd FROM lending_positions WHERE chain_id=$1 GROUP BY 1 ORDER BY n DESC`, [chainId]).catch(() => []);
 
-    return { completeness, tokens, buffer, ticks, tickErrors, chain, coverage, gaps, gas, poolState, kg, lastRun, lending, now: new Date().toISOString() };
+    return { completeness, protocolFees, tokens, buffer, ticks, tickErrors, chain, coverage, gaps, gas, poolState, kg, lastRun, lending, now: new Date().toISOString() };
   }
 
   /** Coverage census: the deepest live pool of each concentrated factory (V3-family AND V4), so a capability
