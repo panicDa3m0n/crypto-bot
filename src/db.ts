@@ -1702,6 +1702,76 @@ export class Database {
     }));
   }
 
+  /**
+   * HEALTH SNAPSHOT — everything a human needs to SEE the system's real state, in one DB-only bundle. Built
+   * from the failures this project actually hit: a buffer that reported 18 items while 10k entities were
+   * incomplete, pools burned into enrich_failed by a flaky lane, 2.5% tick certification, numbers shown
+   * without their trustworthiness. Every section answers "what is missing / what is wrong / how do I find it".
+   */
+  async healthSnapshot(chainId: number): Promise<Record<string, unknown>> {
+    const q = async (sql: string, params: unknown[] = []) => (await this.pool.query(sql, params)).rows as Array<Record<string, unknown>>;
+    const one = async (sql: string, params: unknown[] = []) => (await q(sql, params))[0] ?? {};
+
+    // 1) DATA COMPLETENESS — per archetype, exactly which mandatory field is missing.
+    const completeness = await q(
+      `SELECT COALESCE(meta->>'archetype','(none)') archetype, count(*)::int total,
+              count(*) FILTER (WHERE meta->>'token0' IS NULL)::int missing_token0,
+              count(*) FILTER (WHERE meta->>'fee' IS NULL)::int missing_fee,
+              count(*) FILTER (WHERE meta->>'tickSpacing' IS NULL)::int missing_spacing,
+              count(*) FILTER (WHERE meta->>'factory' IS NULL)::int missing_factory,
+              count(*) FILTER (WHERE enrich_pending)::int pending,
+              count(*) FILTER (WHERE enrich_failed)::int failed
+       FROM entities WHERE chain_id=$1 AND kind='pool' GROUP BY 1 ORDER BY total DESC`, [chainId]);
+    const tokens = await one(
+      `SELECT count(*)::int total, count(*) FILTER (WHERE decimals IS NULL)::int missing_decimals,
+              count(*) FILTER (WHERE symbol IS NULL)::int missing_symbol,
+              count(*) FILTER (WHERE enrich_pending)::int pending, count(*) FILTER (WHERE enrich_failed)::int failed
+       FROM entities WHERE chain_id=$1 AND kind='token'`, [chainId]);
+
+    // 2) ENRICHMENT BUFFER — depth, what's stuck, and whether it is actually moving.
+    const buffer = await one(
+      `SELECT count(*) FILTER (WHERE enrich_pending AND NOT enrich_failed)::int in_buffer,
+              count(*) FILTER (WHERE enrich_failed)::int failed,
+              count(*) FILTER (WHERE enrich_resync AND enrich_pending AND NOT enrich_failed)::int resync_outstanding,
+              count(*) FILTER (WHERE enrich_pending AND enrich_attempts > 0)::int with_attempts,
+              max(enrich_attempts)::int max_attempts,
+              count(*) FILTER (WHERE updated_at > now() - interval '2 min')::int written_last_2min
+       FROM entities WHERE chain_id=$1`, [chainId]);
+
+    // 3) TICK CERTIFICATION — the gate on every size-dependent number, by protocol.
+    const ticks = await q(
+      `SELECT COALESCE(e.meta->>'factory','(none)') factory, count(*)::int pools,
+              count(*) FILTER (WHERE pts.complete)::int certified,
+              count(*) FILTER (WHERE pts.status='failed')::int failed
+       FROM entities e LEFT JOIN pool_tick_status pts ON pts.chain_id=e.chain_id AND pts.pool=e.address
+       WHERE e.chain_id=$1 AND e.kind='pool' AND e.meta->>'archetype' IN ('v3','v4','slipstream')
+       GROUP BY 1 ORDER BY pools DESC LIMIT 12`, [chainId]);
+    const tickErrors = await q(
+      `SELECT COALESCE(last_error,'(none)') reason, count(*)::int n FROM pool_tick_status
+       WHERE chain_id=$1 AND status='failed' GROUP BY 1 ORDER BY n DESC LIMIT 8`, [chainId]);
+
+    // 4) PIPELINE — indexer freshness/coverage, gas freshness. A stale mirror invalidates every decision.
+    const chain = await one(`SELECT indexed_block::text, network_head_seen::text, lag_blocks::int, synced, (EXTRACT(EPOCH FROM (now()-updated_at))*1000)::bigint::text age_ms FROM chain_status WHERE chain_id=$1`, [chainId]);
+    const coverage = await one(`SELECT coverage_start::text, continuous_through::text, generation FROM indexer_coverage WHERE chain_id=$1`, [chainId]);
+    const gaps = await q(`SELECT from_block::text, to_block::text, reason, repaired_at FROM indexer_gaps WHERE chain_id=$1 ORDER BY from_block DESC LIMIT 5`, [chainId]);
+    const gas = await one(`SELECT gas_price_wei::text, (EXTRACT(EPOCH FROM (now()-updated_at))*1000)::bigint::text age_ms FROM gas_state WHERE chain_id=$1`, [chainId]);
+    const poolState = await one(`SELECT count(*)::int total, count(*) FILTER (WHERE updated_at > now() - interval '5 min')::int fresh_5min FROM pool_state WHERE chain_id=$1`, [chainId]);
+
+    // 5) KG ECONOMICS — with the quality flags, so a number is never read without its trustworthiness.
+    const kg = await one(
+      `SELECT (SELECT count(*)::int FROM kg_candidates WHERE chain_id=$1) candidates,
+              (SELECT count(*)::int FROM kg_candidates WHERE chain_id=$1 AND executable) executable,
+              (SELECT count(*)::int FROM kg_candidates WHERE chain_id=$1 AND simulation_exact) exact,
+              (SELECT count(*)::int FROM kg_candidates WHERE chain_id=$1 AND preflight_status='pass') preflight_pass,
+              (SELECT count(*)::int FROM kg_signals WHERE chain_id=$1) signals,
+              (SELECT count(*)::int FROM kg_observer_runs WHERE chain_id=$1) observer_runs,
+              (SELECT count(*)::int FROM kg_surface_runs WHERE chain_id=$1) surface_runs`, [chainId]).catch(() => ({}));
+    const lastRun = await one(`SELECT block::text, duration_ms, sized, executable, preflight_pass, (EXTRACT(EPOCH FROM (now()-created_at))*1000)::bigint::text age_ms FROM kg_observer_runs WHERE chain_id=$1 ORDER BY created_at DESC LIMIT 1`, [chainId]).catch(() => ({}));
+    const lending = await q(`SELECT tier, count(*)::int n, round(sum(debt_usd)::numeric,0)::text debt_usd FROM lending_positions WHERE chain_id=$1 GROUP BY 1 ORDER BY n DESC`, [chainId]).catch(() => []);
+
+    return { completeness, tokens, buffer, ticks, tickErrors, chain, coverage, gaps, gas, poolState, kg, lastRun, lending, now: new Date().toISOString() };
+  }
+
   /** Coverage census: the deepest live pool of each concentrated factory (V3-family AND V4), so a capability
    * probe can prove there is no protocol on the chain we cannot read. */
   async topPoolPerFactory(chainId: number, limit = 20): Promise<Array<{ factory: string; archetype: string; pool: string; pools: number; fee: number | null; tickSpacing: number | null }>> {

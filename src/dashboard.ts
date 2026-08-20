@@ -6,6 +6,7 @@ import type { Database } from "./db.js";
 import type { BerachainClients } from "./chain.js";
 import type { PositionService } from "./positions.js";
 import { selfState, selfContext } from "./self.js";
+import { readProblems } from "./problems.js";
 import { computeGains } from "./gains.js";
 import { SCARLET_STREAM } from "./scarlet/agent.js";
 
@@ -133,6 +134,22 @@ export function startDashboard(deps: Deps): { close: () => void } | undefined {
         res.end(JSON.stringify({ active, history, now: new Date().toISOString() }));
         return;
       }
+      // OBSERVABILITY: the system's real state — what data is missing, what is stuck, what is failing.
+      if (url.pathname.startsWith("/api/health")) {
+        const snap = await deps.db.healthSnapshot(deps.config.CHAIN_ID).catch((e) => ({ error: String(e) }));
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "access-control-allow-origin": "*" });
+        res.end(JSON.stringify(snap, bigintReplacer));
+        return;
+      }
+      // Problems ONLY (warn/error/fatal), deduplicated with counts — not a log stream.
+      if (url.pathname.startsWith("/api/problems")) {
+        const minLevel = Number(url.searchParams.get("min") ?? 40);
+        const out = readProblems(process.env.LOG_DIR ?? "logs", { minLevel, limit: 150 });
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "access-control-allow-origin": "*" });
+        res.end(JSON.stringify({ ...out, now: new Date().toISOString() }));
+        return;
+      }
+      if (url.pathname === "/health") { res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); res.end(HEALTH_PAGE); return; }
       if (url.pathname === "/scarlet") { res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); res.end(SCARLET_PAGE); return; }
       if (url.pathname === "/explorer") {
         res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
@@ -300,6 +317,17 @@ const PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head><title
           </div>
         </template>
         <div x-show="(s.holdings?.length||0)>5" class="text-[11px] text-dim pt-1" x-text="'+ altri '+((s.holdings?.length||0)-5)+' token'"></div>
+      </div>
+    </a>
+
+    <!-- CARD SALUTE — data completeness, stuck pipelines and real errors, at a glance -->
+    <a href="/health" class="block rounded-2xl bg-panel border border-line p-4 hover:border-scarlet/60 transition group">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-[11px] uppercase tracking-widest text-dim">🩺 Salute &amp; diagnostica</h2>
+        <span class="text-[11px] text-energy group-hover:translate-x-0.5 inline-block transition">→</span>
+      </div>
+      <div class="text-sm text-dim">
+        Completezza dei dati, buffer di enrichment, certificazione tick, gap di copertura e <b class="text-txt">solo</b> i log di problema (raggruppati per causa).
       </div>
     </a>
 
@@ -859,5 +887,217 @@ function explorer(){return{
     if(e.kind==='dex') return (m.role||'factory')+this.verif(m);
     return (e.note||'')+this.verif(m); }
 }}
+</script>
+</body></html>`;
+
+/**
+ * HEALTH & DIAGNOSTICS — built from the failures this project actually hit, so a human can SEE them:
+ *  · a buffer that reported 18 items while 10k entities were incomplete  → Completezza dati + Buffer
+ *  · pools burned into enrich_failed by a flaky lane                      → Falliti, con motivo
+ *  · 2.5% tick certification silently capping every executable claim      → Certificazione per protocollo
+ *  · numbers shown without their trustworthiness                          → KG con exact/executable/preflight
+ *  · a misleading error hiding the real cause                             → Problemi (dedup, con conteggi)
+ * Traffic-light at the top = "is anything wrong right now"; tables below = "what and where".
+ */
+const HEALTH_PAGE = String.raw`<!doctype html><html lang="it" class="dark"><head><title>Scarlet · Salute</title>` + HEAD + `<script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script></head>
+<body class="bg-ink text-txt" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+<div x-data="health()" x-init="init()" x-cloak class="max-w-[1200px] mx-auto pb-16">
+
+  <div class="flex items-center gap-2 px-5 pt-3 pb-1 text-dim text-[11px]">
+    <span class="w-2 h-2 rounded-full bg-scarlet livedot"></span>
+    <a href="/" class="font-semibold tracking-wide text-txt hover:text-scarlet">SCARLET</a>
+    <span class="text-dim">/ salute &amp; diagnostica</span>
+    <span class="ml-auto" x-text="clock"></span>
+    <button @click="load()" class="ml-2 px-2 py-0.5 rounded border border-line hover:border-energy text-dim hover:text-energy">aggiorna</button>
+  </div>
+
+  <!-- SEMAFORO: sta bene adesso? -->
+  <div class="px-5 grid grid-cols-2 md:grid-cols-6 gap-2 mt-2">
+    <template x-for="k in lights" :key="k.label">
+      <div class="rounded-xl border p-3" :class="k.ok==='ok'?'border-pos/40 bg-pos/5':k.ok==='warn'?'border-warn/50 bg-warn/5':'border-neg/50 bg-neg/5'">
+        <div class="text-[10px] uppercase tracking-wide text-dim" x-text="k.label"></div>
+        <div class="text-lg font-mono" :class="k.ok==='ok'?'text-pos':k.ok==='warn'?'text-warn':'text-neg'" x-text="k.value"></div>
+        <div class="text-[10px] text-dim" x-text="k.note"></div>
+      </div>
+    </template>
+  </div>
+
+  <!-- PROBLEMI -->
+  <div class="px-5 mt-5">
+    <div class="flex items-center gap-2 mb-2">
+      <h2 class="text-sm font-semibold">Problemi rilevati</h2>
+      <span class="text-[10px] text-dim">(solo warn/error/fatal, raggruppati per causa)</span>
+      <select x-model="minLevel" @change="loadProblems()" class="ml-auto bg-panel border border-line rounded px-2 py-0.5 text-[11px]">
+        <option value="40">warn e oltre</option><option value="50">solo error/fatal</option>
+      </select>
+    </div>
+    <div class="rounded-xl border border-line bg-panel overflow-hidden">
+      <template x-if="!problems.length"><div class="p-4 text-dim text-xs">Nessun problema nella finestra letta. ✓</div></template>
+      <template x-for="p in problems" :key="p.level+p.message+p.detail">
+        <div class="border-b border-line/60 last:border-0 p-3 hover:bg-panel2">
+          <div class="flex items-start gap-2">
+            <span class="px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0"
+                  :class="p.level==='fatal'?'bg-neg/20 text-neg':p.level==='error'?'bg-neg/15 text-neg':'bg-warn/15 text-warn'" x-text="p.level"></span>
+            <span class="text-[10px] text-dim font-mono shrink-0" x-text="p.component"></span>
+            <span class="text-xs" x-text="p.message"></span>
+            <span class="ml-auto text-[10px] font-mono shrink-0" :class="p.count>50?'text-neg':'text-dim'" x-text="'×'+p.count"></span>
+          </div>
+          <div class="text-[11px] text-dim font-mono mt-1 break-all" x-show="p.detail" x-text="p.detail"></div>
+          <div class="text-[10px] text-dim mt-1" x-text="'dal '+fmt(p.firstSeen)+' · ultimo '+fmt(p.lastSeen)"></div>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <!-- COMPLETEZZA DATI -->
+  <div class="px-5 mt-5">
+    <h2 class="text-sm font-semibold mb-2">Completezza dati <span class="text-[10px] text-dim font-normal">— un dato mancante è lavoro per l'enrichment, mai un default</span></h2>
+    <div class="rounded-xl border border-line bg-panel overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead class="text-dim text-[10px] uppercase"><tr class="border-b border-line">
+          <th class="text-left p-2">Archetipo</th><th class="text-right p-2">Pool</th><th class="text-right p-2">no token0</th>
+          <th class="text-right p-2">no fee</th><th class="text-right p-2">no tickSpacing</th><th class="text-right p-2">no factory</th>
+          <th class="text-right p-2">in buffer</th><th class="text-right p-2">falliti</th></tr></thead>
+        <tbody>
+          <template x-for="r in h.completeness||[]" :key="r.archetype">
+            <tr class="border-b border-line/40 hover:bg-panel2">
+              <td class="p-2 font-mono" x-text="r.archetype"></td>
+              <td class="p-2 text-right font-mono" x-text="r.total"></td>
+              <td class="p-2 text-right font-mono" :class="r.missing_token0?'text-neg':'text-dim'" x-text="r.missing_token0"></td>
+              <td class="p-2 text-right font-mono" :class="miss(r,'fee')?'text-warn':'text-dim'" x-text="r.missing_fee"></td>
+              <td class="p-2 text-right font-mono" :class="miss(r,'spacing')?'text-warn':'text-dim'" x-text="r.missing_spacing"></td>
+              <td class="p-2 text-right font-mono" :class="r.missing_factory?'text-warn':'text-dim'" x-text="r.missing_factory"></td>
+              <td class="p-2 text-right font-mono text-energy" x-text="r.pending"></td>
+              <td class="p-2 text-right font-mono" :class="r.failed?'text-neg':'text-dim'" x-text="r.failed"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+    <div class="text-[10px] text-dim mt-1">
+      Token: <span class="font-mono" x-text="h.tokens?.total"></span> totali ·
+      <span class="font-mono" :class="h.tokens?.missing_decimals?'text-neg':'text-pos'" x-text="h.tokens?.missing_decimals"></span> senza decimals ·
+      <span class="font-mono" x-text="h.tokens?.missing_symbol"></span> senza symbol
+      <span class="ml-2 text-dim">— per v2/aerodrome/solidly la fee è una costante di PROTOCOLLO, non un dato per-pool</span>
+    </div>
+  </div>
+
+  <!-- BUFFER + CERTIFICAZIONE -->
+  <div class="px-5 mt-5 grid md:grid-cols-2 gap-4">
+    <div>
+      <h2 class="text-sm font-semibold mb-2">Buffer enrichment</h2>
+      <div class="rounded-xl border border-line bg-panel p-3 text-xs space-y-1">
+        <div class="flex justify-between"><span class="text-dim">da completare (in coda)</span><span class="font-mono text-energy" x-text="h.buffer?.in_buffer"></span></div>
+        <div class="flex justify-between"><span class="text-dim">di cui resync (blocca il gate d'avvio)</span><span class="font-mono" x-text="h.buffer?.resync_outstanding"></span></div>
+        <div class="flex justify-between"><span class="text-dim">falliti (fuori dal buffer)</span><span class="font-mono" :class="h.buffer?.failed?'text-neg':'text-pos'" x-text="h.buffer?.failed"></span></div>
+        <div class="flex justify-between"><span class="text-dim">con tentativi &gt; 0</span><span class="font-mono" x-text="h.buffer?.with_attempts"></span></div>
+        <div class="flex justify-between"><span class="text-dim">scritture ultimi 2 min</span><span class="font-mono" :class="h.buffer?.written_last_2min?'text-pos':'text-warn'" x-text="h.buffer?.written_last_2min"></span></div>
+        <div class="text-[10px] text-dim pt-1 border-t border-line/50">Se "in coda" è alto ma le scritture sono 0, l'enrichment è fermo — non lento.</div>
+      </div>
+    </div>
+    <div>
+      <h2 class="text-sm font-semibold mb-2">Certificazione tick <span class="text-[10px] text-dim font-normal">— governa ogni numero "a size"</span></h2>
+      <div class="rounded-xl border border-line bg-panel overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead class="text-dim text-[10px] uppercase"><tr class="border-b border-line"><th class="text-left p-2">Factory</th><th class="text-right p-2">Pool</th><th class="text-right p-2">Certificati</th><th class="text-right p-2">Falliti</th></tr></thead>
+          <tbody>
+            <template x-for="r in h.ticks||[]" :key="r.factory">
+              <tr class="border-b border-line/40 hover:bg-panel2">
+                <td class="p-2 font-mono text-[10px]" x-text="r.factory.slice(0,14)"></td>
+                <td class="p-2 text-right font-mono" x-text="r.pools"></td>
+                <td class="p-2 text-right font-mono" :class="r.certified? 'text-pos':'text-neg'" x-text="r.certified+' ('+pct(r.certified,r.pools)+')'"></td>
+                <td class="p-2 text-right font-mono" :class="r.failed?'text-warn':'text-dim'" x-text="r.failed"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-2 rounded-xl border border-line bg-panel p-2 text-[11px]" x-show="(h.tickErrors||[]).length">
+        <div class="text-dim text-[10px] uppercase mb-1">Motivi di fallimento</div>
+        <template x-for="e in h.tickErrors||[]" :key="e.reason">
+          <div class="flex gap-2"><span class="font-mono text-warn shrink-0" x-text="e.n"></span><span class="text-dim break-all" x-text="e.reason"></span></div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <!-- PIPELINE + KG -->
+  <div class="px-5 mt-5 grid md:grid-cols-2 gap-4">
+    <div>
+      <h2 class="text-sm font-semibold mb-2">Pipeline dati</h2>
+      <div class="rounded-xl border border-line bg-panel p-3 text-xs space-y-1">
+        <div class="flex justify-between"><span class="text-dim">indexer block</span><span class="font-mono" x-text="h.chain?.indexed_block"></span></div>
+        <div class="flex justify-between"><span class="text-dim">lag / synced</span><span class="font-mono" :class="h.chain?.synced?'text-pos':'text-neg'" x-text="(h.chain?.lag_blocks??'—')+' blk · '+(h.chain?.synced?'sync':'DE-SYNC')"></span></div>
+        <div class="flex justify-between"><span class="text-dim">copertura continua da</span><span class="font-mono" x-text="h.coverage?.coverage_start||'—'"></span></div>
+        <div class="flex justify-between"><span class="text-dim">generazione copertura</span><span class="font-mono" x-text="h.coverage?.generation??'—'"></span></div>
+        <div class="flex justify-between"><span class="text-dim">gas (età)</span><span class="font-mono" :class="Number(h.gas?.age_ms||9e9)<120000?'text-pos':'text-warn'" x-text="h.gas?(fmtAge(h.gas.age_ms)):'assente'"></span></div>
+        <div class="flex justify-between"><span class="text-dim">pool_state freschi (5 min)</span><span class="font-mono" x-text="(h.poolState?.fresh_5min??'—')+' / '+(h.poolState?.total??'—')"></span></div>
+        <template x-if="(h.gaps||[]).length">
+          <div class="pt-1 border-t border-line/50">
+            <div class="text-[10px] text-dim uppercase">Gap di copertura</div>
+            <template x-for="g in h.gaps" :key="g.from_block">
+              <div class="font-mono text-[10px]" :class="g.repaired_at?'text-dim':'text-neg'" x-text="g.from_block+'→'+g.to_block+' · '+(g.reason||'')+(g.repaired_at?' (riparato)':' (APERTO)')"></div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>
+    <div>
+      <h2 class="text-sm font-semibold mb-2">Knowledge Graph <span class="text-[10px] text-dim font-normal">— ogni numero con la sua affidabilità</span></h2>
+      <div class="rounded-xl border border-line bg-panel p-3 text-xs space-y-1">
+        <div class="flex justify-between"><span class="text-dim">candidati osservati</span><span class="font-mono" x-text="h.kg?.candidates??'—'"></span></div>
+        <div class="flex justify-between"><span class="text-dim">di cui simulazione EXACT</span><span class="font-mono" :class="h.kg?.exact?'text-pos':'text-warn'" x-text="h.kg?.exact??'—'"></span></div>
+        <div class="flex justify-between"><span class="text-dim">di cui executable</span><span class="font-mono" x-text="h.kg?.executable??'—'"></span></div>
+        <div class="flex justify-between"><span class="text-dim">preflight passati (reali on-chain)</span><span class="font-mono" :class="h.kg?.preflight_pass?'text-pos':'text-dim'" x-text="h.kg?.preflight_pass??'—'"></span></div>
+        <div class="flex justify-between"><span class="text-dim">signal execution_gap</span><span class="font-mono" x-text="h.kg?.signals??'—'"></span></div>
+        <div class="flex justify-between"><span class="text-dim">cicli observer / surface</span><span class="font-mono" x-text="(h.kg?.observer_runs??'—')+' / '+(h.kg?.surface_runs??'—')"></span></div>
+        <div class="pt-1 border-t border-line/50 text-[10px] text-dim" x-show="h.lastRun?.block">
+          ultimo ciclo: blocco <span class="font-mono" x-text="h.lastRun?.block"></span> ·
+          <span class="font-mono" x-text="Math.round((h.lastRun?.duration_ms||0)/1000)+'s'"></span> ·
+          <span class="font-mono" x-text="fmtAge(h.lastRun?.age_ms)+' fa'"></span>
+        </div>
+      </div>
+      <div class="mt-2 rounded-xl border border-line bg-panel p-3 text-xs" x-show="(h.lending||[]).length">
+        <div class="text-[10px] text-dim uppercase mb-1">Posizioni lending</div>
+        <template x-for="l in h.lending||[]" :key="l.tier">
+          <div class="flex justify-between"><span class="text-dim font-mono" x-text="l.tier"></span><span class="font-mono" x-text="l.n+' · $'+(Number(l.debt_usd||0)).toLocaleString()"></span></div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <div class="px-5 mt-4 text-[10px] text-dim">
+    Vedi anche: <a href="/explorer" class="text-energy hover:underline">Explorer entità</a> ·
+    <a href="/liquidations" class="text-energy hover:underline">Liquidazioni</a> ·
+    <a href="/arb" class="text-energy hover:underline">Arbitraggi</a>
+  </div>
+</div>
+<script>
+function health(){ return {
+  h:{}, problems:[], clock:'', minLevel:'40',
+  async init(){ await this.load(); setInterval(()=>this.load(), 15000); },
+  async load(){ await Promise.all([this.loadHealth(), this.loadProblems()]); this.clock=new Date().toLocaleTimeString(); },
+  async loadHealth(){ try{ this.h = await (await fetch('/api/health')).json(); }catch(e){} },
+  async loadProblems(){ try{ const d=await (await fetch('/api/problems?min='+this.minLevel)).json(); this.problems=d.problems||[]; }catch(e){} },
+  miss(r,f){ const conc=['v3','slipstream','algebra'].includes(r.archetype); return conc && (f==='fee'? r.missing_fee : r.missing_spacing) > 0; },
+  pct(a,b){ return b? Math.round(100*a/b)+'%' : '0%'; },
+  fmt(t){ try{ return new Date(t).toLocaleString(); }catch(e){ return t; } },
+  fmtAge(ms){ const s=Math.round(Number(ms||0)/1000); if(s<60) return s+'s'; if(s<3600) return Math.round(s/60)+'m'; return Math.round(s/3600)+'h'; },
+  get lights(){ const h=this.h, L=[];
+    const lag=Number(h.chain?.lag_blocks??999), synced=h.chain?.synced;
+    L.push({label:'Indexer', value:(synced?'sync':'DE-SYNC')+' · '+lag+'blk', ok:(synced&&lag<=3)?'ok':(synced?'warn':'bad'), note:'blocco '+(h.chain?.indexed_block||'—')});
+    const buf=Number(h.buffer?.in_buffer??0), wrote=Number(h.buffer?.written_last_2min??0);
+    L.push({label:'Buffer enrichment', value:buf.toLocaleString(), ok: buf===0?'ok':(wrote>0?'warn':'bad'), note: buf===0?'completo':(wrote>0?'in lavorazione':'FERMO (0 scritture/2min)')});
+    const fail=Number(h.buffer?.failed??0);
+    L.push({label:'Entità fallite', value:fail.toLocaleString(), ok: fail===0?'ok':(fail<50?'warn':'bad'), note: fail?'dati mancanti a valle':'nessuna'});
+    const gasAge=Number(h.gas?.age_ms??9e9);
+    L.push({label:'Gas', value:h.gas?fmtAgeS(gasAge):'assente', ok: gasAge<120000?'ok':'bad', note:'serve per il net PnL'});
+    const tp=(h.ticks||[]).reduce((a,r)=>({c:a.c+Number(r.certified),p:a.p+Number(r.pools)}),{c:0,p:0});
+    L.push({label:'Tick certificati', value:this.pct(tp.c,tp.p), ok: tp.p&&tp.c/tp.p>0.5?'ok':(tp.c?'warn':'bad'), note:tp.c+'/'+tp.p+' pool concentrated'});
+    const err=this.problems.filter(p=>p.level!=='warn').reduce((a,p)=>a+p.count,0);
+    L.push({label:'Errori', value:String(err), ok: err===0?'ok':(err<20?'warn':'bad'), note:this.problems.length+' problemi distinti'});
+    return L; },
+} }
+function fmtAgeS(ms){ const s=Math.round(Number(ms||0)/1000); if(s<60) return s+'s'; if(s<3600) return Math.round(s/60)+'m'; return Math.round(s/3600)+'h'; }
 </script>
 </body></html>`;
