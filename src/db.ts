@@ -1691,6 +1691,15 @@ export class Database {
     return m ? { loanToken: m.loan_token, collateralToken: m.collateral_token, oracle: m.oracle, irm: m.irm, lltv: BigInt(m.lltv.split(".")[0]) } : null;
   }
 
+  /** Merge FACTS onto a lending position's meta (size read from chain). Merge, never replace: the row also
+   * carries oracle/irm/lltv written at discovery, and losing those would break the monitor's HF math. */
+  async mergeLendingMeta(chainId: number, protocol: string, marketId: string, borrower: string, patch: Record<string, unknown>): Promise<void> {
+    await this.pool.query(
+      `UPDATE lending_positions SET meta = COALESCE(meta, '{}'::jsonb) || $5::jsonb, updated_at=NOW()
+       WHERE chain_id=$1 AND protocol=$2 AND market_id=$3 AND borrower=$4`,
+      [chainId, protocol, marketId, borrower.toLowerCase(), JSON.stringify(patch)]);
+  }
+
   /** Positions due for a re-check (next_check_at reached), soonest first. */
   async dueLendingPositions(chainId: number, limit = 60): Promise<Array<LendingPosition>> {
     const r = await this.pool.query(`SELECT * FROM lending_positions WHERE chain_id=$1 AND tier<>'closed' AND next_check_at<=NOW() ORDER BY next_check_at ASC LIMIT $2`, [chainId, limit]);

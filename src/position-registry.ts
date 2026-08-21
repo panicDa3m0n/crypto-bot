@@ -1,4 +1,5 @@
 import type { Logger } from "pino";
+import { parseAbi, type Address } from "viem";
 import type { Config } from "./config.js";
 import type { BerachainClients } from "./chain.js";
 import type { Database } from "./db.js";
@@ -12,6 +13,14 @@ const MORPHO_BORROW_TOPIC = "0x570954540bed6b1304a87dfe815a5eda4a648f7097a16240d
 // Morpho Liquidate(bytes32 indexed id, address indexed caller, address indexed borrower, ...):
 // topic1 = marketId, topic2 = liquidator (caller), topic3 = borrower. Observability: who took the prey.
 const MORPHO_LIQUIDATE_TOPIC = "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41";
+// Reading a borrower's size straight from Morpho: position() gives collateral + borrow SHARES, market()
+// the totals that turn shares into assets. Same pair the liquidation monitor uses — one shape, one meaning.
+const MORPHO_POS_ABI = parseAbi([
+  "function position(bytes32 id, address user) view returns (uint256 supplyShares, uint128 borrowShares, uint128 collateral)",
+  "function market(bytes32 id) view returns (uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares, uint128 lastUpdate, uint128 fee)"
+]);
+const ORACLE_PRICE_ABI = parseAbi(["function price() view returns (uint256)"]);
+const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11" as Address;
 
 // Per-cycle quote memo: the exit RATE of a (collateral,loan) pair is ~constant across a cycle's
 // positions — only size differs. We quote each pair ONCE and scale to each position's seized size,
@@ -278,6 +287,88 @@ export class PositionRegistry {
     return solid ? "candidate" : "baddebt";
   }
 
+  /**
+   * RESOLVE the positions the INDEXER discovered.
+   *
+   * There are two discovery sources — the Morpho API (enumerate) and the indexer's Borrow events — but only
+   * one classification path, and it was tied to the API. A position the API never returns therefore entered
+   * tier `pending` and stayed there for ever: enumerate never saw it, and the tick explicitly skipped it
+   * "because enumerate will classify it". 8,624 positions sat in that hole for days, unvalued.
+   *
+   * What they lack is size and health, and both are ON-CHAIN — so we read them rather than wait: position()
+   * for the borrower's collateral and borrow shares, market() to turn shares into assets, and the market's
+   * oracle for the price. Bounded per tick and on the BULK lane, never the monitor's precision lane: this is
+   * background completion work and must not contend with the per-block liquidation watch.
+   */
+  private async resolvePending(rows: Array<{ marketId: string; borrower: string; loanToken: string | null; collateralToken: string | null; lltv: number | null; meta: unknown }>): Promise<number> {
+    const morpho = this.config.MORPHO_CORE as Address | undefined;
+    if (!morpho || !rows.length) return 0;
+    const markets = [...new Set(rows.map((r) => r.marketId.toLowerCase()))];
+    const oracles = [...new Set(rows.map((r) => String(((r.meta ?? {}) as Record<string, unknown>).oracle ?? "").toLowerCase()).filter((o) => o && o !== "0x"))];
+    const contracts = [
+      ...rows.map((r) => ({ address: morpho, abi: MORPHO_POS_ABI, functionName: "position" as const, args: [r.marketId as `0x${string}`, r.borrower as Address] })),
+      ...markets.map((id) => ({ address: morpho, abi: MORPHO_POS_ABI, functionName: "market" as const, args: [id as `0x${string}`] })),
+      ...oracles.map((o) => ({ address: o as Address, abi: ORACLE_PRICE_ABI, functionName: "price" as const })),
+    ];
+    const res = await this.chain.primary.multicall({ contracts, allowFailure: true, multicallAddress: MULTICALL3 })
+      .catch(() => [] as Array<{ status: string; result?: unknown }>);
+    if (!res.length) return 0;
+    const totals = new Map<string, { tba: bigint; tbs: bigint }>();
+    markets.forEach((id, i) => { const r = res[rows.length + i]; if (r?.status === "success" && Array.isArray(r.result)) totals.set(id, { tba: (r.result as bigint[])[2], tbs: (r.result as bigint[])[3] }); });
+    const priceByOracle = new Map<string, bigint>();
+    oracles.forEach((o, i) => { const r = res[rows.length + markets.length + i]; if (r?.status === "success" && typeof r.result === "bigint") priceByOracle.set(o, r.result); });
+
+    let resolved = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i], r = res[i];
+      if (r?.status !== "success" || !Array.isArray(r.result)) continue; // read failed → stays pending, retried
+      const meta = (row.meta ?? {}) as Record<string, unknown>;
+      const mt = totals.get(row.marketId.toLowerCase());
+      const oracle = String(meta.oracle ?? "").toLowerCase();
+      const price = priceByOracle.get(oracle);
+      const borrowShares = (r.result as bigint[])[1], collateral = (r.result as bigint[])[2];
+      // Debt REPAID is what the borrower owes in assets: shares → assets via the market totals, rounded up
+      // the way Morpho itself rounds it. No totals ⇒ we cannot state the debt, so we do not guess one.
+      if (!mt || price == null) continue;
+      const borrowAssets = mt.tbs === 0n || borrowShares === 0n ? 0n : (borrowShares * mt.tba + mt.tbs - 1n) / mt.tbs;
+      const lltvRaw = BigInt(String(meta.lltv ?? "0"));
+      if (borrowAssets === 0n) { // no debt left → the position is closed, which is a FACT, not an omission
+        await this.db.setLendingTier(this.config.CHAIN_ID, "morpho", row.marketId, row.borrower, { tier: "closed", reason: "no borrow shares on chain — debt repaid", hf: null, debtUsd: 0, collateralUsd: null, exitUsd: null, profitUsd: null, nextCheckSec: 86_400 }).catch(() => undefined);
+        resolved++; continue;
+      }
+      // Morpho's own health test: maxBorrow = collateral · price / 1e36 · lltv / 1e18, HF = maxBorrow / debt.
+      const maxBorrow = (collateral * price) / 10n ** 36n * lltvRaw / 10n ** 18n;
+      const hf = borrowAssets > 0n ? Number(maxBorrow) / Number(borrowAssets) : Number.POSITIVE_INFINITY;
+      const [cUsd, dUsd] = await Promise.all([
+        this.usdOf(row.collateralToken, collateral, Number(meta.collateralDecimals ?? NaN)),
+        this.usdOf(row.loanToken, borrowAssets, Number(meta.loanDecimals ?? NaN)),
+      ]);
+      await this.db.mergeLendingMeta(this.config.CHAIN_ID, "morpho", row.marketId, row.borrower, { collateralRaw: collateral.toString(), debtRaw: borrowAssets.toString(), resolvedBy: "chain" }).catch(() => undefined);
+      // Band it, but NEVER straight into `watch`: that is the ARMED tier the monitor fires on, and entry to it
+      // requires a sized exit quote proving the liquidation actually profits. This pass establishes size and
+      // health, not profitability — so the best it can claim is `candidate` (known, tracked, unarmed), exactly
+      // what the API path claims before it has quoted. Promotion stays behind the one profit gate there is.
+      const solid = cUsd != null && dUsd != null ? cUsd > dUsd : true;
+      const tier = !solid ? "low_collateral" : "candidate";
+      await this.db.setLendingTier(this.config.CHAIN_ID, "morpho", row.marketId, row.borrower, {
+        tier, reason: `resolved on chain — HF ${Number.isFinite(hf) ? hf.toFixed(3) : "∞"}${solid ? " (size+health known; exit not yet quoted)" : " (collateral ≤ debt)"}`,
+        hf: Number.isFinite(hf) ? hf : null, debtUsd: dUsd, collateralUsd: cUsd, exitUsd: null, profitUsd: null,
+        nextCheckSec: this.nextCheckSec(tier, Number.isFinite(hf) ? hf : 99),
+      }).catch(() => undefined);
+      resolved++;
+    }
+    return resolved;
+  }
+
+  /** USD value of a raw amount, DB-first. Returns null when either datum is unknown — an unpriced position
+   * must read as "not valued", never as $0, which would look like bad debt and park it wrongly. */
+  private async usdOf(token: string | null, raw: bigint, decimals: number): Promise<number | null> {
+    if (!token || !Number.isFinite(decimals)) return null;
+    const px = await this.oracle.usdPrice(token).catch(() => null);
+    if (px == null || !(px > 0)) return null;
+    return (Number(raw) / 10 ** decimals) * px;
+  }
+
   /** Morpho liquidation incentive factor from LLTV: LIF = min(1.15, 1/(1 − 0.3·(1−LLTV))). */
   private lif(lltv: number): number { return lltv > 0 && lltv < 1 ? Math.min(1.15, 1 / (1 - 0.3 * (1 - lltv))) : 1.05; }
 
@@ -314,6 +405,14 @@ export class PositionRegistry {
     try {
       const due = await this.db.dueLendingPositions(this.config.CHAIN_ID, 60).catch(() => []);
       if (!due.length) return;
+      // The indexer's Borrow events discover positions the Morpho API never returns. They arrive as `pending`
+      // and used to be skipped here, deferring to an enumerate that would never see them. Resolve them from
+      // the chain instead — bounded per tick, so a large backlog drains steadily without a burst.
+      const pending = due.filter((p) => p.tier === "pending");
+      if (pending.length) {
+        const n = await this.resolvePending(pending.slice(0, 40)).catch((e) => { this.logger.debug({ err: e }, "pending resolve failed"); return 0; });
+        if (n) this.logger.info({ resolved: n, ofDue: pending.length }, "lending positions resolved from chain (indexer-discovered, never in the API)");
+      }
       // Re-evaluate the profit gate with a FRESH oracle exit value + reschedule per tier. HF is
       // refreshed by enumerate (Morpho oracle); the exit value (ours) is re-checked here fast.
       const memo: QuoteMemo = new Map(); // dedup aggregator quotes by pair across this due-batch
@@ -321,7 +420,7 @@ export class PositionRegistry {
         const hf = pos.hf ?? 2; const debt = pos.debtUsd ?? 0;
         // Candidates (far pipeline) and pending (not yet classified) are never quoted by the tick — the
         // enumerate classifies/promotes them with a fresh HF. Blacklist/bad-debt are likewise rescheduled.
-        if (pos.tier === "blacklist" || pos.tier === "candidate" || pos.tier === "pending" || (pos.collateralUsd ?? 0) <= debt) { await this.reschedule(pos.protocol, pos.marketId, pos.borrower, pos.tier, hf); continue; }
+        if (pos.tier === "blacklist" || pos.tier === "candidate" || pos.tier === "pending" /* resolved above */ || (pos.collateralUsd ?? 0) <= debt) { await this.reschedule(pos.protocol, pos.marketId, pos.borrower, pos.tier, hf); continue; }
         // Re-confirm the profit gate with a FRESH SIZED exit value (our oracle), reschedule per tier.
         const meta = (pos.meta ?? {}) as Record<string, unknown>;
         const collRaw = String(meta.collateralRaw ?? "0");

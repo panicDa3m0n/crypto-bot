@@ -218,7 +218,12 @@ async function main() {
     if (config.SCARLET_AGENT_ENABLED) followService.start();
     if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED) positionManager.start();
     if (config.SCARLET_AGENT_ENABLED && config.ARB_ENABLED) arbEngine.start();
-    if (config.SCARLET_AGENT_ENABLED && config.LIQ_REGISTRY_ENABLED) positionRegistry.start();
+    // The position registry is a DATA pipeline (discover → resolve size/health → tier), not part of the agent.
+    // Gating it on SCARLET_AGENT_ENABLED meant that keeping Scarlet off — precisely so the data could be
+    // completed first — was what stopped the data from being completed: 8,624 borrowers discovered by the
+    // indexer sat unvalued for days because the only thing that classifies them never ran. It follows its own
+    // flag now. Acting still does not: firing stays with the liquidation monitor above, behind EXECUTION_ENABLED.
+    if (config.LIQ_REGISTRY_ENABLED) positionRegistry.start();
     if (config.SCARLET_AGENT_ENABLED) {
       // Continuous operation: each cycle re-schedules the next a short gap AFTER it finishes.
       const loop = async () => {
