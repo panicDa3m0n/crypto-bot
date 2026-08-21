@@ -6,7 +6,7 @@ import type { Database } from "./db.js";
 import type { BerachainClients } from "./chain.js";
 import type { Etherscan } from "./etherscan.js";
 import type { Blockscout } from "./blockscout.js";
-import { UNIV3_MINT, UNIV3_BURN, POOL_CREATED, EVENT_DECODERS, type RawLog } from "./indexer/events.js";
+import { UNIV3_MINT, UNIV3_BURN, POOL_CREATED, V4_MODIFY_LIQUIDITY, EVENT_DECODERS, type RawLog } from "./indexer/events.js";
 import { scanTickMap, validateSnapshotVsQuoter, tickStorageProfile, bitmapWordRange, MULTICALL3 } from "./router/tick-storage.js";
 
 const UNIV3_QUOTER_BASE = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a" as Address; // Uniswap V3 QuoterV2 on Base
@@ -383,6 +383,8 @@ export class RegistryEnricher {
     if (!batch.length) return { done: 0, rateLimited: false };
     const p = batch[0];
     const pool = p.pool.toLowerCase() as Address;
+    const isV4 = p.archetype === "v4"; // a poolId inside the singleton PoolManager, not a contract of its own
+    if (isV4 && !p.factory) { await this.db.noteTickBootstrapError(cid, pool, "V4 pool without its PoolManager (factory) — cannot filter its logs").catch(() => undefined); return { done: 0, rateLimited: false }; }
     const hex = (n: number) => "0x" + n.toString(16);
     // Historical logs need archive depth the enrichment lane often lacks → cascade to primary/fallback.
     const lanes = [this.chain.enrichment, this.chain.primary, this.chain.fallback];
@@ -409,7 +411,14 @@ export class RegistryEnricher {
       while (from <= target && chunks < 25) {
         const to = Math.min(from + span - 1, target);
         let logs: RawLog[] | null = null;
-        try { logs = await req("eth_getLogs", [{ address: pool, topics: [[UNIV3_MINT, UNIV3_BURN]], fromBlock: hex(from), toBlock: hex(to) }]) as RawLog[]; }
+        // V4 has no pool CONTRACT: every pool lives inside the singleton PoolManager and is addressed by its
+        // poolId (bytes32). So the historical filter is by EMITTER + indexed poolId, not by pool address —
+        // `address: <a 66-char poolId>` is not even a valid getLogs filter, which is why V4 could never have
+        // been bootstrapped by this path.
+        const filter = isV4
+          ? { address: p.factory, topics: [V4_MODIFY_LIQUIDITY, pool], fromBlock: hex(from), toBlock: hex(to) }
+          : { address: pool, topics: [[UNIV3_MINT, UNIV3_BURN]], fromBlock: hex(from), toBlock: hex(to) };
+        try { logs = await req("eth_getLogs", [filter]) as RawLog[]; }
         catch (e) { if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: chunks, rateLimited: true }; } if (span > 400) { span = Math.floor(span / 2); continue; } const gaveUp = await this.db.noteTickBootstrapError(cid, pool, `getLogs failed @${from} (archive depth?)`).catch(() => false); if (gaveUp) this.logger.debug({ pool, from }, "tick bootstrap: giving up (archive unavailable) → needs storage-scan/3.4"); return { done: chunks, rateLimited: false }; }
         const deltas: Array<{ tickLower: number; tickUpper: number; liquidityDelta: bigint }> = [];
         for (const l of logs ?? []) { const d = EVENT_DECODERS.get((l.topics[0] ?? "").toLowerCase())?.(l); if (d && d.kind === "liquidity_v3") deltas.push({ tickLower: d.tickLower, tickUpper: d.tickUpper, liquidityDelta: d.liquidityDelta }); }

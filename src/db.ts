@@ -453,6 +453,25 @@ export class Database {
       CREATE INDEX IF NOT EXISTS entities_pool_no_factory_idx ON entities(chain_id) WHERE kind='pool' AND NOT (meta ? 'factory');
       CREATE INDEX IF NOT EXISTS entities_pool_unknown_arch_idx ON entities(chain_id) WHERE kind='pool' AND COALESCE(meta->>'archetype','unknown')='unknown';
       CREATE INDEX IF NOT EXISTS entities_pool_aero_unchecked_idx ON entities(chain_id) WHERE kind='pool' AND NOT (meta ? 'stableChecked');
+      -- Marker table for one-shot data repairs: a repair that must run exactly once, and must NOT re-run and
+      -- undo work done after it (re-opening a certification legitimately earned later would be a new bug).
+      CREATE TABLE IF NOT EXISTS schema_markers (marker TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+      -- ONE-SHOT REPAIR: every V4 pool was certified with a COMPLETE tick map the moment we saw its Initialize,
+      -- on the premise "we observe every liquidity event from birth". The premise was false — V4 emits
+      -- ModifyLiquidity on the singleton PoolManager and that topic was never decoded, so tick_liquidity held
+      -- zero V4 rows while 19k pools claimed full coverage (2.4k of them with live liquidity). The decoder now
+      -- exists; these rows must go back to the queue so they are actually reconstructed. Guarded by a marker
+      -- row so it runs exactly once and does not undo the certifications earned after the fix.
+      DO $v4fix$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM schema_markers WHERE marker = 'v4_tick_recert_2026_08') THEN
+          UPDATE pool_tick_status pts SET status='pending', complete=false, bootstrap_through=NULL, updated_at=NOW()
+            FROM entities e
+           WHERE e.chain_id=pts.chain_id AND e.address=pts.pool AND e.kind='pool'
+             AND e.meta->>'archetype'='v4' AND pts.source='live_indexer' AND pts.complete=true;
+          INSERT INTO schema_markers(marker) VALUES ('v4_tick_recert_2026_08');
+        END IF;
+      END $v4fix$;
       -- Scarlet's token JUDGMENT history (append-only). Her verdicts on a token live here, address-keyed,
       -- so she reconstructs HER past decisions on it. The token FACTS (identity/provenance/security) live
       -- on the entity; this is only the layer of opinion, kept as a timeline (not a single latest value).
@@ -2195,15 +2214,20 @@ export class Database {
     return x ? { status: x.status, source: x.source, creationBlock: x.creation_block != null ? Number(x.creation_block) : null, bootstrapThrough: x.bootstrap_through != null ? Number(x.bootstrap_through) : null, complete: x.complete, coverageGeneration: x.coverage_generation, priority: x.priority } : null;
   }
   /** Concentrated pools NOT yet tick-complete — the bootstrap worklist, priority ASC (0=P0 demand-driven). */
-  async poolsNeedingTickBootstrap(chainId: number, limit = 20, maxPriority = 3): Promise<Array<{ pool: string; archetype: string; createdBlock: number | null; origin: string | null }>> {
-    const r = await this.pool.query<{ address: string; arch: string; created_block: string | null; origin: string | null }>(
-      `SELECT e.address, e.meta->>'archetype' arch, e.created_block::text, e.meta->>'origin' origin
+  async poolsNeedingTickBootstrap(chainId: number, limit = 20, maxPriority = 3): Promise<Array<{ pool: string; archetype: string; createdBlock: number | null; origin: string | null; factory: string | null }>> {
+    // `length(address)=42` used to sit here and silently excluded ALL of V4 — a V4 pool is keyed by a 66-char
+    // poolId, not an address. Half our pool population could therefore never enter this queue, while being
+    // certified complete elsewhere. The archetype list is the ONLY membership rule now; the caller adapts the
+    // log filter per family (V4 filters the singleton PoolManager by indexed poolId). The factory comes along
+    // because for V4 it IS the emitter to filter on.
+    const r = await this.pool.query<{ address: string; arch: string; created_block: string | null; origin: string | null; factory: string | null }>(
+      `SELECT e.address, e.meta->>'archetype' arch, e.created_block::text, e.meta->>'origin' origin, e.meta->>'factory' factory
        FROM entities e LEFT JOIN pool_tick_status pts ON pts.chain_id=e.chain_id AND pts.pool=e.address
-       WHERE e.chain_id=$1 AND e.kind='pool' AND e.meta->>'archetype'='v3' AND length(e.address)=42
+       WHERE e.chain_id=$1 AND e.kind='pool' AND e.meta->>'archetype' IN ('v3','v4')
          AND (pts.complete IS NULL OR pts.complete=false) AND (pts.status IS NULL OR pts.status <> 'failed')
          AND COALESCE(pts.priority,3) <= $3
        ORDER BY COALESCE(pts.priority,3) ASC, pts.updated_at ASC NULLS FIRST LIMIT $2`, [chainId, limit, maxPriority]);
-    return r.rows.map((x) => ({ pool: x.address, archetype: x.arch, createdBlock: x.created_block != null ? Number(x.created_block) : null, origin: x.origin }));
+    return r.rows.map((x) => ({ pool: x.address, archetype: x.arch, createdBlock: x.created_block != null ? Number(x.created_block) : null, origin: x.origin, factory: x.factory }));
   }
   async setPoolTickPriority(chainId: number, pool: string, priority: number): Promise<void> {
     await this.pool.query(

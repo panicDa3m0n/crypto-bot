@@ -36,13 +36,16 @@ export const UNIV3_BURN = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028
 // indexer). We price V4 like V3 (sqrtPrice) — the poolId is the "pool address" (a 66-char hex key).
 export const V4_INITIALIZE = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
 export const V4_SWAP = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f";
+// Verified against the live PoolManager on Base: 45 of these in a 10-block window, decoded with the ABI
+// decoder to confirm the field layout (ticks inside the domain, signed delta).
+export const V4_MODIFY_LIQUIDITY = "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec";
 export const MORPHO_CREATE_MARKET = "0xac4b2400f169220b0c0afdde7a0b32e775ba727ea1cb30b35f935cdaab8683ac";
 export const MORPHO_BORROW = "0x570954540bed6b1304a87dfe815a5eda4a648f7097a16240dcd85c9b5fd42a43";
 export const MORPHO_LIQUIDATE = "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41";
 
 export const MORPHO_TOPICS = new Set([MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE]);
 /** Topics for the FILTERED sync path (bulk historical catch-up). Real-time uses full getBlockReceipts. */
-export const TOPIC0S = [V3_SWAP, PANCAKE_V3_SWAP, V2_SYNC, V2_SWAP, AERO_SYNC, AERO_SWAP, PAIR_CREATED, POOL_CREATED, AERO_POOL_CREATED, UNIV3_MINT, UNIV3_BURN, V4_SWAP, V4_INITIALIZE, MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE];
+export const TOPIC0S = [V3_SWAP, PANCAKE_V3_SWAP, V2_SYNC, V2_SWAP, AERO_SYNC, AERO_SWAP, PAIR_CREATED, POOL_CREATED, AERO_POOL_CREATED, UNIV3_MINT, UNIV3_BURN, V4_SWAP, V4_INITIALIZE, V4_MODIFY_LIQUIDITY, MORPHO_CREATE_MARKET, MORPHO_BORROW, MORPHO_LIQUIDATE];
 
 // ── byte helpers (pure) ───────────────────────────────────────────────────────
 /** The Nth 32-byte word of `data` as a BigInt (null if data too short). */
@@ -67,6 +70,15 @@ export type DecodedEvent =
   | { kind: "morpho"; topic0: string; log: RawLog };
 
 export type Decoder = (log: RawLog) => DecodedEvent | null;
+
+/**
+ * The archetypes whose LIQUIDITY events we actually decode into `liquidity_v3` (per-tick deltas). Certifying a
+ * pool's tick map as "complete from birth because we watch it live" is only true for these — for anything else
+ * the claim is a silent lie, which is exactly what happened to V4 for 19k pools: certified on Initialize while
+ * ModifyLiquidity was never decoded. Any code that certifies from live observation MUST gate on this set, so
+ * adding an archetype without its liquidity decoder cannot quietly re-introduce the same falsehood.
+ */
+export const LIQUIDITY_INDEXED_ARCHETYPES: ReadonlySet<string> = new Set(["v3", "v4"]);
 
 const decodeV3Swap: Decoder = (l) => {
   const sp = word(l.data, 2); if (sp == null || sp <= 0n) return null; // sqrtPriceX96
@@ -111,6 +123,17 @@ const decodeV4Swap: Decoder = (l) => {
   const sp = word(l.data, 2); if (sp == null || sp <= 0n) return null; // sqrtPriceX96 (word2)
   return { kind: "swap_v3", pool: id.toLowerCase(), sqrtPrice: sp, liquidity: word(l.data, 3), amount0: sword(l.data, 0) ?? 0n, amount1: sword(l.data, 1) ?? 0n, recipient: addrFromTopic(l.topics[2]), v4: true };
 };
+// V4 ModifyLiquidity(id⊙, sender⊙, tickLower, tickUpper, liquidityDelta, salt): V4's Mint AND Burn in one
+// signed event — this is the per-tick liquidity map for V4, exactly what Mint/Burn are for V3. It was never
+// decoded, so `tick_liquidity` held ZERO V4 rows while 19k V4 pools were certified as having a complete tick
+// map. Unlike V3 the ticks are in DATA, not topics (only id/sender are indexed), and a delta of 0 is a
+// fee-collection call — a real no-op for the map, dropped so it cannot advance a pool's coverage for free.
+const decodeV4ModifyLiquidity: Decoder = (l) => {
+  const id = l.topics[1]; if (!id || id.length < 66) return null;
+  const tl = sword(l.data, 0), tu = sword(l.data, 1), delta = sword(l.data, 2);
+  if (tl == null || tu == null || delta == null || delta === 0n) return null;
+  return { kind: "liquidity_v3", pool: id.toLowerCase(), liquidityDelta: delta, tickLower: Number(tl), tickUpper: Number(tu) };
+};
 // V4 Initialize(id⊙, currency0⊙, currency1⊙, fee, tickSpacing, hooks, sqrtPriceX96, tick): the "PoolCreated"
 // of V4 — maps a poolId to its currencies/fee/tickSpacing/hooks. currency 0x0 = native ETH (indexer→WETH).
 export const decodeV4Init: Decoder = (l) => {
@@ -134,6 +157,7 @@ export const EVENT_DECODERS: Map<string, Decoder> = new Map([
   [UNIV3_BURN, decodeBurn],
   [V4_SWAP, decodeV4Swap],
   [V4_INITIALIZE, decodeV4Init],
+  [V4_MODIFY_LIQUIDITY, decodeV4ModifyLiquidity],
   [MORPHO_CREATE_MARKET, decodeMorpho(MORPHO_CREATE_MARKET)],
   [MORPHO_BORROW, decodeMorpho(MORPHO_BORROW)],
   [MORPHO_LIQUIDATE, decodeMorpho(MORPHO_LIQUIDATE)]

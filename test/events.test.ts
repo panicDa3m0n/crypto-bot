@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeLog, decodeTransfer, TRANSFER, V3_SWAP, PANCAKE_V3_SWAP, V2_SYNC, AERO_SYNC, V2_SWAP, POOL_CREATED, UNIV3_MINT, UNIV3_BURN, V4_SWAP, V4_INITIALIZE } from "../src/indexer/events.js";
+import { decodeLog, decodeTransfer, TRANSFER, V3_SWAP, PANCAKE_V3_SWAP, V2_SYNC, AERO_SYNC, V2_SWAP, POOL_CREATED, UNIV3_MINT, UNIV3_BURN, V4_SWAP, V4_INITIALIZE, V4_MODIFY_LIQUIDITY, LIQUIDITY_INDEXED_ARCHETYPES, EVENT_DECODERS } from "../src/indexer/events.js";
 
 const POOL = "0x00000000000000000000000000000000000000pp".replace("pp", "01");
 const FACTORY = "0x00000000000000000000000000000000000000ff";
@@ -108,5 +108,43 @@ describe("event decoders (unified registry)", () => {
   it("ERC-721 Transfer (4 topics, tokenId indexed) → null (not a fungible balance)", () => {
     const e = decodeTransfer({ address: POOL, topics: [TRANSFER, topicAddr(A), topicAddr(B), topicNum(7n)], data: "0x", blockNumber: "0x1" });
     expect(e).toBeNull();
+  });
+});
+
+describe("V4 ModifyLiquidity — the tick map of the singleton", () => {
+  // Field layout confirmed against the live Base PoolManager with viem's ABI decoder:
+  // ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper,
+  //                 int256 liquidityDelta, bytes32 salt) — the ticks live in DATA, not in topics.
+  const POOL_ID = "0x" + "ab".repeat(32);
+  const PM = "0x498581ff718922c3f8e6a244956af099b2652b2b";
+
+  it("decodes an add (positive delta) keyed by poolId, not by the emitter", () => {
+    const e = decodeLog(log(V4_MODIFY_LIQUIDITY, [POOL_ID, topicAddr(A)], data(-230400n, -214000n, 47276272197874011251902n, 0n), PM)) as any;
+    expect(e.kind).toBe("liquidity_v3");
+    expect(e.pool).toBe(POOL_ID); // the poolId — the singleton PoolManager is NOT the pool
+    expect(e.tickLower).toBe(-230400);
+    expect(e.tickUpper).toBe(-214000);
+    expect(e.liquidityDelta).toBe(47276272197874011251902n);
+  });
+
+  it("decodes a removal as a negative delta (V4 has no separate Burn)", () => {
+    const e = decodeLog(log(V4_MODIFY_LIQUIDITY, [POOL_ID, topicAddr(A)], data(-887200n, 887200n, -5000n, 0n), PM)) as any;
+    expect(e.liquidityDelta).toBe(-5000n);
+    expect(e.tickLower).toBe(-887200);
+  });
+
+  it("drops a zero-delta fee collection — it must never advance tick coverage for free", () => {
+    expect(decodeLog(log(V4_MODIFY_LIQUIDITY, [POOL_ID, topicAddr(A)], data(-882000n, 882000n, 0n, 0n), PM))).toBeNull();
+  });
+
+  it("certifying a tick map from live observation is gated on having the liquidity decoder", () => {
+    // The bug this guards: V4 was certified complete-from-birth while ModifyLiquidity was never decoded.
+    for (const arch of LIQUIDITY_INDEXED_ARCHETYPES) {
+      const hasDecoder = [...EVENT_DECODERS.values()].length > 0;
+      expect(hasDecoder).toBe(true);
+      expect(["v3", "v4"]).toContain(arch);
+    }
+    expect(LIQUIDITY_INDEXED_ARCHETYPES.has("v2")).toBe(false);       // CP pools have no tick map at all
+    expect(LIQUIDITY_INDEXED_ARCHETYPES.has("algebra")).toBe(false);  // no Algebra liquidity decoder yet
   });
 });

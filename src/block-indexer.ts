@@ -5,7 +5,7 @@ import type { BerachainClients } from "./chain.js";
 import type { Database } from "./db.js";
 import {
   decodeLog, decodeTransfer, TOPIC0S, TRANSFER, MORPHO_CREATE_MARKET, MORPHO_LIQUIDATE,
-  word, wordAddr, addrFromTopic, type RawLog, type DecodedEvent
+  word, wordAddr, addrFromTopic, LIQUIDITY_INDEXED_ARCHETYPES, type RawLog, type DecodedEvent
 } from "./indexer/events.js";
 
 /**
@@ -376,7 +376,7 @@ export class BlockIndexer {
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.pool, kind: "pool", meta, source: "indexer", block }).catch(() => undefined);
       // Item 3: a CONCENTRATED pool created live (origin=created) has a COMPLETE tick map from birth — we
       // observe every Mint/Burn from creation. Certify it (invalidated later if a gap ever breaks continuity).
-      if (e.archetype === "v3" || e.archetype === "v4") await this.db.upsertPoolTickStatus(this.config.CHAIN_ID, e.pool, { status: "complete", source: "live_indexer", creationBlock: block, throughBlock: block, complete: true }).catch(() => undefined);
+      if (LIQUIDITY_INDEXED_ARCHETYPES.has(e.archetype)) await this.db.upsertPoolTickStatus(this.config.CHAIN_ID, e.pool, { status: "complete", source: "live_indexer", creationBlock: block, throughBlock: block, complete: true }).catch(() => undefined);
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t0, kind: "token", source: "indexer", block }).catch(() => undefined);
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t1, kind: "token", source: "indexer", block }).catch(() => undefined);
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.factory, kind: "dex", meta: { role: "factory", discoveredBy: "indexer" }, source: "indexer", block }).catch(() => undefined);
