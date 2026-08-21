@@ -63,7 +63,7 @@ export type PoolArchetype = "v2" | "aerodrome";
 // ── normalized decoded events ─────────────────────────────────────────────────
 export type DecodedEvent =
   | { kind: "pool_created"; pool: string; token0: string; token1: string; fee?: number; archetype: string; factory: string; tickSpacing?: number; hooks?: string } // tickSpacing/hooks: V4 only (for future V4 execution)
-  | { kind: "swap_v3"; pool: string; sqrtPrice: bigint; liquidity: bigint | null; amount0: bigint; amount1: bigint; recipient: string | null; v4?: boolean } // Uniswap V3 + Pancake V3 + forks + V4 (identical sqrtPrice math); v4 = pool is a V4 poolId, not an address
+  | { kind: "swap_v3"; pool: string; sqrtPrice: bigint; liquidity: bigint | null; amount0: bigint; amount1: bigint; recipient: string | null; v4?: boolean; feePips?: number } // Uniswap V3 + Pancake V3 + forks + V4 (identical sqrtPrice math); v4 = pool is a V4 poolId, not an address
   | { kind: "sync"; pool: string; archetype: PoolArchetype; r0: bigint; r1: bigint }
   | { kind: "swap_v2"; pool: string; archetype: PoolArchetype; a0In: bigint; a1In: bigint; a0Out: bigint; a1Out: bigint; to: string | null } // to = the trading wallet (flow)
   | { kind: "liquidity_v3"; pool: string; liquidityDelta: bigint; tickLower: number; tickUpper: number } // Mint (+) / Burn (−) → per-tick liquidity map
@@ -121,8 +121,20 @@ const decodeMorpho = (t0: string): Decoder => (l) => ({ kind: "morpho", topic0: 
 const decodeV4Swap: Decoder = (l) => {
   const id = l.topics[1]; if (!id || id.length < 66) return null;
   const sp = word(l.data, 2); if (sp == null || sp <= 0n) return null; // sqrtPriceX96 (word2)
-  return { kind: "swap_v3", pool: id.toLowerCase(), sqrtPrice: sp, liquidity: word(l.data, 3), amount0: sword(l.data, 0) ?? 0n, amount1: sword(l.data, 1) ?? 0n, recipient: addrFromTopic(l.topics[2]), v4: true };
+  // word5 = the fee ACTUALLY charged on this swap, in ppm. V4 fees can be dynamic (hook-set per swap), so
+  // this event is the authoritative source and a stored static value can never be. Verified against the live
+  // PoolManager: word5 equals the ABI-decoded `fee` field on every sample (100, 0, 9991 — a real dynamic one).
+  const feePips = word(l.data, 5);
+  return { kind: "swap_v3", pool: id.toLowerCase(), sqrtPrice: sp, liquidity: word(l.data, 3), amount0: sword(l.data, 0) ?? 0n, amount1: sword(l.data, 1) ?? 0n, recipient: addrFromTopic(l.topics[2]), v4: true, feePips: feePips != null ? Number(feePips) : undefined };
 };
+/**
+ * Uniswap V4 marks a pool's fee as HOOK-CONTROLLED by setting this flag in the PoolKey fee field. The value is
+ * therefore NOT a fee: storing it verbatim gave 13,956 pools a fee of 8,388,608 ppm (838%) where the real
+ * effective fee was 10,000 or 40,000. A fee with this bit set has to be read live (Swap word5, or
+ * StateView.getSlot0().lpFee) — never taken from the key.
+ */
+export const V4_DYNAMIC_FEE_FLAG = 0x800000;
+export const isV4DynamicFee = (fee: number | null | undefined): boolean => fee != null && (fee & V4_DYNAMIC_FEE_FLAG) !== 0;
 // V4 ModifyLiquidity(id⊙, sender⊙, tickLower, tickUpper, liquidityDelta, salt): V4's Mint AND Burn in one
 // signed event — this is the per-tick liquidity map for V4, exactly what Mint/Burn are for V3. It was never
 // decoded, so `tick_liquidity` held ZERO V4 rows while 19k V4 pools were certified as having a complete tick

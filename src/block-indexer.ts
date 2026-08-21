@@ -5,7 +5,7 @@ import type { BerachainClients } from "./chain.js";
 import type { Database } from "./db.js";
 import {
   decodeLog, decodeTransfer, TOPIC0S, TRANSFER, MORPHO_CREATE_MARKET, MORPHO_LIQUIDATE,
-  word, wordAddr, addrFromTopic, LIQUIDITY_INDEXED_ARCHETYPES, type RawLog, type DecodedEvent
+  word, wordAddr, addrFromTopic, LIQUIDITY_INDEXED_ARCHETYPES, isV4DynamicFee, type RawLog, type DecodedEvent
 } from "./indexer/events.js";
 
 /**
@@ -370,7 +370,13 @@ export class BlockIndexer {
       if (e.kind !== "pool_created") continue;
       // V4: currency 0x0 = native ETH → price it as WETH. tickSpacing/hooks kept for future V4 execution.
       const t0 = e.token0 === ZERO_ADDR ? this.weth : e.token0, t1 = e.token1 === ZERO_ADDR ? this.weth : e.token1;
-      const meta: Record<string, unknown> = { token0: t0, token1: t1, archetype: e.archetype, fee: e.fee, factory: e.factory, discoveredBy: "indexer", origin: "created" };
+      // A V4 PoolKey can mark the fee as HOOK-CONTROLLED with the 0x800000 flag. That value is not a fee: it
+      // was being stored verbatim, giving 13,956 pools a fee of 8,388,608 ppm (838%) where the real effective
+      // fee was 1% or 4%. Record the FACT that the fee is dynamic and leave `fee` unset, so no consumer can
+      // read a fabricated number — the real one comes from pool_state.fee_ppm (last observed swap).
+      const dynamicFee = isV4DynamicFee(e.fee);
+      const meta: Record<string, unknown> = { token0: t0, token1: t1, archetype: e.archetype, factory: e.factory, discoveredBy: "indexer", origin: "created" };
+      if (dynamicFee) meta.dynamicFee = true; else if (e.fee != null) meta.fee = e.fee;
       if (e.tickSpacing != null) meta.tickSpacing = e.tickSpacing;
       if (e.hooks) meta.hooks = e.hooks;
       await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.pool, kind: "pool", meta, source: "indexer", block }).catch(() => undefined);
@@ -430,7 +436,7 @@ export class BlockIndexer {
     // Multi-hop anchor: USD prices for the pool tokens, so a token/token swap (neither side WETH/USDC)
     // can still be priced via whichever side already has a USD price.
     const px = await this.db.getTokenPrices(this.config.CHAIN_ID, [...tokenSet]).catch(() => new Map()) as Map<string, { priceUsd: number | null; source: string }>;
-    const state = new Map<string, { pool: string; archetype: string; r0?: bigint; r1?: bigint; sqrtPrice?: bigint; liquidity?: bigint; block: number }>();
+    const state = new Map<string, { pool: string; archetype: string; r0?: bigint; r1?: bigint; sqrtPrice?: bigint; liquidity?: bigint; feePpm?: number | null; block: number }>();
     const rows = new Map<string, { price: number; conf: number }>(); // token → USD price this block (last swap wins)
     const stats = new Map<string, { volUsd: number; buys: number; sells: number; lastPrice: number; netFlowUsd: number; liqUsd: number | null }>(); // per-token market stats this block
     const flowRows: Array<{ pool: string; wallet: string | null; valueUsd: number }> = []; // per-swap wallet+USD for the FlowSensor (recent_swaps)
@@ -449,7 +455,11 @@ export class BlockIndexer {
       // ALWAYS persist observed reserves — even aerodrome-stable (the read-side needs them for the exact
       // stable math). poolInfo.archetype prevails over the event's generic "aerodrome" (Sync can't tell
       // stable from volatile), so a classified stable pool keeps its archetype in pool_state.
-      if (isSwap) { if (e.sqrtPrice > 0n) state.set(pool, { pool, archetype: "v3", sqrtPrice: e.sqrtPrice, liquidity: e.liquidity ?? undefined, block }); }
+      // A V4 swap is decoded as `swap_v3` because the sqrtPrice math is identical — but the pool is NOT v3:
+      // its ticks come from StateView, not from a pool contract, and its fee can be hook-set per swap. Writing
+      // "v3" here told every read-side consumer to use the V3 reader on a V4 pool. The fee actually charged
+      // (Swap word5) is recorded as STATE, which for a dynamic-fee pool is the only truthful source.
+      if (isSwap) { if (e.sqrtPrice > 0n) state.set(pool, { pool, archetype: e.v4 ? "v4" : "v3", sqrtPrice: e.sqrtPrice, liquidity: e.liquidity ?? undefined, feePpm: e.feePips ?? null, block }); }
       else { state.set(pool, { pool, archetype: info?.archetype ?? e.archetype, r0: e.r0, r1: e.r1, block }); }
 
       // But the x·y=k reserve-ratio pricing below is INVALID for the stable curve → skip pricing only (the

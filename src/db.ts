@@ -472,6 +472,18 @@ export class Database {
           INSERT INTO schema_markers(marker) VALUES ('v4_tick_recert_2026_08');
         END IF;
       END $v4fix$;
+      -- ONE-SHOT REPAIR: strip the V4 dynamic-fee FLAG that was stored as if it were a fee (0x800000 =
+      -- 8,388,608 ppm = 838%). It is a marker meaning "the hook sets this fee per swap", so the pool keeps
+      -- meta.dynamicFee and loses the fabricated number; the real value lives in pool_state.fee_ppm.
+      DO $v4fee$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM schema_markers WHERE marker = 'v4_dynamic_fee_2026_08') THEN
+          UPDATE entities SET meta = (meta - 'fee') || '{"dynamicFee": true}'::jsonb
+           WHERE kind='pool' AND meta->>'archetype'='v4'
+             AND ((meta->>'fee')::numeric)::bigint & 8388608 <> 0;
+          INSERT INTO schema_markers(marker) VALUES ('v4_dynamic_fee_2026_08');
+        END IF;
+      END $v4fee$;
       -- Scarlet's token JUDGMENT history (append-only). Her verdicts on a token live here, address-keyed,
       -- so she reconstructs HER past decisions on it. The token FACTS (identity/provenance/security) live
       -- on the entity; this is only the layer of opinion, kept as a timeline (not a single latest value).
@@ -713,10 +725,13 @@ export class Database {
         r1 NUMERIC,        -- V2: reserve1 (raw)
         sqrt_price NUMERIC, -- V3: sqrtPriceX96
         liquidity NUMERIC,  -- V3: in-range liquidity L
+        fee_ppm INTEGER,    -- V4: the fee ACTUALLY charged on the last observed swap (hooks can set it per swap)
         block_number BIGINT NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (chain_id, pool)
       );
+      -- Existing databases: pool_state predates fee_ppm.
+      ALTER TABLE pool_state ADD COLUMN IF NOT EXISTS fee_ppm INTEGER;
       -- V3 per-tick liquidity map (from Mint/Burn events). liquidity_net = net liquidity added when the
       -- price crosses this tick going UP (Uniswap convention: +ΔL at tickLower, −ΔL at tickUpper). This is
       -- the data a tick-crossing swap sim needs to price LARGE V3 trades EXACTLY (no more single-tick approx).
@@ -2383,22 +2398,27 @@ export class Database {
   /** Persist latest AMM state for a batch of pools (from Swap/Sync logs). One query via UNNEST; a
    * newer block always wins so a gap-backfill can never overwrite fresher state. Values are raw wei
    * strings (BigInt→string) to keep NUMERIC exact — never floats. */
-  async upsertPoolState(chainId: number, rows: Array<{ pool: string; archetype: string; r0?: bigint | null; r1?: bigint | null; sqrtPrice?: bigint | null; liquidity?: bigint | null; block: number }>): Promise<void> {
+  async upsertPoolState(chainId: number, rows: Array<{ pool: string; archetype: string; r0?: bigint | null; r1?: bigint | null; sqrtPrice?: bigint | null; liquidity?: bigint | null; feePpm?: number | null; block: number }>): Promise<void> {
     if (!rows.length) return;
     const s = (v: bigint | null | undefined) => (v == null ? null : v.toString());
+    // fee_ppm is STATE, not metadata: a V4 fee can be set per swap by the pool's hook, so the only truthful
+    // source is the last observed swap. COALESCE keeps the previous value when this event carries none (a V3
+    // swap does not report a fee), so a V4 pool never loses its known fee to a later non-V4 write.
     await this.pool.query(
-      `INSERT INTO pool_state(chain_id, pool, archetype, r0, r1, sqrt_price, liquidity, block_number)
-       SELECT $1, p, a, r0, r1, sp, liq, bn
-       FROM unnest($2::text[], $3::text[], $4::numeric[], $5::numeric[], $6::numeric[], $7::numeric[], $8::bigint[]) AS t(p, a, r0, r1, sp, liq, bn)
+      `INSERT INTO pool_state(chain_id, pool, archetype, r0, r1, sqrt_price, liquidity, fee_ppm, block_number)
+       SELECT $1, p, a, r0, r1, sp, liq, fee, bn
+       FROM unnest($2::text[], $3::text[], $4::numeric[], $5::numeric[], $6::numeric[], $7::numeric[], $8::int[], $9::bigint[]) AS t(p, a, r0, r1, sp, liq, fee, bn)
        ON CONFLICT (chain_id, pool) DO UPDATE SET
          archetype=EXCLUDED.archetype, r0=EXCLUDED.r0, r1=EXCLUDED.r1, sqrt_price=EXCLUDED.sqrt_price,
-         liquidity=EXCLUDED.liquidity, block_number=EXCLUDED.block_number, updated_at=NOW()
+         liquidity=EXCLUDED.liquidity, fee_ppm=COALESCE(EXCLUDED.fee_ppm, pool_state.fee_ppm),
+         block_number=EXCLUDED.block_number, updated_at=NOW()
        WHERE pool_state.block_number <= EXCLUDED.block_number`,
       [chainId,
         rows.map((x) => x.pool.toLowerCase()),
         rows.map((x) => x.archetype),
         rows.map((x) => s(x.r0)), rows.map((x) => s(x.r1)),
         rows.map((x) => s(x.sqrtPrice)), rows.map((x) => s(x.liquidity)),
+        rows.map((x) => x.feePpm ?? null),
         rows.map((x) => x.block)]
     );
   }
@@ -2652,16 +2672,16 @@ export class Database {
    * in ONE query (entities ⨝ pool_state) — no per-token sampling, no archetype exclusion. length(address)=42
    * drops V4 bytes32 poolIds (separate path). State may be null (a bare pool not yet priced) — the caller
    * decides modelability; the loader never hides a pool for arbitrary reasons. */
-  async graphPools(chainId: number, archetypes: string[]): Promise<Array<{ address: string; meta: unknown; r0: bigint | null; r1: bigint | null; sqrtPrice: bigint | null; liquidity: bigint | null; block: number; ageMs: number | null }>> {
-    const r = await this.pool.query<{ address: string; meta: unknown; r0: string | null; r1: string | null; sp: string | null; liq: string | null; bn: string | null; age_ms: string | null }>(
-      `SELECT e.address, e.meta, ps.r0::text r0, ps.r1::text r1, ps.sqrt_price::text sp, ps.liquidity::text liq, ps.block_number::text bn,
+  async graphPools(chainId: number, archetypes: string[]): Promise<Array<{ address: string; meta: unknown; r0: bigint | null; r1: bigint | null; sqrtPrice: bigint | null; liquidity: bigint | null; feePpm: number | null; block: number; ageMs: number | null }>> {
+    const r = await this.pool.query<{ address: string; meta: unknown; r0: string | null; r1: string | null; sp: string | null; liq: string | null; fee_ppm: number | null; bn: string | null; age_ms: string | null }>(
+      `SELECT e.address, e.meta, ps.r0::text r0, ps.r1::text r1, ps.sqrt_price::text sp, ps.liquidity::text liq, ps.fee_ppm, ps.block_number::text bn,
               (EXTRACT(EPOCH FROM (NOW()-ps.updated_at))*1000)::bigint::text AS age_ms
        FROM entities e LEFT JOIN pool_state ps ON ps.chain_id=e.chain_id AND ps.pool=e.address
        WHERE e.chain_id=$1 AND e.kind='pool' AND length(e.address)=42 AND e.meta->>'archetype' = ANY($2::text[])`,
       [chainId, archetypes]
     );
     const b = (v: string | null) => (v == null ? null : BigInt(v.split(".")[0]));
-    return r.rows.map((x) => ({ address: x.address, meta: x.meta, r0: b(x.r0), r1: b(x.r1), sqrtPrice: b(x.sp), liquidity: b(x.liq), block: x.bn ? Number(x.bn) : 0, ageMs: x.age_ms ? Number(x.age_ms) : null }));
+    return r.rows.map((x) => ({ address: x.address, meta: x.meta, r0: b(x.r0), r1: b(x.r1), sqrtPrice: b(x.sp), liquidity: b(x.liq), feePpm: x.fee_ppm ?? null, block: x.bn ? Number(x.bn) : 0, ageMs: x.age_ms ? Number(x.age_ms) : null }));
   }
 
   /** Idempotently plants the system blacklist (test/synthetic tokens etc.). System rows

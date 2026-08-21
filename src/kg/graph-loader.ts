@@ -86,7 +86,14 @@ export async function loadLiquidityGraph(db: Database, cid: number, opts: LoadOp
     const factory = m.factory?.toLowerCase();
     // Per-pool fee when the archetype has one; otherwise the PROTOCOL fee of its factory. 0 stays 0 (unknown)
     // so downstream can fail closed — but with the protocol fee resolved, "unknown" is now genuinely rare.
-    const feePpm = Number(m.fee) > 0 ? Number(m.fee) : (factory ? protoFees.get(factory) ?? 0 : 0);
+    // A V4 pool can have a HOOK-CONTROLLED fee: there is no static fee to read, only the one actually charged
+    // on the last observed swap (pool_state.fee_ppm). It must come first for such a pool, because the fallback
+    // chain below would otherwise land on 0 — and 0 is the dangerous direction: a zero fee makes a pool look
+    // MORE profitable than it is, where the old fabricated 838% only made it invisible. Unknown stays 0 so the
+    // consumer fails closed rather than quoting a free swap.
+    const feePpm = m.dynamicFee === true
+      ? (Number(row.feePpm) > 0 ? Number(row.feePpm) : 0)
+      : Number(m.fee) > 0 ? Number(m.fee) : (factory ? protoFees.get(factory) ?? 0 : 0);
     const ps: PoolState = {
       address, archetype, token0: t0, token1: t1,
       feePpm,
@@ -122,4 +129,4 @@ export async function loadLiquidityGraph(db: Database, cid: number, opts: LoadOp
   };
 }
 
-interface PoolMeta { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string; tickSpacing?: unknown }
+interface PoolMeta { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string; tickSpacing?: unknown; dynamicFee?: boolean }
