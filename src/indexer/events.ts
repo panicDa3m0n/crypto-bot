@@ -63,9 +63,9 @@ export type PoolArchetype = "v2" | "aerodrome";
 // ── normalized decoded events ─────────────────────────────────────────────────
 export type DecodedEvent =
   | { kind: "pool_created"; pool: string; token0: string; token1: string; fee?: number; archetype: string; factory: string; tickSpacing?: number; hooks?: string } // tickSpacing/hooks: V4 only (for future V4 execution)
-  | { kind: "swap_v3"; pool: string; sqrtPrice: bigint; liquidity: bigint | null; amount0: bigint; amount1: bigint; recipient: string | null; v4?: boolean; feePips?: number } // Uniswap V3 + Pancake V3 + forks + V4 (identical sqrtPrice math); v4 = pool is a V4 poolId, not an address
+  | { kind: "swap_v3"; pool: string; sqrtPrice: bigint; liquidity: bigint | null; amount0: bigint; amount1: bigint; recipient: string | null; sender: string | null; v4?: boolean; feePips?: number } // Uniswap V3 + Pancake V3 + forks + V4 (identical sqrtPrice math); v4 = pool is a V4 poolId, not an address
   | { kind: "sync"; pool: string; archetype: PoolArchetype; r0: bigint; r1: bigint }
-  | { kind: "swap_v2"; pool: string; archetype: PoolArchetype; a0In: bigint; a1In: bigint; a0Out: bigint; a1Out: bigint; to: string | null } // to = the trading wallet (flow)
+  | { kind: "swap_v2"; pool: string; archetype: PoolArchetype; a0In: bigint; a1In: bigint; a0Out: bigint; a1Out: bigint; to: string | null; sender: string | null } // to = the trading wallet (flow)
   | { kind: "liquidity_v3"; pool: string; liquidityDelta: bigint; tickLower: number; tickUpper: number } // Mint (+) / Burn (−) → per-tick liquidity map
   | { kind: "morpho"; topic0: string; log: RawLog };
 
@@ -83,7 +83,7 @@ export const LIQUIDITY_INDEXED_ARCHETYPES: ReadonlySet<string> = new Set(["v3", 
 const decodeV3Swap: Decoder = (l) => {
   const sp = word(l.data, 2); if (sp == null || sp <= 0n) return null; // sqrtPriceX96
   // Swap(sender⊙, recipient⊙, amount0, amount1, sqrtPriceX96, liquidity, tick): recipient = topics[2] = the wallet.
-  return { kind: "swap_v3", pool: l.address.toLowerCase(), sqrtPrice: sp, liquidity: word(l.data, 3), amount0: sword(l.data, 0) ?? 0n, amount1: sword(l.data, 1) ?? 0n, recipient: addrFromTopic(l.topics[2]) };
+  return { kind: "swap_v3", pool: l.address.toLowerCase(), sqrtPrice: sp, liquidity: word(l.data, 3), amount0: sword(l.data, 0) ?? 0n, amount1: sword(l.data, 1) ?? 0n, recipient: addrFromTopic(l.topics[2]), sender: addrFromTopic(l.topics[1]) };
 };
 const decodeSync = (archetype: PoolArchetype): Decoder => (l) => {
   const r0 = word(l.data, 0), r1 = word(l.data, 1);
@@ -92,7 +92,7 @@ const decodeSync = (archetype: PoolArchetype): Decoder => (l) => {
 const decodeSwapV2 = (archetype: PoolArchetype): Decoder => (l) => ({
   // Swap(sender⊙, amount0In, amount1In, amount0Out, amount1Out, to⊙): to = topics[2] = the wallet.
   kind: "swap_v2", pool: l.address.toLowerCase(), archetype,
-  a0In: word(l.data, 0) ?? 0n, a1In: word(l.data, 1) ?? 0n, a0Out: word(l.data, 2) ?? 0n, a1Out: word(l.data, 3) ?? 0n, to: addrFromTopic(l.topics[2])
+  a0In: word(l.data, 0) ?? 0n, a1In: word(l.data, 1) ?? 0n, a0Out: word(l.data, 2) ?? 0n, a1Out: word(l.data, 3) ?? 0n, to: addrFromTopic(l.topics[2]), sender: addrFromTopic(l.topics[1])
 });
 const decodePoolCreated = (kind: "v3" | "v2" | "aero"): Decoder => (l) => {
   const token0 = addrFromTopic(l.topics[1]), token1 = addrFromTopic(l.topics[2]);
@@ -125,7 +125,7 @@ const decodeV4Swap: Decoder = (l) => {
   // this event is the authoritative source and a stored static value can never be. Verified against the live
   // PoolManager: word5 equals the ABI-decoded `fee` field on every sample (100, 0, 9991 — a real dynamic one).
   const feePips = word(l.data, 5);
-  return { kind: "swap_v3", pool: id.toLowerCase(), sqrtPrice: sp, liquidity: word(l.data, 3), amount0: sword(l.data, 0) ?? 0n, amount1: sword(l.data, 1) ?? 0n, recipient: addrFromTopic(l.topics[2]), v4: true, feePips: feePips != null ? Number(feePips) : undefined };
+  return { kind: "swap_v3", pool: id.toLowerCase(), sqrtPrice: sp, liquidity: word(l.data, 3), amount0: sword(l.data, 0) ?? 0n, amount1: sword(l.data, 1) ?? 0n, recipient: addrFromTopic(l.topics[2]), sender: addrFromTopic(l.topics[1]), v4: true, feePips: feePips != null ? Number(feePips) : undefined };
 };
 /**
  * Uniswap V4 marks a pool's fee as HOOK-CONTROLLED by setting this flag in the PoolKey fee field. The value is

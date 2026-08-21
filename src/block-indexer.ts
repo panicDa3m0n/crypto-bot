@@ -68,6 +68,12 @@ export class BlockIndexer {
   /** PUSH to the enricher: fired when a block wrote a new/incomplete entity (bare pool/token) → the enricher
    * drains the buffer NOW instead of waiting for its idle poll. Injected by index.ts (= enricher.nudge). */
   onDiscovery?: () => void;
+  /** ROUTER EVIDENCE, accumulated in MEMORY. Every Swap names the contract that called it, which for a
+   * factory's own pools is that factory's router — the one thing a factory cannot tell us about itself, and
+   * the reason only 4 of 146 had one. Counting it per block would put a write on the critical path for a
+   * fact that changes almost never, so it is tallied here and flushed occasionally. */
+  private routerTally = new Map<string, { swaps: number; pools: Set<string> }>(); // "factory|sender" → evidence
+  private lastRouterFlush = 0;
   private readonly marketCache = new Map<string, { loanToken: string; collateralToken: string; oracle: string; irm: string; lltv: bigint }>();
 
   /** TRUE when the indexer is at the chain head (data is fresh). While FALSE it's realigning (cold-start or
@@ -452,6 +458,14 @@ export class BlockIndexer {
       const pool = e.pool;
       const info = pools.get(pool);
       const isSwap = e.kind === "swap_v3";
+      // Who called the pool. For a factory-native router this is the router itself; for an aggregator it is
+      // the aggregator. Both are recorded — telling them apart is the reader's job (exclusivity), not ours.
+      const sender = isSwap ? e.sender : null; // a Sync carries no caller — only a Swap names who traded
+      if (sender && info?.factory) {
+        const k = `${info.factory.toLowerCase()}|${sender}`;
+        const t = this.routerTally.get(k);
+        if (t) { t.swaps += 1; t.pools.add(pool); } else this.routerTally.set(k, { swaps: 1, pools: new Set([pool]) });
+      }
       // ALWAYS persist observed reserves — even aerodrome-stable (the read-side needs them for the exact
       // stable math). poolInfo.archetype prevails over the event's generic "aerodrome" (Sync can't tell
       // stable from volatile), so a classified stable pool keeps its archetype in pool_state.
@@ -529,6 +543,12 @@ export class BlockIndexer {
     }
 
     if (this.config.DEBUG_KEEP_RAW_BLOCKS && logs.length) await this.db.saveRawBlock(this.config.CHAIN_ID, block, logs).catch(() => undefined);
+    // Flush the router tally on its own slow beat, and only when it has grown enough to be worth a write.
+    if (this.routerTally.size >= 200 || (this.routerTally.size && Date.now() - this.lastRouterFlush > 120_000)) {
+      const rows = [...this.routerTally.entries()].map(([k, v]) => { const [factory, sender] = k.split("|"); return { factory, sender, swaps: v.swaps, pools: v.pools.size, block }; });
+      this.routerTally = new Map(); this.lastRouterFlush = Date.now();
+      await this.db.addRouterEvidence(this.config.CHAIN_ID, rows).catch((err) => this.logger.debug({ err }, "router evidence flush failed"));
+    }
     if (state.size) await this.db.upsertPoolState(this.config.CHAIN_ID, [...state.values()]).catch((e) => this.logger.debug({ err: e }, "indexer pool_state upsert failed"));
     if (rows.size) {
       await this.db.upsertTokenPrices(this.config.CHAIN_ID, [...rows.entries()].map(([token, v]) => ({ token, priceUsd: v.price, confidence: v.conf, source: "indexer", block })), { tauFastSec: this.config.VOL_TAU_FAST_SEC, tauSlowSec: this.config.VOL_TAU_SLOW_SEC }).catch((e) => this.logger.debug({ err: e }, "indexer price upsert failed"));

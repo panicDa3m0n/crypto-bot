@@ -633,6 +633,29 @@ export class RegistryEnricher {
     return { done, rateLimited: false };
   }
 
+
+  /**
+   * ROUTER derivation — from OBSERVATION, because a factory cannot be asked. Only 4 of 146 factories had a
+   * router, and without one none of that factory's pools is own-executable, which is what caps routeEncodable
+   * in the KG funnel. But every Swap names the contract that called it, and for a factory's own pools that
+   * caller IS the router — the evidence was in the block stream all along, simply discarded at decode time.
+   *
+   * The one thing that must not be got wrong is mistaking an AGGREGATOR for a router: it appears as sender
+   * too, and everywhere. Exclusivity separates them by construction — a Uniswap router physically cannot swap
+   * an Aerodrome pool, so a genuine router's swaps sit almost entirely on its own factory, while an aggregator
+   * spreads across many. The promotion records the numbers behind it, so the claim can be re-checked later
+   * instead of being an unexplained address.
+   */
+  private async deriveRouters(cid: number, block: number | null): Promise<number> {
+    let n = 0;
+    for (const c of await this.db.routerCandidates(cid).catch(() => [])) {
+      await this.db.upsertEntity({ chainId: cid, address: c.factory, kind: "dex", meta: { router: c.router, routerSource: `swap-sender: ${c.swaps} swaps on ${c.pools} pools, exclusivity ${(c.exclusivity * 100).toFixed(1)}%` }, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+      this.logger.info({ factory: c.factory, router: c.router, swaps: c.swaps, pools: c.pools, exclusivity: Number(c.exclusivity.toFixed(3)) }, "router derived from swap senders");
+      n += 1;
+    }
+    return n;
+  }
+
   /**
    * FACTORY IDENTITY — the `dex` kind was structurally excluded from enrichment (only token/pool could ever
    * be "pending"), leaving 134 of 140 factories anonymous. That matters far beyond tidiness: a factory without
@@ -650,17 +673,23 @@ export class RegistryEnricher {
     // BLOCKED THE INDEXER's writes on an LWLock. An index-backed count decides whether the heavy work is
     // needed at all, and the pass is bounded to a slow cadence because factory identity barely changes.
     if (Date.now() - this.lastDexIdentityAt < DEX_IDENTITY_INTERVAL_MS) return { done: 0, rateLimited: false };
-    const pendingDex = await this.db.countPendingByKind(cid, "dex").catch(() => 0);
-    if (!pendingDex) { this.lastDexIdentityAt = Date.now(); return { done: 0, rateLimited: false }; }
     this.lastDexIdentityAt = Date.now();
+    // The ROUTER derivation runs BEFORE the "is anything pending" pre-check, deliberately. `enrich_pending`
+    // for a dex means ONE thing — the type is missing — so with all 146 factories typed the pre-check would
+    // return zero and skip the whole pass, hiding the router work behind an unrelated field. That is the same
+    // shape of bug as the enrichment buffer keyed on token0: a queue predicate that speaks for one field only
+    // makes every other missing datum invisible for ever. Its own query is index-backed and throttled above.
+    const routers = await this.deriveRouters(cid, block);
+    const pendingDex = await this.db.countPendingByKind(cid, "dex").catch(() => 0);
+    if (!pendingDex) return { done: routers, rateLimited: false };
     // 1) TYPE in bulk, from data we already hold — one SQL statement, no network, no pacing. Do this FIRST so
     //    a derivable field is never queued behind a field that needs a (possibly failing) external lookup.
     const typed = await this.db.deriveFactoryTypes(cid).catch(() => 0);
     // 2) NAME is the only part that needs the network; it is best-effort and bounded.
     const batch = await this.db.factoriesNeedingIdentity(cid, 15).catch(() => []);
-    if (!batch.length) return { done: typed, rateLimited: false };
+    if (!batch.length) return { done: typed + routers, rateLimited: false };
     const TYPE_OF: Record<string, string> = { v3: "uni-v3", v4: "uni-v4", slipstream: "slipstream", algebra: "algebra", v2: "uni-v2", aerodrome: "aerodrome", "aerodrome-stable": "aerodrome", solidly: "solidly" };
-    let done = typed;
+    let done = typed + routers;
     for (const f of batch) {
       const patch: Record<string, unknown> = {};
       if (!f.hasType && f.poolArchetype && TYPE_OF[f.poolArchetype]) { patch.type = TYPE_OF[f.poolArchetype]; patch.typeSource = `pools:${f.poolArchetype}(${f.pools})`; }

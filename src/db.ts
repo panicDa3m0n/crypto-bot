@@ -453,6 +453,22 @@ export class Database {
       CREATE INDEX IF NOT EXISTS entities_pool_no_factory_idx ON entities(chain_id) WHERE kind='pool' AND NOT (meta ? 'factory');
       CREATE INDEX IF NOT EXISTS entities_pool_unknown_arch_idx ON entities(chain_id) WHERE kind='pool' AND COALESCE(meta->>'archetype','unknown')='unknown';
       CREATE INDEX IF NOT EXISTS entities_pool_aero_unchecked_idx ON entities(chain_id) WHERE kind='pool' AND NOT (meta ? 'stableChecked');
+      -- ROUTER EVIDENCE. A factory's router is not readable from the factory — but every Swap names the
+      -- contract that called it (topic1, the sender), and that is the router. One caveat decides the whole
+      -- method: an AGGREGATOR also appears as sender, across many factories at once, while a factory's own
+      -- router can only ever swap that factory's own pools. So we count (factory, sender) pairs and let
+      -- EXCLUSIVITY separate them — evidence accumulated over blocks, never a single observation.
+      CREATE TABLE IF NOT EXISTS router_evidence (
+        chain_id INTEGER NOT NULL,
+        factory TEXT NOT NULL,
+        sender TEXT NOT NULL,
+        swaps BIGINT NOT NULL DEFAULT 0,
+        pools_seen INTEGER NOT NULL DEFAULT 0,
+        last_block BIGINT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (chain_id, factory, sender)
+      );
+      CREATE INDEX IF NOT EXISTS router_evidence_sender_idx ON router_evidence(chain_id, sender);
       -- Marker table for one-shot data repairs: a repair that must run exactly once, and must NOT re-run and
       -- undo work done after it (re-opening a certification legitimately earned later would be a new bug).
       CREATE TABLE IF NOT EXISTS schema_markers (marker TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
@@ -1210,7 +1226,7 @@ export class Database {
          EXISTS(SELECT 1 FROM entities WHERE chain_id=$1 AND kind='pool' AND meta->>'archetype' IN ('aerodrome','aerodrome-stable')
                   AND NOT (meta ? 'stableChecked')) AS aero_stable,
          EXISTS(SELECT 1 FROM entities WHERE chain_id=$1 AND kind='dex' AND NOT (meta ? 'feePpm')) AS protocol_fee,
-         EXISTS(SELECT 1 FROM entities WHERE chain_id=$1 AND kind='dex' AND (NOT (meta ? 'type') OR name IS NULL)) AS dex_identity`,
+         EXISTS(SELECT 1 FROM entities WHERE chain_id=$1 AND kind='dex' AND (NOT (meta ? 'type') OR name IS NULL OR NOT (meta ? 'router'))) AS dex_identity`,
       [chainId]
     );
     const x = r.rows[0];
@@ -1689,6 +1705,46 @@ export class Database {
     );
     const m = r.rows[0];
     return m ? { loanToken: m.loan_token, collateralToken: m.collateral_token, oracle: m.oracle, irm: m.irm, lltv: BigInt(m.lltv.split(".")[0]) } : null;
+  }
+
+
+  /** Accumulate router evidence. Called with per-flush AGGREGATES, never per swap: the indexer counts in
+   * memory and flushes occasionally, so the per-block critical path pays nothing for this. */
+  async addRouterEvidence(chainId: number, rows: Array<{ factory: string; sender: string; swaps: number; pools: number; block: number }>): Promise<void> {
+    if (!rows.length) return;
+    await this.pool.query(
+      `INSERT INTO router_evidence(chain_id, factory, sender, swaps, pools_seen, last_block)
+       SELECT $1, f, s, sw, po, bn FROM unnest($2::text[], $3::text[], $4::bigint[], $5::int[], $6::bigint[]) AS t(f, s, sw, po, bn)
+       ON CONFLICT (chain_id, factory, sender) DO UPDATE SET
+         swaps = router_evidence.swaps + EXCLUDED.swaps,
+         pools_seen = GREATEST(router_evidence.pools_seen, EXCLUDED.pools_seen),
+         last_block = GREATEST(COALESCE(router_evidence.last_block,0), EXCLUDED.last_block), updated_at=NOW()`,
+      [chainId, rows.map((r) => r.factory.toLowerCase()), rows.map((r) => r.sender.toLowerCase()),
+       rows.map((r) => r.swaps), rows.map((r) => r.pools), rows.map((r) => r.block)]
+    );
+  }
+
+  /**
+   * The router candidate for each factory that still lacks one. A candidate must be the factory's TOP sender
+   * by swap count, and EXCLUSIVE to it: `exclusivity` is the share of that sender's swaps, chain-wide, that
+   * happened on this factory's pools. A router physically cannot swap another family's pools, so a genuine one
+   * scores ~1.0; an aggregator, which routes everywhere, scores low. We also require it on several distinct
+   * pools, so a sender that simply only ever touched one pool cannot masquerade as exclusive.
+   */
+  async routerCandidates(chainId: number, minSwaps = 50, minPools = 3, minExclusivity = 0.9): Promise<Array<{ factory: string; router: string; swaps: number; pools: number; exclusivity: number }>> {
+    const r = await this.pool.query<{ factory: string; sender: string; swaps: string; pools_seen: number; exclusivity: string }>(
+      `WITH totals AS (SELECT sender, sum(swaps) tot FROM router_evidence WHERE chain_id=$1 GROUP BY 1),
+            ranked AS (
+              SELECT re.factory, re.sender, re.swaps, re.pools_seen, (re.swaps::numeric / NULLIF(t.tot,0)) exclusivity,
+                     row_number() OVER (PARTITION BY re.factory ORDER BY re.swaps DESC) rn
+              FROM router_evidence re JOIN totals t ON t.sender=re.sender
+              WHERE re.chain_id=$1
+            )
+       SELECT r.factory, r.sender, r.swaps::text, r.pools_seen, r.exclusivity::text
+       FROM ranked r JOIN entities e ON e.chain_id=$1 AND e.address=r.factory AND e.kind='dex'
+       WHERE r.rn=1 AND r.swaps >= $2 AND r.pools_seen >= $3 AND r.exclusivity >= $4 AND NOT (e.meta ? 'router')`,
+      [chainId, minSwaps, minPools, minExclusivity]);
+    return r.rows.map((x) => ({ factory: x.factory, router: x.sender, swaps: Number(x.swaps), pools: x.pools_seen, exclusivity: Number(x.exclusivity) }));
   }
 
   /** Merge FACTS onto a lending position's meta (size read from chain). Merge, never replace: the row also
@@ -2393,14 +2449,14 @@ export class Database {
     return r.rows.map((x) => ({ block: Number(x.block_number), pool: x.pool, wallet: x.wallet, valueUsd: x.value_usd }));
   }
   /** Pool metadata (token0/token1/archetype) for a batch of pool addresses — from the entities registry. */
-  async poolInfoBatch(chainId: number, addresses: string[]): Promise<Map<string, { token0: string | null; token1: string | null; archetype: string | null }>> {
-    const out = new Map<string, { token0: string | null; token1: string | null; archetype: string | null }>();
+  async poolInfoBatch(chainId: number, addresses: string[]): Promise<Map<string, { token0: string | null; token1: string | null; archetype: string | null; factory: string | null }>> {
+    const out = new Map<string, { token0: string | null; token1: string | null; archetype: string | null; factory: string | null }>();
     if (!addresses.length) return out;
     const lower = [...new Set(addresses.map((a) => a.toLowerCase()))];
-    const r = await this.pool.query<{ address: string; token0: string | null; token1: string | null; archetype: string | null }>(
-      `SELECT address, meta->>'token0' AS token0, meta->>'token1' AS token1, meta->>'archetype' AS archetype FROM entities WHERE chain_id=$1 AND kind='pool' AND address = ANY($2::text[])`, [chainId, lower]
+    const r = await this.pool.query<{ address: string; token0: string | null; token1: string | null; archetype: string | null; factory: string | null }>(
+      `SELECT address, meta->>'token0' AS token0, meta->>'token1' AS token1, meta->>'archetype' AS archetype, meta->>'factory' AS factory FROM entities WHERE chain_id=$1 AND kind='pool' AND address = ANY($2::text[])`, [chainId, lower]
     );
-    for (const row of r.rows) out.set(row.address, { token0: row.token0, token1: row.token1, archetype: row.archetype });
+    for (const row of r.rows) out.set(row.address, { token0: row.token0, token1: row.token1, archetype: row.archetype, factory: row.factory });
     return out;
   }
 
