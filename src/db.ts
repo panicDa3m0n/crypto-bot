@@ -2056,7 +2056,27 @@ export class Database {
    * incomplete, pools burned into enrich_failed by a flaky lane, 2.5% tick certification, numbers shown
    * without their trustworthiness. Every section answers "what is missing / what is wrong / how do I find it".
    */
+  /**
+   * CACHED + SINGLE-FLIGHT. This snapshot is a dashboard view built from a dozen full aggregates over every
+   * pool and token. Uncached it is a live hazard, not a slow page: four of these running concurrently
+   * saturated the database and pushed the indexer's own writes into WALSync/WALWrite waits, cutting it from
+   * 0.5 blocks/s to 0.05 — the indexer fell behind because a monitoring view was too expensive to look at.
+   * Refresh cadence is what the observer needs, not what a browser asks for, and overlapping callers share
+   * ONE in-flight computation instead of each starting their own.
+   */
+  private healthCache?: { at: number; data: Record<string, unknown> };
+  private healthInFlight?: Promise<Record<string, unknown>>;
   async healthSnapshot(chainId: number): Promise<Record<string, unknown>> {
+    const now = Date.now();
+    if (this.healthCache && now - this.healthCache.at < 30_000) return this.healthCache.data;
+    if (this.healthInFlight) return this.healthInFlight;
+    this.healthInFlight = this.computeHealthSnapshot(chainId)
+      .then((d) => { this.healthCache = { at: Date.now(), data: d }; return d; })
+      .finally(() => { this.healthInFlight = undefined; });
+    return this.healthInFlight;
+  }
+
+  private async computeHealthSnapshot(chainId: number): Promise<Record<string, unknown>> {
     const q = async (sql: string, params: unknown[] = []) => (await this.pool.query(sql, params)).rows as Array<Record<string, unknown>>;
     const one = async (sql: string, params: unknown[] = []) => (await q(sql, params))[0] ?? {};
 

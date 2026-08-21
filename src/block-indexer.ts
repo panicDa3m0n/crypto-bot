@@ -74,6 +74,7 @@ export class BlockIndexer {
    * fact that changes almost never, so it is tallied here and flushed occasionally. */
   private routerTally = new Map<string, { swaps: number; pools: Set<string> }>(); // "factory|sender" → evidence
   private lastRouterFlush = 0;
+  private routerFlushing = false;
   private readonly marketCache = new Map<string, { loanToken: string; collateralToken: string; oracle: string; irm: string; lltv: bigint }>();
 
   /** TRUE when the indexer is at the chain head (data is fresh). While FALSE it's realigning (cold-start or
@@ -543,11 +544,15 @@ export class BlockIndexer {
     }
 
     if (this.config.DEBUG_KEEP_RAW_BLOCKS && logs.length) await this.db.saveRawBlock(this.config.CHAIN_ID, block, logs).catch(() => undefined);
-    // Flush the router tally on its own slow beat, and only when it has grown enough to be worth a write.
-    if (this.routerTally.size >= 200 || (this.routerTally.size && Date.now() - this.lastRouterFlush > 120_000)) {
+    // Flush the router tally on its own slow beat. SINGLE-FLIGHT and time-gated on purpose: during catch-up
+    // many blocks are processed concurrently, and a size-triggered flush would let each of them start its own
+    // upsert on the same table, contending on the same rows. The size bound stays only as a memory valve.
+    if (!this.routerFlushing && this.routerTally.size && (this.routerTally.size >= 5000 || Date.now() - this.lastRouterFlush > 120_000)) {
       const rows = [...this.routerTally.entries()].map(([k, v]) => { const [factory, sender] = k.split("|"); return { factory, sender, swaps: v.swaps, pools: v.pools.size, block }; });
-      this.routerTally = new Map(); this.lastRouterFlush = Date.now();
-      await this.db.addRouterEvidence(this.config.CHAIN_ID, rows).catch((err) => this.logger.debug({ err }, "router evidence flush failed"));
+      this.routerTally = new Map(); this.lastRouterFlush = Date.now(); this.routerFlushing = true;
+      await this.db.addRouterEvidence(this.config.CHAIN_ID, rows)
+        .catch((err) => this.logger.debug({ err }, "router evidence flush failed"))
+        .finally(() => { this.routerFlushing = false; });
     }
     if (state.size) await this.db.upsertPoolState(this.config.CHAIN_ID, [...state.values()]).catch((e) => this.logger.debug({ err: e }, "indexer pool_state upsert failed"));
     if (rows.size) {
