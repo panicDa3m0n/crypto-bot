@@ -85,9 +85,20 @@ export class LiquidationMonitor {
 
       // One oracle read per DISTINCT oracle (positions in a market share it) — multicall, precision lane.
       const oracles = [...new Set(watched.map((w) => w.oracle))];
-      const prices = await this.chain.precisionRead((c) => c.multicall({ contracts: oracles.map((o) => ({ address: o as Address, abi: ORACLE_ABI, functionName: "price" as const })), allowFailure: true, multicallAddress: MULTICALL3 }), "morpho-oracle-prices").catch(() => [] as Array<{ status: string; result?: unknown }>);
+      // NEVER swallow this. Without oracle prices the monitor cannot compute a single health factor, so it
+      // watches everything and fires at nothing — and it did exactly that for hours, reporting
+      // `nearestHf: null` in a heartbeat that otherwise looked healthy while a profitable liquidation was
+      // taken by someone else. A component that cannot do its job must say so, not log an INFO line.
+      const prices = await this.chain.precisionRead((c) => c.multicall({ contracts: oracles.map((o) => ({ address: o as Address, abi: ORACLE_ABI, functionName: "price" as const })), allowFailure: true, multicallAddress: MULTICALL3 }), "morpho-oracle-prices")
+        .catch((err) => { this.logger.error({ err, oracles: oracles.length }, "liquidation monitor: ORACLE PRICE READ FAILED — cannot evaluate any position this tick"); return [] as Array<{ status: string; result?: unknown }>; });
       const priceByOracle = new Map<string, bigint>();
       oracles.forEach((o, i) => { const r = prices[i]; if (r?.status === "success" && typeof r.result === "bigint") priceByOracle.set(o, r.result); });
+      // BLINDNESS IS AN ALARM, not a statistic. Watching N positions while able to price none of them is
+      // indistinguishable, in the heartbeat, from watching N positions that are all far from liquidation.
+      if (watched.length && !priceByOracle.size) {
+        this.logger.error({ watched: watched.length, oracles: oracles.length, sample: oracles.slice(0, 3) },
+          "liquidation monitor is BLIND — zero of its oracles returned a price; no liquidation can be detected");
+      }
 
       // FRESH SIZE for the NEAR ones: the liq_price above uses 180s-old collateral/debt. For positions
       // whose live price sits within LIQ_NEAR_MARGIN of that stale liq_price (about to cross), re-read

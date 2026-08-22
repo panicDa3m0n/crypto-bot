@@ -97,7 +97,27 @@ export class Database {
     this.pool = new pg.Pool({ connectionString, max: 8 });
   }
 
+  /**
+   * WAIT for the database instead of dying because it is a few seconds late.
+   *
+   * `depends_on: service_healthy` only governs `docker compose up`. After a HOST reboot the daemon restarts
+   * everything at once under its restart policy, which does not honour that ordering — so the app raced
+   * Postgres, failed DNS resolution, and was killed as a "fatal startup failure" 23 times in a row until the
+   * database happened to win. A service whose dependency is briefly unavailable should wait for it, not
+   * crash-loop; the retries are bounded so a genuinely absent database still fails loudly rather than hanging.
+   */
+  private async awaitDatabase(attempts = 30, gapMs = 2_000): Promise<void> {
+    for (let i = 1; i <= attempts; i++) {
+      try { await this.pool.query("SELECT 1"); return; }
+      catch (e) {
+        if (i === attempts) throw e;
+        await new Promise((r) => setTimeout(r, gapMs));
+      }
+    }
+  }
+
   async migrate(): Promise<void> {
+    await this.awaitDatabase();
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS network_observations (
         id BIGSERIAL PRIMARY KEY,
@@ -2162,12 +2182,17 @@ export class Database {
     // `fee_applies` / `spacing_applies`: a constant-product pool has NO per-pool fee (it is a protocol
     // constant) and NO tickSpacing. Reporting those as "missing" invents thousands of phantom gaps and makes
     // the real ones invisible — the view must distinguish NOT-APPLICABLE from MISSING.
+    // A DYNAMIC fee is not a missing one. V4 pools whose fee is hook-controlled deliberately carry no static
+    // meta.fee — the real value is per-swap and lives in pool_state.fee_ppm — so counting them as gaps
+    // reported 16,095 phantom holes and pushed V4 completeness to 43%. A completeness view that invents gaps
+    // is as misleading as one that hides them: it sends you to fix data that is already correct.
     const completeness = await q(
       `SELECT COALESCE(meta->>'archetype','(none)') archetype, count(*)::int total,
-              (COALESCE(meta->>'archetype','') IN ('v3','v4','slipstream','algebra')) fee_applies,
+              (COALESCE(meta->>'archetype','') IN ('v3','slipstream')) fee_applies,
               (COALESCE(meta->>'archetype','') IN ('v3','v4','slipstream','algebra')) spacing_applies,
               count(*) FILTER (WHERE meta->>'token0' IS NULL)::int missing_token0,
-              count(*) FILTER (WHERE meta->>'fee' IS NULL)::int missing_fee,
+              count(*) FILTER (WHERE meta->>'fee' IS NULL AND (meta->>'dynamicFee') IS DISTINCT FROM 'true')::int missing_fee,
+              count(*) FILTER (WHERE (meta->>'dynamicFee') = 'true')::int dynamic_fee,
               count(*) FILTER (WHERE meta->>'tickSpacing' IS NULL)::int missing_spacing,
               count(*) FILTER (WHERE meta->>'factory' IS NULL)::int missing_factory,
               count(*) FILTER (WHERE enrich_pending)::int pending,
@@ -2175,8 +2200,10 @@ export class Database {
               -- COMPLETE = every field that APPLIES to this archetype is present. Showing progress, not only
               -- gaps: "8945/8951 complete" tells you the pipeline is winning; a gap count alone never does.
               count(*) FILTER (WHERE (meta->>'token0') IS NOT NULL AND (meta->>'token1') IS NOT NULL
+                AND ((meta->>'fee') IS NOT NULL OR (meta->>'dynamicFee') = 'true'
+                     OR COALESCE(meta->>'archetype','') NOT IN ('v3','slipstream'))
                 AND (COALESCE(meta->>'archetype','') NOT IN ('v3','v4','slipstream','algebra')
-                     OR ((meta->>'fee') IS NOT NULL AND (meta->>'tickSpacing') IS NOT NULL)))::int complete
+                     OR (meta->>'tickSpacing') IS NOT NULL))::int complete
        FROM entities WHERE chain_id=$1 AND kind='pool' GROUP BY 1,3,4 ORDER BY total DESC`, [chainId]);
     // WHY an entity cannot be completed. A datum the chain genuinely refuses (the contract does not expose the
     // function) is a bounded, knowable gap — but only if it is NAMED. Left as a bare "failed" count it looks
