@@ -1481,8 +1481,18 @@ export class Database {
    * not bad data). Data completeness is the goal — a permanently-failed entity we never re-try is a silent
    * hole in every downstream calculation. Called on startup so a transient outage cannot cost us data. */
   async resetEnrichFailures(chainId: number, kind = "pool"): Promise<number> {
+    // Requeue only failures we CANNOT explain. This runs at every enricher start, and resetting every failed
+    // entity meant each restart erased the evidence that the chain definitively refuses a contract — with
+    // fast deploys those entities never reached the attempt cap and were re-read for ever (measured:
+    // enrich_attempts=0 on all 37 queued pools, 22 of which already carried a recorded verdict).
+    //
+    // `enrichBlockedBy` is not a guess: it is only written when a positive control proved the lane healthy
+    // and the sub-call still failed — the chain was asked and answered "this function does not exist". That
+    // is a FACT about the contract and survives a restart. A failure with no such evidence is exactly the
+    // flaky-transport case this reset exists for, and still gets another chance.
     const r = await this.pool.query(
-      `UPDATE entities SET enrich_failed=false, enrich_attempts=0 WHERE chain_id=$1 AND kind=$2 AND enrich_failed AND enrich_pending`, [chainId, kind]
+      `UPDATE entities SET enrich_failed=false, enrich_attempts=0
+        WHERE chain_id=$1 AND kind=$2 AND enrich_failed AND enrich_pending AND NOT (meta ? 'enrichBlockedBy')`, [chainId, kind]
     );
     return r.rowCount ?? 0;
   }
