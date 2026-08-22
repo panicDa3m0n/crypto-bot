@@ -31,6 +31,7 @@ const ERC20_META_ABI = parseAbi(["function symbol() view returns (string)", "fun
 // call cannot revert, so a failure to answer it is proof about the TRANSPORT rather than about any pool.
 const MULTICALL3_PROBE_ABI = parseAbi(["function getBlockNumber() view returns (uint256)"]);
 const POOL_BATCH = 40;   // one Multicall3 covers the whole batch, so batch size is nearly free now
+const TOKEN_BATCH = 120; // decimals now go out as ONE multicall, so the batch is bounded by the lane, not by pacing
 const FAST_MS = 400;      // there's a backlog → drain quickly
 const BACKOFF_MS = 6_000; // the enrichment RPC threw a rate-limit → let the buffer WAIT, then resume
 const MAX_ATTEMPTS = 4;   // per-entity in-memory read attempts before giving up (marks checked so we don't loop forever)
@@ -304,35 +305,51 @@ export class RegistryEnricher {
     return { done, rateLimited: false };
   }
 
-  /** Fill DECIMALS (the only price-critical fact) via ONE RPC read/token on the dedicated lane — gentle
-   * enough to stay under free-tier limits — then symbol/name best-effort from Blockscout (keyless API, not
-   * the RPC), then BACKFILL price for the tokens that just got decimals. Spacing paces us under the limit. */
+  /**
+   * Fill DECIMALS — the one price-critical fact — for a whole BATCH in a single Multicall3, then backfill the
+   * USD price of whatever just got them.
+   *
+   * This used to read one token per RPC round-trip and, for each, also fetch symbol/name over HTTP before
+   * moving on. That is 12 tokens per ~90 seconds. It matters far beyond throughput: the startup gate waits for
+   * the resync set to empty, and 2,082 tokens at that rate is 4.3 hours during which NOTHING downstream starts.
+   * `enrichPools` in this same file already had the right shape, so this is that idiom applied here rather
+   * than a new mechanism. Symbol/name are not price-critical and already have their own pass, so they are no
+   * longer interleaved into the critical one — mixing a readability lookup into it is what made it serial.
+   */
   private async enrichTokens(block: number | null): Promise<{ done: number; rateLimited: boolean }> {
-    const need = await this.db.entitiesNeedingDecimals(this.config.CHAIN_ID, this.config.ENRICH_BATCH).catch(() => []);
+    const need = await this.db.entitiesNeedingDecimals(this.config.CHAIN_ID, TOKEN_BATCH).catch(() => []);
     if (!need.length) return { done: 0, rateLimited: false };
+    const mcClient = this.bulkClient(); // batched multicalls need a multicall-capable lane, not the single-read one
+    const contracts = need.map((e) => ({ address: e.address as Address, abi: ERC20_META_ABI, functionName: "decimals" as const }));
+    let res: Array<{ status: string; result?: unknown }> = [];
+    try {
+      res = await mcClient.multicall({ contracts, multicallAddress: MULTICALL3, allowFailure: true }) as Array<{ status: string; result?: unknown }>; // db-first-allow: write-side enrichment
+    } catch (err) {
+      if (isRateLimit(err)) { this.chain.laneError("enrichment", err); return { done: 0, rateLimited: true }; }
+      this.logger.warn({ err, batch: need.length }, "token decimals batch failed — no token judged");
+      return { done: 0, rateLimited: false };
+    }
+    // Same positive control as the pool batch: an all-failed batch is ambiguous between a dead lane and a batch
+    // of contracts that genuinely do not answer, so ask something that cannot revert before judging anyone.
+    const anySuccess = res.some((r) => r?.status === "success");
+    const laneAlive = anySuccess || await mcClient.readContract({ address: MULTICALL3, abi: MULTICALL3_PROBE_ABI, functionName: "getBlockNumber" }).then(() => true).catch(() => false);
     let done = 0; const gotDecimals: string[] = [];
-    for (const e of need) {
-      try {
-        const dc = await this.chain.enrichment.readContract({ address: e.address as Address, abi: ERC20_META_ABI, functionName: "decimals" }) as number | bigint;
-        const decimals = dc != null && Number.isFinite(Number(dc)) && Number(dc) >= 0 && Number(dc) <= 36 ? Number(dc) : undefined;
-        if (decimals != null) {
-          // symbol/name are NOT price-critical — take them from Blockscout (keyless), off the RPC lane.
-          const info = this.blockscout.available ? await this.blockscout.tokenInfo(e.address).catch(() => null) : null;
-          const symbol = info?.symbol && info.symbol !== "?" ? info.symbol.slice(0, 32) : undefined;
-          // Writing decimals flips `enrich_pending` false automatically (generated) + advances updated_block.
-          await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.address, kind: "token", symbol, name: info?.name?.slice(0, 96), decimals, source: "enricher", block: block ?? undefined }).catch(() => undefined);
-          if (symbol) await this.db.mergeEntityMeta(this.config.CHAIN_ID, e.address, "token", { symbolCheckedAt: new Date().toISOString() }).catch(() => undefined);
-          gotDecimals.push(e.address); done += 1;
-        } else { await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, e.address, "token", block, MAX_ATTEMPTS).catch(() => undefined); }
-      } catch (err) {
-        if (isRateLimit(err)) { this.chain.laneError("enrichment", err); return { done, rateLimited: true }; }
+    for (let i = 0; i < need.length; i++) {
+      const e = need[i], r = res[i];
+      const dc = r?.status === "success" ? r.result as number | bigint : null;
+      const decimals = dc != null && Number.isFinite(Number(dc)) && Number(dc) >= 0 && Number(dc) <= 36 ? Number(dc) : undefined;
+      if (decimals != null) {
+        // Writing decimals flips `enrich_pending` false automatically (generated) + advances updated_block.
+        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.address, kind: "token", decimals, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+        gotDecimals.push(e.address); done += 1;
+      } else if (laneAlive) {
+        // The transport is proven, so a non-answer is about THIS contract: count it, and let the cap apply.
         await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, e.address, "token", block, MAX_ATTEMPTS).catch(() => undefined);
       }
-      await this.pace();
     }
     // Backfill USD price for the freshly-decimalled tokens from the stored pool_state (no RPC).
     if (gotDecimals.length && this.reprice) await this.reprice(gotDecimals).catch(() => undefined);
-    if (done) this.logger.info({ filled: done, backfilled: gotDecimals.length }, "tokens enriched (dedicated RPC)");
+    if (done) this.logger.info({ filled: done, of: need.length, backfilled: gotDecimals.length }, "token decimals enriched (batched)");
     return { done, rateLimited: false };
   }
 
@@ -345,24 +362,53 @@ export class RegistryEnricher {
   private async enrichAeroStable(block: number | null): Promise<{ done: number; rateLimited: boolean }> {
     const batch = await this.db.poolsNeedingStableCheck(this.config.CHAIN_ID, this.config.ENRICH_BATCH).catch(() => [] as string[]);
     if (!batch.length) return { done: 0, rateLimited: false };
-    let done = 0;
-    for (const pool of batch) {
-      try {
-        const isStable = await this.chain.enrichment.readContract({ address: pool as Address, abi: AERO_STABLE_ABI, functionName: "stable" }) as boolean;
-        if (isStable) {
-          const factory = ((await this.chain.enrichment.readContract({ address: pool as Address, abi: POOL_META_ABI, functionName: "factory" })) as string).toLowerCase();
-          const feeRaw = await this.chain.enrichment.readContract({ address: factory as Address, abi: AERO_FACTORY_FEE_ABI, functionName: "getFee", args: [pool as Address, true] }) as bigint;
-          await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "aerodrome-stable", fee: Number(feeRaw) * 100, factory, stableChecked: block ?? 0 }).catch(() => undefined);
-        } else {
-          await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "aerodrome", stableChecked: block ?? 0 }).catch(() => undefined);
-        }
-        done += 1;
-      } catch (e) {
-        if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done, rateLimited: true }; }
-        await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { stableChecked: block ?? 0 }).catch(() => undefined); // mark so we don't retry forever
-      }
-      await this.pace();
+    // TWO multicalls, not 3N round-trips: stable+factory for the whole batch, then getFee only for the pools
+    // that came back stable. The reads are dependent (the fee lives on the pool's factory), which is why it
+    // was written as a serial chain — but a dependency between STAGES does not require one round-trip per POOL.
+    const mc = this.bulkClient();
+    const probe = batch.flatMap((pool) => [
+      { address: pool as Address, abi: AERO_STABLE_ABI, functionName: "stable" as const },
+      { address: pool as Address, abi: POOL_META_ABI, functionName: "factory" as const },
+    ]);
+    let pr: Array<{ status: string; result?: unknown }>;
+    try {
+      pr = await mc.multicall({ contracts: probe, multicallAddress: MULTICALL3, allowFailure: true }) as Array<{ status: string; result?: unknown }>; // db-first-allow: write-side enrichment
+    } catch (e) {
+      if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: 0, rateLimited: true }; }
+      this.logger.warn({ err: e, batch: batch.length }, "aerodrome stable probe failed — no pool judged");
+      return { done: 0, rateLimited: false };
     }
+    const stables: Array<{ pool: string; factory: string }> = [];
+    const volatiles: string[] = [];
+    const unanswered: string[] = [];
+    batch.forEach((pool, i) => {
+      const s = pr[2 * i], f = pr[2 * i + 1];
+      if (s?.status !== "success") { unanswered.push(pool); return; }
+      if (!s.result) { volatiles.push(pool); return; }
+      if (f?.status === "success" && f.result) stables.push({ pool, factory: String(f.result).toLowerCase() });
+      else unanswered.push(pool); // stable but its factory is unreadable → the fee is unobtainable, retry later
+    });
+    let fees: Array<{ status: string; result?: unknown }> = [];
+    if (stables.length) {
+      fees = await mc.multicall({
+        contracts: stables.map((s) => ({ address: s.factory as Address, abi: AERO_FACTORY_FEE_ABI, functionName: "getFee" as const, args: [s.pool as Address, true] })),
+        multicallAddress: MULTICALL3, allowFailure: true,
+      }).catch(() => [] as Array<{ status: string; result?: unknown }>) as Array<{ status: string; result?: unknown }>; // db-first-allow: write-side enrichment
+    }
+    let done = 0;
+    for (let i = 0; i < stables.length; i++) {
+      const { pool, factory } = stables[i], r = fees[i];
+      // The exact stable math needs a REAL fee — never a guessed one — so a pool whose fee did not answer is
+      // left unmarked and retried, not written with a placeholder.
+      if (r?.status !== "success") continue;
+      await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "aerodrome-stable", fee: Number(r.result as bigint) * 100, factory, stableChecked: block ?? 0 }).catch(() => undefined);
+      done += 1;
+    }
+    for (const pool of volatiles) {
+      await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "aerodrome", stableChecked: block ?? 0 }).catch(() => undefined);
+      done += 1;
+    }
+    if (unanswered.length) this.logger.debug({ unanswered: unanswered.length }, "aerodrome stable: pools left unmarked for retry");
     return { done, rateLimited: false };
   }
 
