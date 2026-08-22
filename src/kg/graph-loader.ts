@@ -1,5 +1,6 @@
 import type { Database } from "../db.js";
 import type { PoolState, Archetype } from "../router/types.js";
+import { CONCENTRATED as CONC, MODELABLE } from "../archetypes.js";
 
 /**
  * FULL LIQUIDITY GRAPH LOADER (Item 4.1) — the DB-only foundation of the KG Reality Observatory. Loads the
@@ -14,8 +15,6 @@ import type { PoolState, Archetype } from "../router/types.js";
 
 // Everything we surface. Modelable-by-buildPoolSim = v2/aerodrome (CP) + aerodrome-stable + v3/slipstream.
 const GRAPH_ARCHETYPES = ["v2", "aerodrome", "aerodrome-stable", "solidly", "v3", "slipstream"];
-const CONC = new Set<Archetype>(["v3", "v4", "slipstream"]);
-const MODELABLE = new Set(["v2", "aerodrome", "aerodrome-stable", "v3", "slipstream"]);
 
 export interface GraphStats {
   poolsTotal: number;      // pools loaded (edges)

@@ -1,4 +1,5 @@
 import { getSqrtRatioAtTick, getTickAtSqrtRatio, MIN_TICK, MAX_TICK, Q96 } from "./tick-math.js";
+import { tickSpacingFor } from "../archetypes.js";
 
 /**
  * EXACT Uniswap-V3 swap simulation — walks the price across initialized ticks using our indexed state
@@ -90,9 +91,9 @@ function tickIndexOf(ticks: ReadonlyArray<{ tick: number; liquidityNet: bigint }
   return idx;
 }
 
-// Fallback tickSpacing by fee tier (canonical Uniswap) — used only if the caller omits pool.tickSpacing; a
-// fork with a non-standard spacing MUST pass it explicitly or the word-boundary walk (below) will be wrong.
-const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
+// tickSpacing comes from the single source of truth (src/archetypes.ts). A fork with non-standard spacing
+// MUST pass its own, or the word-boundary walk below is wrong — which is why the shared helper returns
+// undefined rather than a plausible number when it does not know.
 
 /**
  * CERTIFIED-EXACTNESS ENVELOPE (Item 3). The word-boundary walk reproduces QuoterV2 bit-for-bit well past 720
@@ -127,7 +128,8 @@ export function simulateExactInputStateful(pool: V3PoolSim, zeroForOne: boolean,
   if (amountIn <= 0n || pool.sqrtPriceX96 <= 0n || pool.liquidity <= 0n) return null;
   const { netAt, ascTicks } = tickIndexOf(pool.ticks);
 
-  const tickSpacing = pool.tickSpacing && pool.tickSpacing > 0 ? pool.tickSpacing : (FEE_TO_SPACING[pool.feePips] ?? 1);
+  const tickSpacing = tickSpacingFor(pool.tickSpacing, pool.feePips);
+  if (tickSpacing == null) return null; // unknown spacing ⇒ the walk cannot be exact; refuse instead of guessing 1
   let sqrtP = pool.sqrtPriceX96;
   let L = pool.liquidity;
   let tick = pool.tick ?? getTickAtSqrtRatio(sqrtP);

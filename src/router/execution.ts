@@ -1,4 +1,5 @@
 import { encodeFunctionData, parseAbi, type Address, type Hex } from "viem";
+import { resolveFeePpm } from "../archetypes.js";
 
 /**
  * OWN EXECUTION — turn a chosen local route into venue-router calldata, so WE broadcast the swap
@@ -61,7 +62,9 @@ export interface ExecParams {
 }
 
 /** Build the router call (to/calldata/value) for a single-hop swap on the given venue. */
-export function buildExec(p: ExecParams): ExecCall {
+/** Returns NULL when the swap cannot be encoded truthfully (today: an unknown fee tier — the tier is part of
+ * the V3 path, so guessing it would target a DIFFERENT pool than the one that was quoted). */
+export function buildExec(p: ExecParams): ExecCall | null {
   if (p.venue === "slipstream") return buildSlipstream(p);
   if (p.venue === "v3") return buildV3(p);
   return buildSolidlyOrV2(p);
@@ -84,8 +87,10 @@ function buildSlipstream(p: ExecParams): ExecCall {
   return { to: p.router, calldata, value: p.nativeIn ? p.amountIn : 0n };
 }
 
-function buildV3(p: ExecParams): ExecCall {
-  const fee = p.feePpm && p.feePpm > 0 ? p.feePpm : 3000;
+function buildV3(p: ExecParams): ExecCall | null {
+  // Encoding a swap with an invented fee tier targets the WRONG pool: the tier is part of the V3 path.
+  const fee = resolveFeePpm(p.feePpm);
+  if (fee == null) return null;
   if (p.nativeOut) {
     // token → WETH into the router, then unwrap the WETH to owner with the min-out enforced there.
     const swap = encodeFunctionData({ abi: V3_ABI, functionName: "exactInputSingle", args: [{ tokenIn: p.tokenIn, tokenOut: p.weth, fee, recipient: ADDRESS_THIS, amountIn: p.amountIn, amountOutMinimum: 0n, sqrtPriceLimitX96: 0n }] });

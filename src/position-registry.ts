@@ -425,7 +425,10 @@ export class PositionRegistry {
         const meta = (pos.meta ?? {}) as Record<string, unknown>;
         const collRaw = String(meta.collateralRaw ?? "0");
         const debtRaw = String(meta.debtRaw ?? "0");
-        const loanDec = Number(meta.loanDecimals ?? 18);
+        // Decimals scale the profit figure. A 6-decimal loan token read as 18 misstates it by 10^12, so an
+        // unknown one means we cannot judge this position — we reschedule it instead of deciding on a guess.
+        const loanDec = Number(meta.loanDecimals);
+        if (!Number.isFinite(loanDec)) { await this.reschedule(pos.protocol, pos.marketId, pos.borrower, pos.tier, hf); continue; }
         if (!(pos.collateralToken && pos.loanToken && BigInt(collRaw) > 0n)) { await this.reschedule(pos.protocol, pos.marketId, pos.borrower, pos.tier, hf); continue; }
         const exit = await this.exitValue(pos.collateralToken, collRaw, pos.collateralUsd ?? 0, debtRaw, debt, pos.lltv ?? 0.9, pos.loanToken, memo);
         if (exit.status === "error") { await this.reschedule(pos.protocol, pos.marketId, pos.borrower, pos.tier, hf); continue; } // transient — keep prior tier
@@ -462,10 +465,14 @@ export class PositionRegistry {
       const items = j?.marketPositions?.items ?? [];
       for (const it of items) {
         const m = it.market; if (!m?.collateralAsset || !m.loanAsset) continue;
+        // The API is a SOURCE, not an authority: if it omits a decimals field we do not substitute 18 — a
+        // position we cannot size correctly is one we skip, and it stays discoverable via the indexer path.
+        const cDec = Number(m.collateralAsset?.decimals), lDec = Number(m.loanAsset?.decimals);
+        if (!Number.isFinite(cDec) || !Number.isFinite(lDec)) continue;
         out.push({
           healthFactor: Number(it.healthFactor ?? 0), user: (it.user?.address ?? "").toLowerCase(), marketId: m.marketId ?? "",
-          lltv: Number(m.lltv ?? 0) / 1e18, lltvRaw: String(m.lltv ?? "0"), collateral: { symbol: m.collateralAsset.symbol ?? "?", address: (m.collateralAsset.address ?? "").toLowerCase(), decimals: Number(m.collateralAsset.decimals ?? 18) },
-          loan: { symbol: m.loanAsset.symbol ?? "?", address: (m.loanAsset.address ?? "").toLowerCase(), decimals: Number(m.loanAsset.decimals ?? 18) }, oracle: (m.oracle?.address ?? "").toLowerCase(), irm: (m.irmAddress ?? "").toLowerCase(),
+          lltv: Number(m.lltv ?? 0) / 1e18, lltvRaw: String(m.lltv ?? "0"), collateral: { symbol: m.collateralAsset.symbol ?? "?", address: (m.collateralAsset.address ?? "").toLowerCase(), decimals: cDec },
+          loan: { symbol: m.loanAsset.symbol ?? "?", address: (m.loanAsset.address ?? "").toLowerCase(), decimals: lDec }, oracle: (m.oracle?.address ?? "").toLowerCase(), irm: (m.irmAddress ?? "").toLowerCase(),
           collateralRaw: String(it.state?.collateral ?? "0"), debtRaw: String(it.state?.borrowAssets ?? "0"), debtUsd: Number(it.state?.borrowAssetsUsd ?? 0), collateralUsd: Number(it.state?.collateralUsd ?? 0)
         });
       }

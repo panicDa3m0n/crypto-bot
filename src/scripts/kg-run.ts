@@ -21,8 +21,7 @@ import { buildPoolSim, sizeCycle } from "../kg/kernel.js";
 import { PoolSim } from "../kg/state.js";
 import { evaluateExecutable, type GateContext } from "../kg/opportunity.js";
 import { encodeCycle } from "../kg/encode.js";
-
-const CONC = new Set<Archetype>(["v3", "v4", "slipstream"]);
+import { CONCENTRATED as CONC } from "../archetypes.js";
 // Execution-risk params (env-overridable; move to config when wired into the live engine).
 const MAX_EXECUTION_LAG_BLOCKS = Number(process.env.KG_MAX_EXECUTION_LAG_BLOCKS ?? 3);
 const EXEC_MIN_PROFIT_BPS = Number(process.env.KG_EXEC_MIN_PROFIT_BPS ?? 7000); // keep ≥70% of predicted gross on-chain

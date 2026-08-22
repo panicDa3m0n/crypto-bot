@@ -3,6 +3,7 @@ import type { PoolState, Archetype } from "../router/types.js";
 import type { LiquidityGraph } from "./graph-loader.js";
 import { PoolSim } from "./state.js";
 import { buildPoolSim } from "./kernel.js";
+import { CONCENTRATED as CONC, MODELABLE } from "../archetypes.js";
 
 /**
  * SHARED VALUE/PATH SURFACE PRIMITIVE (Item 7) — the one economic-evaluation core under BOTH Pair Surface and
@@ -12,9 +13,6 @@ import { buildPoolSim } from "./kernel.js";
  * exact for compounding), and always tracking simulationExact + encodability + blacklist. Detectors are just
  * different VIEWS over this: Pair Surface reads venue-by-venue on one pair; Best Exit reads token→numéraire.
  */
-
-const CONC = new Set<Archetype>(["v3", "v4", "slipstream"]);
-const MODELABLE = new Set(["v2", "aerodrome", "aerodrome-stable", "v3", "slipstream"]);
 
 export interface PathQuotePoint {
   amountIn: bigint;

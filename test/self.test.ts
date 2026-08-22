@@ -30,15 +30,29 @@ describe("Scarlet self-model", () => {
     expect(self.temperament).toBe("exploit");
   });
 
-  it("is sated and set to explore once net worth exceeds the runway target", () => {
-    const self = selfState({ ...base, estimatedNavUsd: 12 }, config);
-    expect(self.hunger).toBe(0);
-    expect(self.temperament).toBe("explore");
+  // These two used to assert a RUNWAY model (sated once NAV passed HONEY_RUNWAY_TARGET). The self-model was
+  // deliberately changed to MILESTONE-based levelling — hunger is progress toward the next rung of
+  // PROFIT_MILESTONES (default 100,250,500,…), not distance from a survival runway — and the tests were left
+  // asserting the old design, so they had been red ever since. They now describe what the model actually does.
+  it("is hungry just after clearing a milestone, because the next rung is far", () => {
+    const self = selfState({ ...base, estimatedNavUsd: 110 }, config); // just past the 100 rung, next is 250
+    expect(self.level).toBe(2);
+    expect(self.nextMilestoneUsd).toBe(250);
+    expect(self.hunger).toBeGreaterThan(0.66);
+    expect(self.temperament).toBe("exploit");
   });
 
-  it("is balanced at a mid net worth", () => {
-    const self = selfState({ ...base, estimatedNavUsd: 5 }, config);
+  it("is balanced halfway between two milestones", () => {
+    const self = selfState({ ...base, estimatedNavUsd: 175 }, config); // midpoint of 100 → 250
+    expect(self.xpToNextPct).toBeCloseTo(50, 0);
     expect(self.temperament).toBe("balanced");
+  });
+
+  it("is sated only once every milestone is behind it", () => {
+    const self = selfState({ ...base, estimatedNavUsd: 200_000 }, config); // past the last rung
+    expect(self.nextMilestoneUsd).toBeNull();
+    expect(self.hunger).toBe(0);
+    expect(self.temperament).toBe("explore");
   });
 
   it("loses energy health when native BERA falls below the gas floor", () => {

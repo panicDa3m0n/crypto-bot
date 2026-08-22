@@ -1,4 +1,5 @@
 import type { PoolState } from "../router/types.js";
+import { CONSTANT_PRODUCT, STABLE_CURVE, CONCENTRATED, resolveFeePpm, tickSpacingFor } from "../archetypes.js";
 import { getTickAtSqrtRatio } from "../router/tick-math.js";
 import { PoolSim, V2PoolSim, V3PoolSim, StablePoolSim, VenueSnapshot, PortfolioState, type StateVersion, type SimulationState, type AssetId, type SwapTrace } from "./state.js";
 import { SwapOp, FlashBorrowOp, FlashRepayOp, LiquidateOp, type Transformation } from "./operators.js";
@@ -13,25 +14,39 @@ import { LendingSnapshot, BorrowerPositionSim, LendingMarketSim, computeLiquidat
  */
 
 // ── PoolState → mutable PoolSim ──────────────────────────────────────────────
-const CP_ARCH = new Set(["v2", "aerodrome"]);
 
-/** Build a mutable simulator for a mirrored pool. `ticks` (from db.tickLiquidity) makes V3 exact across
- * tick boundaries; without them a V3 pool is single-tick (only safe for small sizes). Returns null if the
- * pool's state is missing. */
+/**
+ * Build a mutable simulator for a mirrored pool, or NULL when we cannot honestly simulate it.
+ *
+ * Two things changed here and both matter more than they look:
+ *
+ * 1. NO GUESSED FEE. `fee || 3000` turned an unknown fee into 0.30% in every branch but one. On a strategy
+ *    whose edge is basis points that does not produce a rough answer, it produces a confident wrong one —
+ *    and it hid a real data hole, because a pool that cannot state its fee looks fine. The stable branch
+ *    already refused to guess; that is now the rule. A missing fee is enrichment work.
+ * 2. NO FALLTHROUGH. The last branch used to be "anything else is V3", so `solidly`, `unknown` and `v4` all
+ *    landed on concentrated-liquidity math. It happened to return null for reserve-shaped pools only because
+ *    they have no sqrtPrice — an accident, not a decision. SolidlyV3 pools are both concentrated AND
+ *    sqrtPrice-bearing, so that accident was about to stop protecting us. Membership is now explicit.
+ */
 export function buildPoolSim(p: PoolState, ticks?: Array<{ tick: number; liquidityNet: bigint }>): PoolSim | null {
-  const fee = p.feePpm > 0 ? p.feePpm : 0;
-  if (CP_ARCH.has(p.archetype)) {
+  const fee = resolveFeePpm(p.feePpm);
+  if (fee == null) return null; // unknown fee ⇒ unquotable, in every family
+  if (CONSTANT_PRODUCT.has(p.archetype)) {
     if (p.r0 == null || p.r1 == null || p.r0 <= 0n || p.r1 <= 0n) return null;
-    return new V2PoolSim(p.address.toLowerCase(), p.token0, p.token1, p.r0, p.r1, fee || 3000, p.archetype);
+    return new V2PoolSim(p.address.toLowerCase(), p.token0, p.token1, p.r0, p.r1, fee, p.archetype);
   }
-  if (p.archetype === "aerodrome-stable") {
-    // Stable (x³y+xy³=k): FAIL-CLOSED — needs reserves + BOTH token decimal scales + a real fee (never
-    // guess a fee on a small-edge strategy). fee is carried as ppm (= factory bps × 100).
-    if (p.r0 == null || p.r1 == null || p.r0 <= 0n || p.r1 <= 0n || p.dec0 == null || p.dec1 == null || fee <= 0) return null;
+  if (STABLE_CURVE.has(p.archetype)) {
+    // Stable (x³y+xy³=k) additionally needs BOTH token decimal scales. fee is ppm (= factory bps × 100).
+    if (p.r0 == null || p.r1 == null || p.r0 <= 0n || p.r1 <= 0n || p.dec0 == null || p.dec1 == null) return null;
     return new StablePoolSim(p.address.toLowerCase(), p.token0, p.token1, p.r0, p.r1, p.dec0, p.dec1, fee / 100, "aerodrome-stable");
   }
+  if (!CONCENTRATED.has(p.archetype)) return null; // an unmodelled family is surfaced elsewhere, never quoted
   if (p.sqrtPriceX96 == null || p.liquidity == null || p.sqrtPriceX96 <= 0n || p.liquidity <= 0n) return null;
-  return new V3PoolSim(p.address.toLowerCase(), p.token0, p.token1, p.sqrtPriceX96, p.liquidity, getTickAtSqrtRatio(p.sqrtPriceX96), fee || 3000, ticks ?? [], p.archetype, p.tickCoverage === "complete" ? "complete" : "partial", p.tickSpacing ?? 0);
+  // A wrong tickSpacing silently corrupts the word-boundary walk, so an unknown one is refused too.
+  const spacing = tickSpacingFor(p.tickSpacing, fee);
+  if (spacing == null) return null;
+  return new V3PoolSim(p.address.toLowerCase(), p.token0, p.token1, p.sqrtPriceX96, p.liquidity, getTickAtSqrtRatio(p.sqrtPriceX96), fee, ticks ?? [], p.archetype, p.tickCoverage === "complete" ? "complete" : "partial", spacing);
 }
 
 /** Assemble an immutable snapshot from PoolSims. */

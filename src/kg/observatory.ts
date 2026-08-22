@@ -6,6 +6,7 @@ import { PoolSim, type SwapTrace } from "./state.js";
 import { buildPoolSim, sizeCycle } from "./kernel.js";
 import { findNegativeCycles, type KGCycle, type KGEdge } from "./cycle-finder.js";
 import { evaluateExecutable, type GateContext } from "./opportunity.js";
+import { CONCENTRATED as CONC, MODELABLE } from "../archetypes.js";
 
 /**
  * KG OPPORTUNITY OBSERVATORY (Item 4.2) — reads the ONE full liquidity graph many different ways and turns
@@ -16,9 +17,6 @@ import { evaluateExecutable, type GateContext } from "./opportunity.js";
  * Every candidate flows the same pipeline: exact simulation → economic gate (DB-first gas) → lifecycle row.
  * READ-ONLY: no chain RPC; gas comes from gas_state (a write-side poller fills it).
  */
-
-const CONC = new Set<Archetype>(["v3", "v4", "slipstream"]);
-const MODELABLE = new Set(["v2", "aerodrome", "aerodrome-stable", "v3", "slipstream"]);
 
 /** Compact deterministic hash (djb2 → hex) — for the candidate state fingerprint, not security. */
 function hash(s: string): string { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(16); }
@@ -82,7 +80,7 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
     flashFundable: new Set([weth, usdc]),
     gasPriceWei, ethUsd,
     numeraireUsd: (t) => t === usdc ? 1 : t === weth ? ethUsd : null,
-    decimalsOf: (t) => t === weth ? 18 : t === usdc ? 6 : (graph.decimals.get(t) ?? 18),
+    decimalsOf: (t) => t === weth ? 18 : t === usdc ? 6 : (graph.decimals.get(t) ?? null),
     minNetUsd: 0.01, safetyUsd: 0.005, flashFeeBps: 0,
     execMinProfitBps: 7000, lag: graph.lag, maxLagBlocks: 3,
   };

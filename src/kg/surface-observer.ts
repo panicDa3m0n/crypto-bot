@@ -3,6 +3,7 @@ import type { Config } from "../config.js";
 import type { LiquidityGraph } from "./graph-loader.js";
 import type { SurfaceContext } from "./path-surface.js";
 import { pairSurface, bestExitSurface } from "./surfaces.js";
+import { MODELABLE } from "../archetypes.js";
 
 /**
  * SURFACE OBSERVER (Item 7 steps 3/5/6) — turns the surface detectors into a permanent economic-intelligence
@@ -28,7 +29,6 @@ export async function runSurfaces(db: Database, config: Config, graph: Liquidity
   const cid = config.CHAIN_ID, block = graph.head;
   const deadline = Date.now() + (opts.budgetMs ?? DEFAULT_BUDGET_MS);
   const weth = config.WBERA_ADDRESS.toLowerCase(), usdc = config.USDC_E_ADDRESS.toLowerCase();
-  const MODELABLE = new Set(["v2", "aerodrome", "aerodrome-stable", "v3", "slipstream"]);
 
   // ── target selection (bounded) ──
   const byPair = new Map<string, Set<string>>();

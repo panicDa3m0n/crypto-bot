@@ -61,7 +61,8 @@ export class V2PoolSim extends PoolSim {
   ) { super(); }
 
   private amountOut(rIn: bigint, rOut: bigint, amountIn: bigint): bigint {
-    const fee = this.feePpm > 0 && this.feePpm < 1_000_000 ? BigInt(Math.round(this.feePpm)) : 3000n;
+    // A sim is only built with a resolved fee (buildPoolSim refuses otherwise), so this is a guard, not a default.
+    const fee = BigInt(Math.round(this.feePpm));
     const inWithFee = amountIn * (1_000_000n - fee);
     return (inWithFee * rOut) / (rIn * 1_000_000n + inWithFee);
   }
@@ -99,7 +100,7 @@ export class V3PoolSim extends PoolSim {
 
   private sim(tokenIn: string, amountIn: bigint) {
     const zeroForOne = tokenIn.toLowerCase() === this.token0;
-    const r = simulateExactInputStateful({ sqrtPriceX96: this.sqrtPriceX96, liquidity: this.liquidity, tick: this.tick, feePips: this.feePpm > 0 ? this.feePpm : 3000, tickSpacing: this.tickSpacing, ticks: this.ticks }, zeroForOne, amountIn);
+    const r = simulateExactInputStateful({ sqrtPriceX96: this.sqrtPriceX96, liquidity: this.liquidity, tick: this.tick, feePips: this.feePpm, tickSpacing: this.tickSpacing, ticks: this.ticks }, zeroForOne, amountIn);
     return r;
   }
 

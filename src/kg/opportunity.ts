@@ -19,7 +19,9 @@ export interface GateContext {
   gasPriceWei: bigint;
   ethUsd: number;
   numeraireUsd: (token: AssetId) => number | null; // USD per 1 whole token; null if unpriceable
-  decimalsOf: (token: AssetId) => number;
+  /** NULL when the token's decimals are unknown. They scale the PnL, so guessing 18 for a 6-decimal token
+   * misreports profit by a factor of 10^12 — an unknowable amount must stay unknowable. */
+  decimalsOf: (token: AssetId) => number | null;
   minNetUsd: number;                          // executability threshold
   safetyUsd: number;                          // margin subtracted (adverse selection / slippage buffer)
   flashFeeBps: number;                        // provider fee (Morpho = 0)
@@ -51,6 +53,10 @@ export interface ExecutableOpportunity {
 export function evaluateExecutable(sized: SizedCycle, ctx: GateContext): ExecutableOpportunity {
   const num = sized.numeraire.toLowerCase();
   const dec = ctx.decimalsOf(num);
+  if (dec == null) {
+    return { grossPnlUsd: null, netPnlUsd: null, gasCostUsd: 0, economicEdge: false, executable: false,
+      rejectionReason: `numeraire decimals unknown (${num.slice(0, 10)}…) — cannot value this cycle`, sized } as ExecutableOpportunity;
+  }
   const numUsd = ctx.numeraireUsd(num);
   const grossHuman = Number(sized.realizedPnl) / 10 ** dec;
   const amountHuman = Number(sized.amountIn) / 10 ** dec;

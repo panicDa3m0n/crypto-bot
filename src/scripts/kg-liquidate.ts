@@ -24,8 +24,7 @@ import { LendingMarketSim, BorrowerPositionSim, LendingSnapshot, posKey, compute
 import { buildPoolSim, makeSnapshot, planFlashLiquidation, simulateFlashLiquidation, type ExitHop } from "../kg/kernel.js";
 import { PoolSim, type SwapTrace } from "../kg/state.js";
 import { encodeLiquidationPlan } from "../kg/encode.js";
-
-const CONC = new Set<Archetype>(["v3", "v4", "slipstream"]);
+import { CONCENTRATED as CONC } from "../archetypes.js";
 const ADAPTERS = [new ConstantProductAdapter(), new V3Adapter(), new StableAdapter()];
 const AERO_POOL_ABI = parseAbi([
   "function getReserves() view returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast)",

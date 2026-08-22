@@ -1,5 +1,6 @@
 import type { PoolState, Archetype } from "../router/types.js";
 import { stableProbe } from "../router/solidly-math.js";
+import { resolveFeePpm } from "../archetypes.js";
 
 /**
  * KG CYCLE-FINDER (Liquidity-Graph, phase F1 — the detector). We model the mirrored pool universe as a
@@ -56,9 +57,12 @@ function rawReserves(p: PoolState): { r0: bigint; r1: bigint } | null {
   return r0 > 0n && r1 > 0n ? { r0, r1 } : null;
 }
 
-/** ln of the marginal fee-adjusted rate (raw wei out per wei in) = ln(rOut/rIn) + ln(1−fee). */
-function lnMarginal(rIn: bigint, rOut: bigint, feePpm: number): number {
-  const fee = feePpm > 0 && feePpm < 1_000_000 ? feePpm : 3000;
+/** ln of the marginal fee-adjusted rate (raw wei out per wei in) = ln(rOut/rIn) + ln(1−fee).
+ * NULL when the fee is unknown: an edge whose cost cannot be stated must not enter the search with an
+ * invented one — it would be ranked against edges whose cost IS known, and win on a fiction. */
+function lnMarginal(rIn: bigint, rOut: bigint, feePpm: number): number | null {
+  const fee = resolveFeePpm(feePpm);
+  if (fee == null) return null;
   return lnBig(rOut) - lnBig(rIn) + Math.log((1_000_000 - fee) / 1_000_000);
 }
 
@@ -68,11 +72,14 @@ export function buildEdges(pools: PoolState[]): KGEdge[] {
   for (const p of pools) {
     if (!p.token0 || !p.token1) continue;
     const t0 = p.token0.toLowerCase(), t1 = p.token1.toLowerCase();
-    const fee = p.feePpm;
+    // An edge whose FEE is unknown carries no usable cost. Admitting it with an invented 0.30% would let it
+    // compete against edges whose cost is real and win on a fiction, so it simply is not an edge.
+    const fee = resolveFeePpm(p.feePpm);
+    if (fee == null) continue;
     const id = p.address.toLowerCase();
     if (p.archetype === "aerodrome-stable") {
       // Stable curve: reserve ratio ≠ marginal rate → probe the exact math. FAIL-CLOSED without dec/fee.
-      if (p.r0 == null || p.r1 == null || p.r0 <= 0n || p.r1 <= 0n || p.dec0 == null || p.dec1 == null || fee <= 0) continue;
+      if (p.r0 == null || p.r1 == null || p.r0 <= 0n || p.r1 <= 0n || p.dec0 == null || p.dec1 == null) continue;
       const bps = fee / 100;
       const a = stableProbe(p.r0, p.r1, p.dec0, p.dec1, bps, true);
       const b = stableProbe(p.r0, p.r1, p.dec0, p.dec1, bps, false);
@@ -82,8 +89,9 @@ export function buildEdges(pools: PoolState[]): KGEdge[] {
     }
     const rr = rawReserves(p);
     if (!rr) continue;
-    edges.push({ pool: id, archetype: p.archetype, from: t0, to: t1, feePpm: fee, lnRate: lnMarginal(rr.r0, rr.r1, fee), state: p });
-    edges.push({ pool: id, archetype: p.archetype, from: t1, to: t0, feePpm: fee, lnRate: lnMarginal(rr.r1, rr.r0, fee), state: p });
+    const ab = lnMarginal(rr.r0, rr.r1, fee), ba = lnMarginal(rr.r1, rr.r0, fee);
+    if (ab != null) edges.push({ pool: id, archetype: p.archetype, from: t0, to: t1, feePpm: fee, lnRate: ab, state: p });
+    if (ba != null) edges.push({ pool: id, archetype: p.archetype, from: t1, to: t0, feePpm: fee, lnRate: ba, state: p });
   }
   return edges;
 }

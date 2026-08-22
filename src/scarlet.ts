@@ -185,11 +185,14 @@ export class Scarlet {
         case "flash_liquidate": {
           const req = ["organ", "loanToken", "collateralToken", "oracle", "irm", "lltv", "borrower", "seizedAssets", "flashAmount"].filter((k) => !args[k]);
           if (req.length) return { ok: false, reason: `missing: ${req.join(", ")} (organ from briefing.organ; marketParams+borrower from signals; seizedAssets/flashAmount are base-unit amounts you size)` };
+          // The swap fee tier selects WHICH pool the seized collateral is sold through. Defaulting it sent the
+          // trade to a pool the caller never chose, so it is required: an omitted tier is a caller error.
+          if (args.swapFeeBps == null || !Number.isFinite(Number(args.swapFeeBps))) return { ok: false, reason: "swapFeeBps is required — the fee tier selects the exit pool and must not be defaulted" };
           try {
             return await this.primitives.flashLiquidate({
               organ: getAddress(String(args.organ).toLowerCase()), loanToken: getAddress(String(args.loanToken).toLowerCase()), collateralToken: getAddress(String(args.collateralToken).toLowerCase()),
               oracle: getAddress(String(args.oracle).toLowerCase()), irm: getAddress(String(args.irm).toLowerCase()), lltv: String(args.lltv), borrower: getAddress(String(args.borrower).toLowerCase()),
-              seizedAssets: BigInt(String(args.seizedAssets)), flashAmount: BigInt(String(args.flashAmount)), swapFeeBps: Number(args.swapFeeBps ?? 3000), minProfitWei: BigInt(String(args.minProfit ?? "0"))
+              seizedAssets: BigInt(String(args.seizedAssets)), flashAmount: BigInt(String(args.flashAmount)), swapFeeBps: Number(args.swapFeeBps), minProfitWei: BigInt(String(args.minProfit ?? "0"))
             }, args.execute === true);
           } catch (error) { return { ok: false, reason: error instanceof Error ? error.message : "flash_liquidate failed" }; }
         }

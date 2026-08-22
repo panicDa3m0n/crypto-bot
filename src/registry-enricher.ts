@@ -8,9 +8,9 @@ import type { Etherscan } from "./etherscan.js";
 import type { Blockscout } from "./blockscout.js";
 import { UNIV3_MINT, UNIV3_BURN, POOL_CREATED, V4_MODIFY_LIQUIDITY, EVENT_DECODERS, type RawLog } from "./indexer/events.js";
 import { scanTickMap, validateSnapshotVsQuoter, tickStorageProfile, bitmapWordRange, MULTICALL3 } from "./router/tick-storage.js";
+import { tickSpacingFor } from "./archetypes.js";
 
 const UNIV3_QUOTER_BASE = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a" as Address; // Uniswap V3 QuoterV2 on Base
-const FEE_TO_SPACING: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 }; // 2500=Pancake tier
 const STORAGE_SCAN_INTERVAL_MS = 15_000; // heavy last-resort path (Pinax reliable lane) — bound its cadence
 const GAS_POLL_INTERVAL_MS = 20_000;     // DB-first gas: write-side poller cadence (read-side reads gas_state)
 const DEX_IDENTITY_INTERVAL_MS = 120_000; // factory identity barely changes; its queries are heavy (full pool aggregate)
@@ -551,7 +551,7 @@ export class RegistryEnricher {
     const profile = tickStorageProfile(p.factory ?? undefined, { DEX_FACTORY: this.config.DEX_FACTORY, UNIV3_QUOTER: UNIV3_QUOTER_BASE });
     if (!profile?.quoter) { await this.db.failPoolTickStatus(cid, pool, "no known Quoter for fork → not storage-certifiable").catch(() => undefined); return { done: 1, rateLimited: false }; }
     const feePips = Number(p.fee) > 0 ? Number(p.fee) : 500;
-    const tickSpacing = Number(p.tickSpacing) > 0 ? Number(p.tickSpacing) : (FEE_TO_SPACING[feePips] ?? 0);
+    const tickSpacing = tickSpacingFor(Number(p.tickSpacing), feePips) ?? 0;
     if (!tickSpacing) { await this.db.failPoolTickStatus(cid, pool, "storage scan: tickSpacing unknown").catch(() => undefined); return { done: 1, rateLimited: false }; }
     try {
       const head = Number(await client.getBlockNumber().catch(() => 0n));

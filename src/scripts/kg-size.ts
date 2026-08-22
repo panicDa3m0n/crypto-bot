@@ -15,8 +15,7 @@ import type { Archetype, PoolState } from "../router/types.js";
 import { findNegativeCycles, type KGCycle } from "../kg/cycle-finder.js";
 import { buildPoolSim, sizeCycle } from "../kg/kernel.js";
 import { PoolSim } from "../kg/state.js";
-
-const CONC = new Set<Archetype>(["v3", "v4", "slipstream"]);
+import { CONCENTRATED as CONC } from "../archetypes.js";
 
 /** Rotate a cycle so it STARTS at the first preferred token present (WETH/USDC) — the real, flash-fundable
  * numéraire. Cycle product is rotation-invariant, so this only changes the entry point. */

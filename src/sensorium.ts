@@ -12,7 +12,7 @@ import { priceV3FromSqrt, priceV2FromReserves } from "./block-indexer.js";
  * of a known standard needs no new code — only a registry row. This replaces the
  * per-protocol scanners with a single organ that produces one world-model.
  */
-export type NormPool = { venueId: string; venueName: string; type: string; pool: string; pair: string; sym0: string; sym1: string; token0: string; token1: string; feeBps: number; price1per0: number; tvlUsd: number; reserve0: number; reserve1: number };
+export type NormPool = { venueId: string; venueName: string; type: string; pool: string; pair: string; sym0: string; sym1: string; token0: string; token1: string; feeBps: number | null; price1per0: number; tvlUsd: number; reserve0: number; reserve1: number };
 export type WorldModel = { observedAt: string; poolCount: number; pools: NormPool[]; arbHints: Array<{ pair: string; cheapVenue: string; dearVenue: string; spreadPct: number }> };
 
 type Tok = { address: Address; symbol: string; decimals: number };
@@ -81,14 +81,16 @@ export class Sensorium {
   /** Normalized pool from DB state. Price is exact (pool_state); TVL is exact for V2 (reserves) and a
    * virtual-reserve proxy for V3 (liquidity/sqrtPrice) — enough for the depth filter + display. */
   private normFromState(pool: string, meta: Record<string, unknown>, st: { archetype: string; r0: bigint | null; r1: bigint | null; sqrtPrice: bigint | null; liquidity: bigint | null }, t0: Tok, t1: Tok, px: Record<string, number>): NormPool | null {
-    let price1per0 = 0, reserve0 = 0, reserve1 = 0, feeBps: number;
+    let price1per0 = 0, reserve0 = 0, reserve1 = 0, feeBps: number | null;
     if (st.archetype === "v3" && st.sqrtPrice != null && st.sqrtPrice > 0n) {
       price1per0 = priceV3FromSqrt(st.sqrtPrice, t0.decimals, t1.decimals) ?? 0;
       if (st.liquidity != null && st.liquidity > 0n) { // virtual reserves
         reserve0 = Number((st.liquidity * Q96) / st.sqrtPrice) / 10 ** t0.decimals;
         reserve1 = Number((st.liquidity * st.sqrtPrice) / Q96) / 10 ** t1.decimals;
       }
-      feeBps = meta.fee != null ? Number(meta.fee) : 3000; // preserve the existing (tier-valued) convention
+      // An unknown fee stays unknown here too. This feeds the world-model the agent reads, and a pool
+      // presented with a fabricated 0.30% looks indistinguishable from one we actually measured.
+      feeBps = meta.fee != null ? Number(meta.fee) : null;
     } else if (st.r0 != null && st.r1 != null) {
       reserve0 = Number(st.r0) / 10 ** t0.decimals; reserve1 = Number(st.r1) / 10 ** t1.decimals;
       price1per0 = priceV2FromReserves(st.r0, st.r1, t0.decimals, t1.decimals) ?? 0;
@@ -123,7 +125,7 @@ function arbHints(pools: NormPool[]): WorldModel["arbHints"] {
     const sorted = [...ps].sort((a, b) => a.price1per0 - b.price1per0);
     const lo = sorted[0]; const hi = sorted[sorted.length - 1];
     const spreadPct = lo.price1per0 > 0 ? (hi.price1per0 - lo.price1per0) / lo.price1per0 * 100 : 0;
-    if (spreadPct > 0.3) hints.push({ pair, cheapVenue: `${lo.venueName} ${lo.feeBps}bps`, dearVenue: `${hi.venueName} ${hi.feeBps}bps`, spreadPct: Number(spreadPct.toFixed(3)) });
+    if (spreadPct > 0.3) hints.push({ pair, cheapVenue: `${lo.venueName} ${lo.feeBps ?? "?"}bps`, dearVenue: `${hi.venueName} ${hi.feeBps ?? "?"}bps`, spreadPct: Number(spreadPct.toFixed(3)) });
   }
   return hints.sort((a, b) => b.spreadPct - a.spreadPct);
 }

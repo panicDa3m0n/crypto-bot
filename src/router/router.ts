@@ -245,6 +245,9 @@ export class LocalRouter extends Aggregator {
       stable: venue === "aerodrome" ? (pool.archetype === "aerodrome-stable") : false,
       factory: (pool.factory ?? this.factoryCache.get(pool.address)) as Address
     });
+    // The encoder refuses rather than inventing a fee tier — a guessed tier encodes a DIFFERENT pool than the
+    // one we quoted, which is the worst possible way to be wrong on an execution path.
+    if (!call) { this.log.warn({ tokenIn, tokenOut, venue, pool: pool.address }, "cannot encode swap: unresolved fee tier — pool needs enrichment"); return null; }
     const f = freshness(await this.headBlock(), [{ block: pool.block, ageMs: pool.ageMs }], this.cfg.ROUTE_MAX_BLOCKS_BEHIND);
     this.log.debug({ tokenIn, tokenOut, venue, pool: pool.address, router, expectedOut: route.amountOut.toString(), minOut: minOut.toString(), value: call.value.toString(), fresh: freshnessLog(f) }, "local exec plan built");
     return { router, calldata: call.calldata, value: call.value, expectedOut: route.amountOut, minOut, nativeIn, nativeOut, venue, poolAddress: pool.address };
@@ -270,6 +273,7 @@ export class LocalRouter extends Aggregator {
       stable: venue === "aerodrome" ? (pool.archetype === "aerodrome-stable") : false,
       factory: (pool.factory ?? this.factoryCache.get(pool.address)) as Address
     });
+    if (!call) { this.log.warn({ venue, pool: pool.address }, "cannot encode swap: unresolved fee tier — pool needs enrichment"); return null; }
     return { router, calldata: call.calldata, value: call.value, venue };
   }
 

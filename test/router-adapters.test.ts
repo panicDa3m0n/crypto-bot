@@ -52,8 +52,18 @@ describe("ConstantProductAdapter", () => {
     expect(a.quoteOut(p, T0, amt)?.feePpm).toBe(500);
   });
 
-  it("defaults to 0.3% when fee is missing/invalid, and never marks the quote approximate", () => {
-    const p = pool({ feePpm: 0 });
+  it("REFUSES to quote when the fee is unknown — it must never be invented", () => {
+    // This test previously asserted the opposite ("defaults to 0.3%"), which enshrined the single most
+    // damaging default in the codebase: on a strategy whose edge is basis points, an invented fee yields a
+    // confident wrong number in either direction, and hides the data hole that caused it. A pool that cannot
+    // state its fee is enrichment work, not a 0.30% guess.
+    for (const bad of [0, -1, 1_000_000, Number.NaN]) {
+      expect(a.quoteOut(pool({ feePpm: bad }), T0, 10n ** 18n)).toBeNull();
+    }
+  });
+
+  it("quotes normally once the fee IS known", () => {
+    const p = pool({ feePpm: 3000 });
     const amt = 10n ** 18n;
     const got = a.quoteOut(p, T0, amt);
     expect(got?.amountOut).toBe(univ2Out(amt, p.r0!, p.r1!));

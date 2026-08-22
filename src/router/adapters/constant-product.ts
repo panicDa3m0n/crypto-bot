@@ -1,4 +1,5 @@
 import type { PoolState, QuoteLeg, VenueAdapter } from "../types.js";
+import { resolveFeePpm } from "../../archetypes.js";
 
 /**
  * Constant-product AMM: Uniswap-V2 and Solidly-VOLATILE (Aerodrome/Velodrome) pools. The invariant is
@@ -27,7 +28,9 @@ export class ConstantProductAdapter implements VenueAdapter {
     const inIs0 = inl === pool.token0.toLowerCase();
     if (!inIs0 && inl !== pool.token1.toLowerCase()) return null; // token not in this pool
     const [rIn, rOut] = inIs0 ? [r0, r1] : [r1, r0];
-    const feePpm = pool.feePpm > 0 && pool.feePpm < 1_000_000 ? BigInt(Math.round(pool.feePpm)) : 3000n;
+    const f = resolveFeePpm(pool.feePpm);
+    if (f == null) return null; // no invented fee: an unpriceable pool must not quote
+    const feePpm = BigInt(Math.round(f));
     const inWithFee = amountIn * (1_000_000n - feePpm);
     const out = (inWithFee * rOut) / (rIn * 1_000_000n + inWithFee);
     return out > 0n ? { amountOut: out, feePpm: Number(feePpm), approximate: false } : null;

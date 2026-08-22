@@ -1,4 +1,5 @@
 import type { PoolState, QuoteLeg, VenueAdapter } from "../types.js";
+import { resolveFeePpm } from "../../archetypes.js";
 
 const Q96 = 2n ** 96n;
 
@@ -28,7 +29,9 @@ export class V3Adapter implements VenueAdapter {
     const r1 = (L * sp) / Q96; // virtual reserve of token1
     if (r0 <= 0n || r1 <= 0n) return null;
     const [rIn, rOut] = inIs0 ? [r0, r1] : [r1, r0];
-    const feePpm = pool.feePpm > 0 && pool.feePpm < 1_000_000 ? BigInt(Math.round(pool.feePpm)) : 3000n;
+    const f = resolveFeePpm(pool.feePpm);
+    if (f == null) return null; // no invented fee: an unpriceable pool must not quote
+    const feePpm = BigInt(Math.round(f));
     const inWithFee = amountIn * (1_000_000n - feePpm);
     const out = (inWithFee * rOut) / (rIn * 1_000_000n + inWithFee);
     if (out <= 0n) return null;
