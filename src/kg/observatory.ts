@@ -31,6 +31,7 @@ export interface Candidate {
   fingerprint: string;          // hash(route pools + their state blocks + amountIn + minProfit) — preflight dedup
 }
 export interface ObserveStats {
+  aborted?: boolean;               // the cycle was cut short (mirror went stale); its numbers are partial
   detectors: Record<string, number>; sized: number; economic: number;
   economicallyPositive: number;    // economic edge (net > threshold) before encodability
   routeEncodable: number;          // of those, we can build calldata for the whole route
@@ -42,10 +43,18 @@ export interface ObserveStats {
   blockedByTicks: { candidates: number; sumPeakUsd: number; topFactories: Array<{ factory: string; usd: number }>; topPools: Array<{ pool: string; usd: number }> };
 }
 
-export interface ObserveOpts { minGrossBps?: number; cycleLimit?: number; gasMaxAgeMs?: number }
+export interface ObserveOpts { minGrossBps?: number; cycleLimit?: number; gasMaxAgeMs?: number;
+  /** Return true to stop the cycle early (see runObservatory). */ abort?: () => boolean }
 
 /** capability: DB-only own-execution capability of a pool (null = unsupported fork / unenriched). Injected so
  * the observatory stays decoupled from LocalRouter yet can fold encodability into the gate. */
+/**
+ * `opts.abort` lets the caller stop a cycle that has become pointless. The mirror can go stale WHILE this
+ * runs — a cycle takes minutes — and every number produced after that describes a world that no longer
+ * exists. Worse, on a single core the work competes with the indexer that is trying to catch up, so
+ * continuing actively delays the freshness the cycle depends on. Checked between candidates, which is where
+ * the time goes.
+ */
 export async function runObservatory(db: Database, config: Config, graph: LiquidityGraph, opts: ObserveOpts = {}, capability?: (ps: PoolState) => { venue: string } | null): Promise<{ candidates: Candidate[]; stats: ObserveStats }> {
   const cid = config.CHAIN_ID;
   const weth = config.WBERA_ADDRESS.toLowerCase(), usdc = config.USDC_E_ADDRESS.toLowerCase();
@@ -152,10 +161,12 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
     if (!isExec && /partial tick coverage/.test(reason ?? "") && opp.economicEdge) for (const e of cycle.edges) if (CONC.has(e.archetype as Archetype)) await db.setPoolTickPriority(cid, e.pool, 0).catch(() => undefined);
   };
 
+  let aborted = false;
   // ── DETECTOR 1: spatial/cyclic arb (negative cycles on the FULL modelable graph) ──
   const modelablePriced = [...graph.pools.values()].filter((p) => MODELABLE.has(p.archetype) && ((p.r0 != null && p.r1 != null && p.r0 > 0n && p.r1 > 0n) || (p.sqrtPriceX96 != null && p.liquidity != null && p.liquidity > 0n)));
   const cycles = findNegativeCycles(modelablePriced, { minGrossBps, limit: opts.cycleLimit ?? 300 });
   for (const c0 of cycles) {
+    if (opts.abort?.()) { aborted = true; break; }
     const c = rotate(c0, [weth, usdc]);
     const sims = new Map<string, PoolSim>(); let ok = true;
     for (const e of c.edges) { const s = await simFor(e.pool); if (!s) { ok = false; break; } sims.set(s.poolId, s); }
@@ -167,6 +178,7 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
   for (const p of modelablePriced) { const [a, b] = [p.token0, p.token1].sort(); const k = `${a}|${b}`; (byPair.get(k) ?? byPair.set(k, []).get(k)!).push(p.address); }
   const multiVenue = [...byPair.entries()].filter(([, v]) => v.length >= 2);
   for (const [pairKey, poolIds] of multiVenue) {
+    if (opts.abort?.()) { aborted = true; break; }
     const [t0, t1] = pairKey.split("|");
     // marginal spot per venue (small probe in each direction), then best-buy / best-sell venues.
     const probe0 = (graph.decimals.has(t0) ? 10n ** BigInt(graph.decimals.get(t0)!) : 10n ** 18n) / 1000n || 1n;
@@ -197,6 +209,7 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
   return {
     candidates,
     stats: {
+      aborted,
       detectors, sized, economic, economicallyPositive, routeEncodable: routeEncodableN, executable,
       gasPriceWei: gasPriceWei.toString(), gasAgeMs: gas?.ageMs ?? null, gasStale, ethUsd, multiVenuePairs: multiVenue.length,
       unsupportedForks: top(unsupported, (v) => v.peakUsd).map(([factory, v]) => ({ factory, candidates: v.candidates, peakUsd: v.peakUsd })),

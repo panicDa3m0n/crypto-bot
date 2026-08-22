@@ -70,7 +70,21 @@ async function main() {
       lastBlock = head;
       const t0 = Date.now();
       const g = await loadLiquidityGraph(db, cid);
-      const { candidates, stats } = await runObservatory(db, config, g, { minGrossBps: MIN_GROSS_BPS }, capability);
+      // Yield the moment the mirror goes stale. A cycle takes minutes; if the indexer falls behind meanwhile,
+      // every remaining number describes a world that no longer exists — and on a single core this work is
+      // competing with the very catch-up it depends on. Cheap DB read, checked between candidates.
+      const staleSince = () => db.getChainStatus(cid).then((c) => !c?.synced).catch(() => false);
+      let stale = false;
+      const staleTimer = setInterval(() => { void staleSince().then((v) => { stale = v; }); }, 5_000);
+      let candidates: Awaited<ReturnType<typeof runObservatory>>["candidates"], stats: Awaited<ReturnType<typeof runObservatory>>["stats"];
+      try { ({ candidates, stats } = await runObservatory(db, config, g, { minGrossBps: MIN_GROSS_BPS, abort: () => stale }, capability)); }
+      finally { clearInterval(staleTimer); }
+      if (stats.aborted) {
+        logger.warn({ block: head, sized: stats.sized }, "observatory cycle ABORTED — mirror went stale mid-cycle; yielding the cpu to the indexer");
+        lastBlock = 0; // do not treat this block as observed: redo it once the mirror is fresh again
+        await sleep(POLL_MS);
+        continue;
+      }
 
       let attempted = 0, pass = 0, reused = 0;
       const outcomes: Record<string, number> = {};
