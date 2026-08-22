@@ -489,6 +489,20 @@ export class Database {
           INSERT INTO schema_markers(marker) VALUES ('v4_tick_recert_2026_08');
         END IF;
       END $v4fix$;
+      -- ONE-SHOT REPAIR: re-open pools whose "the chain refuses this field" verdict was recorded by a reader
+      -- that could not yet see the field. Solidly V3 keeps a mutable fee INSIDE slot0 and exposes no fee(),
+      -- so our two-field V3 reader saw a revert and the pool accrued attempts until it was written off. The
+      -- verdict was about US, not about the contract. Only fee-blocked entries are re-opened; a pool that
+      -- refuses token0 is a different, still-valid verdict and stays where it is.
+      DO $refee$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM schema_markers WHERE marker = 'slot0_fee_recovery_2026_08') THEN
+          UPDATE entities SET enrich_failed=false, enrich_attempts=0, meta = meta - 'enrichBlockedBy'
+           WHERE kind='pool' AND meta ? 'enrichBlockedBy'
+             AND (meta->'enrichBlockedBy') @> '["fee"]'::jsonb;
+          INSERT INTO schema_markers(marker) VALUES ('slot0_fee_recovery_2026_08');
+        END IF;
+      END $refee$;
       -- ONE-SHOT REPAIR: strip the V4 dynamic-fee FLAG that was stored as if it were a fee (0x800000 =
       -- 8,388,608 ppm = 838%). It is a marker meaning "the hook sets this fee per swap", so the pool keeps
       -- meta.dynamicFee and loses the fabricated number; the real value lives in pool_state.fee_ppm.
