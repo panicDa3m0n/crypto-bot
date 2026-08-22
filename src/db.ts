@@ -511,6 +511,10 @@ export class Database {
           INSERT INTO schema_markers(marker) VALUES ('v4_tick_recert_2026_08');
         END IF;
       END $v4fix$;
+      -- Clear keys left holding a JSON null by a merge patch that meant "remove". Harmless in themselves, but
+      -- they satisfy a key-presence test while failing anything that reads the value as its real type.
+      UPDATE entities SET meta = meta - 'enrichBlockedBy'
+       WHERE kind='pool' AND jsonb_typeof(meta->'enrichBlockedBy') = 'null';
       -- ONE-SHOT REPAIR: re-open pools whose "the chain refuses this field" verdict was recorded by a reader
       -- that could not yet see the field. Solidly V3 keeps a mutable fee INSIDE slot0 and exposes no fee(),
       -- so our two-field V3 reader saw a revert and the pool accrued attempts until it was written off. The
@@ -1714,8 +1718,15 @@ export class Database {
 
   /** Merge a JSON patch into an entity's meta (verification enrichment, etc.). */
   async mergeEntityMeta(chainId: number, address: string, kind: string, patch: Record<string, unknown>): Promise<void> {
-    // jsonParam, not raw stringify: it is the one place that strips what Postgres cannot store.
-    await this.pool.query(`UPDATE entities SET meta = meta || $4::jsonb WHERE chain_id=$1 AND address=$2 AND kind=$3`, [chainId, address.toLowerCase(), kind, jsonParam(patch)]);
+    // A null in a merge patch means REMOVE THE KEY, not "store a null". `meta || {"k": null}` keeps the key
+    // with a null value, which then satisfies `meta ? 'k'` while failing anything that expects the real type —
+    // that is exactly how one cleared field took down the whole health view. jsonParam, not raw stringify:
+    // it is the one place that strips what Postgres cannot store.
+    const drop = Object.entries(patch).filter(([, v]) => v === null).map(([k]) => k);
+    const set = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== null));
+    await this.pool.query(
+      `UPDATE entities SET meta = (meta - $5::text[]) || $4::jsonb WHERE chain_id=$1 AND address=$2 AND kind=$3`,
+      [chainId, address.toLowerCase(), kind, jsonParam(set), drop]);
   }
 
   // --- lending positions registry (all borrowers, tiered, adaptive polling) ---
@@ -2174,7 +2185,10 @@ export class Database {
       `SELECT COALESCE(meta->>'archetype','(none)') archetype,
               (SELECT string_agg(v, ',' ORDER BY v) FROM jsonb_array_elements_text(meta->'enrichBlockedBy') v) fields,
               count(*)::int pools, bool_or(enrich_failed) any_failed
-       FROM entities WHERE chain_id=$1 AND kind='pool' AND meta ? 'enrichBlockedBy'
+       -- jsonb_typeof, not just key-presence: a key holding anything other than an array (a null left by a
+       -- clear, say) makes jsonb_array_elements_text raise, and because this runs inside ONE health snapshot
+       -- a single malformed row blanked every panel on the page. A diagnostic view must degrade, never fail.
+       FROM entities WHERE chain_id=$1 AND kind='pool' AND jsonb_typeof(meta->'enrichBlockedBy') = 'array'
        GROUP BY 1,2 ORDER BY pools DESC LIMIT 12`, [chainId]);
     // Protocol-level fee coverage: for CP pools the fee lives on the FACTORY, so completeness is measured there.
     const protocolFees = await q(
