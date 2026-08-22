@@ -26,6 +26,11 @@ const AERO_FACTORY_FEE_ABI = parseAbi(["function getFee(address pool, bool stabl
 const V2_FACTORY_ABI = parseAbi(["function getPair(address,address) view returns (address)"]);
 const SOLIDLY_FACTORY_ABI = parseAbi(["function getPair(address,address,bool) view returns (address)","function isPair(address) view returns (bool)"]);
 // ABI fingerprint used to classify an unknown pool: which of these it answers tells us its family.
+// Solidly V3 keeps a MUTABLE fee inside slot0 (sqrtPriceX96, tick, fee, unlocked) and exposes no fee().
+// That is why its pools reverted on fee() and looked like broken contracts: the datum was there all along,
+// one field further in. Confirmed against the chain — slot0 word2 = 10000 on a pool whose factory
+// (SolidlyV3Factory) independently maps feeAmountTickSpacing(10000) to the spacing 100 we already stored.
+const SLOT0_WITH_FEE_ABI = parseAbi(["function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint24 fee, bool unlocked)"]);
 const CLASSIFY_ABI = parseAbi(["function slot0() view returns (uint160,int24)","function globalState() view returns (uint160,int24,uint16,uint16,uint16,bool)","function stable() view returns (bool)","function getReserves() view returns (uint112,uint112,uint32)"]);
 const ERC20_META_ABI = parseAbi(["function symbol() view returns (string)", "function name() view returns (string)", "function decimals() view returns (uint8)"]);
 // POSITIVE CONTROL for lane liveness: Multicall3 is deployed at the same address on every chain and this
@@ -292,8 +297,15 @@ export class RegistryEnricher {
       // ever. A definitive revert is evidence — record WHICH field the chain refuses, and count the attempt so
       // the cap eventually applies. The residue stays visible in `enrichBlockedBy` instead of silently cycling.
       if (blocked?.length) {
-        await this.db.mergeEntityMeta(this.config.CHAIN_ID, p.address, "pool", { enrichBlockedBy: blocked }).catch(() => undefined);
-        await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, p.address, "pool", block, MAX_ATTEMPTS).catch(() => undefined);
+        // Before recording a refusal, try the place the datum might actually live. A concentrated pool that
+        // rejects fee() is the Solidly V3 shape, which carries a mutable fee inside slot0 — so "the chain
+        // refuses" was our reader looking in the wrong field, not an absent value. Recovering the exact datum
+        // is the goal; failing closed is only the net for when it genuinely is not there.
+        const recovered = blocked.includes("fee") ? await this.recoverSlot0Fee(p.address, block) : false;
+        if (!recovered) {
+          await this.db.mergeEntityMeta(this.config.CHAIN_ID, p.address, "pool", { enrichBlockedBy: blocked }).catch(() => undefined);
+          await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, p.address, "pool", block, MAX_ATTEMPTS).catch(() => undefined);
+        }
       }
       // Count an attempt ONLY on a definitive answer (the call resolved and the data isn't there). After a
       // transport failure we leave the pool untouched so it is retried later instead of being burned.
@@ -304,6 +316,27 @@ export class RegistryEnricher {
       done += 1;
     }
     return { done, rateLimited: false };
+  }
+
+
+  /**
+   * Recover a fee that lives inside slot0 rather than behind fee(). Returns true when the pool was recovered.
+   *
+   * Solidly V3 is concentrated-liquidity like Uniswap V3, but its fee is MUTABLE (fee setters can change it)
+   * and therefore sits in slot0 instead of being an immutable per-pool constant. Our V3 reader only knew the
+   * two-field slot0, so 23 live pools reverted on every field we asked for and were on their way to being
+   * written off as non-contracts. The fee is re-read as state rather than trusted forever, which is why the
+   * pool is marked dynamicFee.
+   */
+  private async recoverSlot0Fee(pool: string, block: number | null): Promise<boolean> {
+    try {
+      const r = await this.bulkClient().readContract({ address: pool as Address, abi: SLOT0_WITH_FEE_ABI, functionName: "slot0" }) as readonly [bigint, number, number, boolean];
+      const fee = Number(r?.[2]);
+      if (!Number.isFinite(fee) || fee <= 0 || fee >= 1_000_000) return false;
+      await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "solidly-v3", fee, dynamicFee: true, feeSource: "slot0", enrichBlockedBy: null }).catch(() => undefined);
+      this.logger.info({ pool: pool.slice(0, 12), fee }, "fee recovered from slot0 — pool reclassified solidly-v3");
+      return true;
+    } catch { return false; } // not this shape either → the caller records the refusal as before
   }
 
   /**

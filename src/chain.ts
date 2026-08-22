@@ -92,14 +92,17 @@ export class BerachainClients {
     this.executionRpc = config.EXECUTION_RPC_HTTP_URL ?? this.fallbackRpc;
     this.indexerRpc = config.INDEXER_RPC_HTTP_URL;
     this.enrichmentRpc = config.ENRICHMENT_RPC_HTTP_URL;
-    this.toolsRpc = config.TOOLS_RPC_HTTP_URL ?? this.indexerRpc; // aligned with the indexer lane by default
+    // Tools default to the BULK lane, never the indexer's. The indexer is the urgent, per-block component and
+    // sharing its endpoint with on-demand tool reads is the exact contention this lane split exists to prevent;
+    // defaulting to it meant the separation was opt-in, and therefore usually absent.
+    this.toolsRpc = config.TOOLS_RPC_HTTP_URL ?? this.primaryRpc;
     this.primary = createPublicClient({ chain, transport: http(config.PRIMARY_RPC_HTTP_URL, { timeout: 12_000, retryCount: 1 }) });
     // Dedicated indexer lane — ONLY the block-indexer uses this client, so its getLogs/metadata reads never
     // contend with the shared read pool (and vice-versa). retryCount handles transient blips without skipping a block.
     this.indexer = createPublicClient({ chain, transport: http(this.indexerRpc, { timeout: 12_000, retryCount: 2 }) });
     // Dedicated enrichment lane (bursty) + Scarlet-tools lane (aligned with indexer unless overridden).
     this.enrichment = createPublicClient({ chain, transport: http(this.enrichmentRpc, { timeout: 12_000, retryCount: 1 }) });
-    this.tools = this.toolsRpc === this.indexerRpc ? this.indexer : createPublicClient({ chain, transport: http(this.toolsRpc, { timeout: 12_000, retryCount: 1 }) });
+    this.tools = this.toolsRpc === this.primaryRpc ? this.primary : createPublicClient({ chain, transport: http(this.toolsRpc, { timeout: 12_000, retryCount: 1 }) });
     this.secondary = createPublicClient({ chain, transport: http(config.SECONDARY_RPC_HTTP_URL, { timeout: 12_000, retryCount: 1 }) });
     this.precision = createPublicClient({ chain, transport: http(this.precisionRpc, { timeout: 12_000, retryCount: 0, batch: true }) });
     this.fallback = createPublicClient({ chain, transport: http(this.fallbackRpc, { timeout: 12_000, retryCount: 1, batch: true }) });
@@ -116,7 +119,7 @@ export class BerachainClients {
     this.exec = createPublicClient({ chain, transport: http(this.executionRpc, { timeout: 12_000, retryCount: 1 }) });
     // TRACEABILITY: one authoritative line mapping every purpose → its endpoint, so we always know which
     // RPC is used for what (and can swap any via env). Grep "RPC lanes" to audit.
-    this.logger?.info({ indexer: redactRpc(this.indexerRpc), enrichment: redactRpc(this.enrichmentRpc), tools: redactRpc(this.toolsRpc), execution: redactRpc(this.executionRpc), primary: redactRpc(this.primaryRpc), secondary: redactRpc(this.secondaryRpc), precision: redactRpc(this.precisionRpc), fallback: redactRpc(this.fallbackRpc), dedicatedExecution: this.executionRpc !== this.primaryRpc, dedicatedIndexer: this.indexerRpc !== this.primaryRpc, toolsAlignedWithIndexer: this.toolsRpc === this.indexerRpc }, "RPC lanes");
+    this.logger?.info({ indexer: redactRpc(this.indexerRpc), enrichment: redactRpc(this.enrichmentRpc), tools: redactRpc(this.toolsRpc), execution: redactRpc(this.executionRpc), primary: redactRpc(this.primaryRpc), secondary: redactRpc(this.secondaryRpc), precision: redactRpc(this.precisionRpc), fallback: redactRpc(this.fallbackRpc), dedicatedExecution: this.executionRpc !== this.primaryRpc, dedicatedIndexer: this.indexerRpc !== this.primaryRpc, toolsSharingIndexerLane: this.toolsRpc === this.indexerRpc }, "RPC lanes");
   }
 
   /** Log an RPC lane failure AT THE MOMENT it happens (rule: no status polling — surface KO on error).

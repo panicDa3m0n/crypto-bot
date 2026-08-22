@@ -13,7 +13,7 @@
 /** AMM family of a pool, as classified by the indexer (entities.meta.archetype). "slipstream" is not a
  * pool archetype (SlipStream pools classify as "v3" for pricing) — it's an EXECUTION venue: the same V3
  * concentrated-liquidity math, but the router keys pools by int24 tickSpacing (not uint24 fee). */
-export type Archetype = "v2" | "aerodrome" | "aerodrome-stable" | "v3" | "v4" | "slipstream";
+export type Archetype = "v2" | "aerodrome" | "aerodrome-stable" | "v3" | "v4" | "slipstream" | "solidly-v3";
 
 /**
  * The raw AMM state of one pool — our LOCAL MIRROR of on-chain state, assembled by the router from

@@ -12,7 +12,7 @@
 import type { Archetype } from "./router/types.js";
 
 /** Families whose liquidity lives in TICKS (a per-tick map is required to quote them exactly). */
-export const CONCENTRATED: ReadonlySet<string> = new Set<Archetype | string>(["v3", "v4", "slipstream", "algebra"]);
+export const CONCENTRATED: ReadonlySet<string> = new Set<Archetype | string>(["v3", "v4", "slipstream", "algebra", "solidly-v3"]);
 
 /** Families priced by x·y=k reserves. */
 export const CONSTANT_PRODUCT: ReadonlySet<string> = new Set(["v2", "aerodrome", "solidly"]);
@@ -26,14 +26,15 @@ export const PER_POOL_FEE: ReadonlySet<string> = new Set(["v3", "slipstream"]);
 /** The fee is a property of the PROTOCOL (its factory), not of the pool. */
 export const PROTOCOL_LEVEL_FEE: ReadonlySet<string> = new Set(["v2", "aerodrome", "aerodrome-stable", "solidly"]);
 
-/** The fee is DYNAMIC and only knowable from live state (V4 hooks; Algebra's per-block fee). */
-export const DYNAMIC_FEE: ReadonlySet<string> = new Set(["v4", "algebra"]);
+/** The fee is DYNAMIC and only knowable from live state (V4 hooks; Algebra's per-block fee; Solidly V3
+ * carries a mutable fee INSIDE slot0, which is why its pools revert on fee() and looked broken). */
+export const DYNAMIC_FEE: ReadonlySet<string> = new Set(["v4", "algebra", "solidly-v3"]);
 
 /** `tickSpacing` is a meaningful, readable property. */
 export const HAS_TICK_SPACING: ReadonlySet<string> = CONCENTRATED;
 
 /** What `buildPoolSim` can actually simulate today. Anything else is surfaced but never quoted. */
-export const MODELABLE: ReadonlySet<string> = new Set(["v2", "aerodrome", "aerodrome-stable", "v3", "slipstream"]);
+export const MODELABLE: ReadonlySet<string> = new Set(["v2", "aerodrome", "aerodrome-stable", "v3", "slipstream", "solidly-v3"]);
 
 /**
  * Canonical Uniswap fee-tier → tickSpacing. Four separate copies of this existed and they disagreed: one was
