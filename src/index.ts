@@ -1,4 +1,3 @@
-import { Redis } from "ioredis";
 import { loadConfig } from "./config.js";
 import { BerachainClients } from "./chain.js";
 import { Collector } from "./collector.js";
@@ -48,7 +47,6 @@ import { startDashboard } from "./dashboard.js";
 const config = loadConfig();
 const logger = createLogger(config);
 const db = new Database(config.DATABASE_URL);
-const redis = new Redis(config.REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
 const chain = new BerachainClients(config, logger);
 const etherscan = new Etherscan(config);
 const blockscout = new Blockscout(config, logger);
@@ -160,8 +158,6 @@ async function main() {
   for (const d of config.network.dexes) await db.upsertEntity({ chainId: config.CHAIN_ID, address: d.factory, kind: "dex", symbol: d.id, name: d.name, meta: { type: d.type, router: d.router, quoter: d.quoter, note: d.note }, source: "seed" }).catch(() => undefined);
   // Protocols map (lending/perp) — the surfaces liquidations & other strategies derive from.
   for (const p of config.network.protocols) await db.upsertEntity({ chainId: config.CHAIN_ID, address: p.address, kind: "protocol", symbol: p.id, name: p.name, meta: { category: p.category, family: p.family, role: p.role, tvlUsd: p.tvlUsd, note: p.note }, source: "seed" }).catch(() => undefined);
-  await redis.connect();
-  await redis.ping();
   if (config.SERVICE_ROLE !== "brain") {
     collector.start(); sensorium.start(); launchWatcher.start(); flowSensor.start();
     if (config.WHALE_INTEL_ENABLED) whaleIntel.start();
@@ -256,7 +252,6 @@ async function shutdown(signal: string) {
   const drainDeadline = Date.now() + 5_000;
   while (blockIndexer.busy && Date.now() < drainDeadline) await new Promise((r) => setTimeout(r, 100));
   if (blockIndexer.busy) logger.warn("indexer still in flight at shutdown — closing anyway");
-  await redis.quit();
   await db.close();
   process.exit(0);
 }

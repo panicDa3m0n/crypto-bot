@@ -9,14 +9,22 @@
 # that still needs a real `docker compose build`. Everything else is a restart.
 #
 # Mounted read-only so a container cannot write over the deployed artefacts.
+# CPU PRECEDENCE. The block indexer is the starting point of the whole system: everything else reads what it
+# writes, so a stale mirror makes every downstream component wrong rather than merely slow. On a single-core
+# box it had NO priority at all — no limit and no weight — and won the cpu by luck against postgres, redis and
+# unrelated projects. Weights (cpu_shares) are the right instrument: they cost nothing when the core is free
+# and decide who yields when it is not. Postgres carries the same weight because starving it starves the
+# indexer's writes, which is the same failure by another route.
 services:
   brain:
+    cpu_shares: 4096      # the indexer lives here — it yields to nothing
     volumes:
       - /opt/bera-bot/app/dist:/app/dist:ro
       - /opt/bera-bot/app/src/prompts:/app/src/prompts:ro
       - /opt/bera-bot/app/src/strategy:/app/src/strategy:ro
       - /opt/bera-bot/app/networks:/app/networks:ro
   observer:
+    cpu_shares: 512       # sensors: useful, never urgent
     volumes:
       - /opt/bera-bot/app/dist:/app/dist:ro
       - /opt/bera-bot/app/src/prompts:/app/src/prompts:ro
@@ -32,9 +40,12 @@ services:
     #
     # Half a core: the observatory gets slower, the indexer stays at head. That is the correct trade, because
     # a stale mirror makes the observatory's output worthless anyway.
-    cpus: "0.5"
+    cpus: "0.5"           # safety valve: one heavy cycle can never monopolise the core outright
+    cpu_shares: 256       # and under contention it yields to the indexer first
     volumes:
       - /opt/bera-bot/app/dist:/app/dist:ro
       - /opt/bera-bot/app/src/prompts:/app/src/prompts:ro
       - /opt/bera-bot/app/src/strategy:/app/src/strategy:ro
       - /opt/bera-bot/app/networks:/app/networks:ro
+  postgres:
+    cpu_shares: 4096      # the indexer's writes go through here; starving it starves the indexer
