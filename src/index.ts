@@ -244,8 +244,18 @@ async function main() {
 
 async function shutdown(signal: string) {
   logger.info({ signal }, "shutting down");
-  if (config.SERVICE_ROLE !== "brain") { collector.stop(); sensorium.stop(); launchWatcher.stop(); flowSensor.stop(); whaleIntel.stop(); graduationSensor.stop(); chainScanner.stop(); registryEnricher.stop(); }
-  if (config.SERVICE_ROLE !== "observer") { reconciler.stop(); autoflash.stop(); autoArm.stop(); liquidationMonitor.stop(); followService.stop(); positionManager.stop(); arbEngine.stop(); walletHoldings.stop(); displayPrices.stop(); blockIndexer.stop(); positionRegistry.stop(); scarletStopped = true; if (scarletHeartbeat) clearTimeout(scarletHeartbeat); dashboard?.close(); }
+  // Each component must be stopped on the role where it actually RUNS. registryEnricher started under the
+  // brain branch but was stopped under the observer one, so on brain it was never stopped at all and its
+  // 400ms drain kept querying after the pool was closed. Keep these two lists mirror images of the start ones.
+  if (config.SERVICE_ROLE !== "brain") { collector.stop(); sensorium.stop(); launchWatcher.stop(); flowSensor.stop(); whaleIntel.stop(); graduationSensor.stop(); chainScanner.stop(); }
+  if (config.SERVICE_ROLE !== "observer") { reconciler.stop(); autoflash.stop(); autoArm.stop(); liquidationMonitor.stop(); followService.stop(); positionManager.stop(); arbEngine.stop(); walletHoldings.stop(); displayPrices.stop(); blockIndexer.stop(); registryEnricher.stop(); positionRegistry.stop(); scarletStopped = true; if (scarletHeartbeat) clearTimeout(scarletHeartbeat); dashboard?.close(); }
+  // DRAIN before closing the connection pool. stop() only stops NEW work from being scheduled; whatever was
+  // already running keeps going, and closing the pool underneath it produced "Cannot use a pool after calling
+  // end on the pool" — an alarming error for what is simply an unclean shutdown. Bounded: we wait for the
+  // in-flight tick to notice the stop flag, and give up rather than hang if something does not settle.
+  const drainDeadline = Date.now() + 5_000;
+  while (blockIndexer.busy && Date.now() < drainDeadline) await new Promise((r) => setTimeout(r, 100));
+  if (blockIndexer.busy) logger.warn("indexer still in flight at shutdown — closing anyway");
   await redis.quit();
   await db.close();
   process.exit(0);

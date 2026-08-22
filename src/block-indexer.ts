@@ -44,6 +44,7 @@ type RawRpc = { request: (a: { method: string; params: unknown }) => Promise<unk
 
 export class BlockIndexer {
   private running = false;
+  private stopped = false;
   private cursor = 0;
   private coverageStart = -1;       // Item 3: start of the current continuous-coverage segment
   private coverageGeneration = 0;   // bumped whenever a gap breaks continuity
@@ -131,7 +132,13 @@ export class BlockIndexer {
     await this.writeChainStatus(); // seed freshness telemetry at boot
   }
 
-  stop(): void { if (this.timer) clearInterval(this.timer); if (this.unwatch) this.unwatch(); }
+  /** Stop accepting work AND abort the range currently being processed. Clearing the timer is not enough:
+   * a catch-up tick walks up to INDEXER_SYNC_MAX_CATCHUP blocks and can run for minutes, so it kept querying
+   * after shutdown closed the connection pool — surfacing as "Cannot use a pool after calling end on the
+   * pool" rather than as the orderly stop it should be. The in-flight loop checks this flag between blocks. */
+  stop(): void { this.stopped = true; if (this.timer) clearInterval(this.timer); if (this.unwatch) this.unwatch(); }
+  /** True while a tick is still executing — shutdown waits briefly on this before closing the pool. */
+  get busy(): boolean { return this.running; }
 
   /** BACKFILL: recompute USD price for tokens that JUST got their decimals (from enrichment), using the
    * already-stored pool_state — so a fresh token is priced the instant it's enriched, not only on its next
@@ -331,6 +338,7 @@ export class BlockIndexer {
     let swaps = 0, discovered = 0, lending = 0;
     for (let b = from; b <= to; b++) {
       const bl = byBlock.get(b) ?? [];
+      if (this.stopped) break; // shutdown: leave the cursor where it truly is and let the next start resume
       const r = await this.processBlock(b, bl);
       swaps += r.swaps; discovered += r.discovered; lending += r.lending;
       this.cursor = b;
