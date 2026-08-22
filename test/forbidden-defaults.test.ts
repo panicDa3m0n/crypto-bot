@@ -36,6 +36,13 @@ const RULES: Array<{ name: string; re: RegExp; why: string }> = [
     why: "decimals come from the entities registry; guessing 18 silently mis-scales every amount by up to 10^12",
   },
   {
+    // A backtick inside a SQL comment CLOSES the surrounding TS template literal, so the file stops
+    // compiling in a place that looks nothing like the mistake. This has broken the build three times.
+    name: "backtick inside a SQL comment",
+    re: /^\s*--.*`/,
+    why: "a backtick terminates the enclosing template literal — write the identifier without quoting it",
+  },
+  {
     name: "duplicated fee-tier table",
     re: /FEE_TO_SPACING\s*[:=]/,
     why: "tickSpacing has ONE source of truth (archetypes.tickSpacingFor); four copies had already diverged",

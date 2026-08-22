@@ -2,6 +2,7 @@ import pg from "pg";
 import type { Decision, NetworkObservation, PortfolioSnapshot } from "./domain.js";
 import { jsonSafe } from "./json.js";
 import { summarizeMiniMaxUsage, type MiniMaxUsageSummary } from "./usage.js";
+import { CONCENTRATED } from "./archetypes.js";
 
 /** node-postgres binds JavaScript arrays as PostgreSQL arrays, not JSON arrays. */
 function jsonParam(value: unknown): string {
@@ -2386,17 +2387,21 @@ export class Database {
   }
   /** Storage-scan worklist (Item 3.4): concentrated pools not tick-complete — INCLUDING status='failed'
    * (historical bootstrap gave up → storage snapshot is the fallback). Priority ASC (P0 first). */
-  async poolsForStorageScan(chainId: number, limit = 4): Promise<Array<{ pool: string; factory: string | null; tickSpacing: number | null; fee: number | null; token0: string | null; token1: string | null }>> {
-    const r = await this.pool.query<{ address: string; factory: string | null; ts: string | null; fee: string | null; t0: string | null; t1: string | null }>(
+  async poolsForStorageScan(chainId: number, limit = 4): Promise<Array<{ pool: string; factory: string | null; tickSpacing: number | null; fee: number | null; token0: string | null; token1: string | null; archetype: string | null }>> {
+    const r = await this.pool.query<{ address: string; factory: string | null; ts: string | null; fee: string | null; t0: string | null; t1: string | null; arch: string | null }>(
       // FALLBACK SET ONLY: pools the historical-log bootstrap gave up on (status='failed'). The storage scan
       // is the recovery path for these — never a competitor to an in-flight bootstrap on the same pool. Runs on
       // its own reliable lane, so it is decoupled from the bootstrap queue. Highest priority / oldest first.
-      `SELECT e.address, e.meta->>'factory' factory, e.meta->>'tickSpacing' ts, e.meta->>'fee' fee, e.meta->>'token0' t0, e.meta->>'token1' t1
+      `SELECT e.address, e.meta->>'factory' factory, e.meta->>'tickSpacing' ts, e.meta->>'fee' fee, e.meta->>'token0' t0, e.meta->>'token1' t1, e.meta->>'archetype' arch
        FROM entities e JOIN pool_tick_status pts ON pts.chain_id=e.chain_id AND pts.pool=e.address
-       WHERE e.chain_id=$1 AND e.kind='pool' AND e.meta->>'archetype'='v3' AND length(e.address)=42
+       -- archetype='v3' AND length=42 sat here and silently excluded V4 (a poolId is 66 chars), which is
+       -- the SAME exclusion that was already found and fixed in poolsNeedingTickBootstrap. Fixing one
+       -- instance of a bug and leaving its siblings is how V4 stayed dark through four separate filters, so
+       -- the archetype list is the only membership rule here too; the reader adapts per family.
+       WHERE e.chain_id=$1 AND e.kind='pool' AND e.meta->>'archetype' = ANY($3::text[])
          AND pts.status='failed' AND pts.complete IS NOT TRUE
-       ORDER BY pts.priority ASC, pts.updated_at ASC NULLS FIRST LIMIT $2`, [chainId, limit]);
-    return r.rows.map((x) => ({ pool: x.address, factory: x.factory, tickSpacing: x.ts != null ? Number(x.ts) : null, fee: x.fee != null ? Number(x.fee) : null, token0: x.t0, token1: x.t1 }));
+       ORDER BY pts.priority ASC, pts.updated_at ASC NULLS FIRST LIMIT $2`, [chainId, limit, [...CONCENTRATED]]);
+    return r.rows.map((x) => ({ pool: x.address, factory: x.factory, tickSpacing: x.ts != null ? Number(x.ts) : null, fee: x.fee != null ? Number(x.fee) : null, token0: x.t0, token1: x.t1, archetype: x.arch }));
   }
 
   /** ATOMIC SNAPSHOT REPLACE (Item 3.4) — storage bootstrap is a STATE SNAPSHOT, NOT additive: a complete
@@ -2791,7 +2796,10 @@ export class Database {
       `SELECT e.address, e.meta, ps.r0::text r0, ps.r1::text r1, ps.sqrt_price::text sp, ps.liquidity::text liq, ps.fee_ppm, ps.block_number::text bn,
               (EXTRACT(EPOCH FROM (NOW()-ps.updated_at))*1000)::bigint::text AS age_ms
        FROM entities e LEFT JOIN pool_state ps ON ps.chain_id=e.chain_id AND ps.pool=e.address
-       WHERE e.chain_id=$1 AND e.kind='pool' AND length(e.address)=42 AND e.meta->>'archetype' = ANY($2::text[])`,
+       -- No length filter: the archetype allowlist IS the membership rule. length(address)=42 here was a
+       -- third copy of the same silent V4 exclusion, and it would have kept V4 out even once the loader asks
+       -- for it — a filter that survives the decision it was meant to implement.
+       WHERE e.chain_id=$1 AND e.kind='pool' AND e.meta->>'archetype' = ANY($2::text[])`,
       [chainId, archetypes]
     );
     const b = (v: string | null) => (v == null ? null : BigInt(v.split(".")[0]));

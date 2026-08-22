@@ -8,6 +8,7 @@ import type { Etherscan } from "./etherscan.js";
 import type { Blockscout } from "./blockscout.js";
 import { UNIV3_MINT, UNIV3_BURN, POOL_CREATED, V4_MODIFY_LIQUIDITY, EVENT_DECODERS, type RawLog } from "./indexer/events.js";
 import { scanTickMap, validateSnapshotVsQuoter, tickStorageProfile, bitmapWordRange, MULTICALL3 } from "./router/tick-storage.js";
+import { readTicksInWindow } from "./router/tick-source.js";
 import { tickSpacingFor } from "./archetypes.js";
 
 const UNIV3_QUOTER_BASE = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a" as Address; // Uniswap V3 QuoterV2 on Base
@@ -536,6 +537,43 @@ export class RegistryEnricher {
    * Quoter for the fork, or a validation miss ⇒ never certify. Snapshot REPLACE (not additive) — the scan is
    * an authoritative state read, not another delta reconstruction.
    */
+
+  /**
+   * V4 tick recovery via StateView. The unified TickSource (src/router/tick-source.ts) already knew how to do
+   * this — it read 20/20 concentrated forks in the harness — but nothing in production ever called it, so the
+   * capability existed on paper only. This is that call site.
+   *
+   * The window is RANGE-BOUNDED rather than the full ±887272 domain (85× fewer words), and the pool's own
+   * tickSpacing is required: a wrong spacing makes the bitmap walk read the wrong words entirely, so an
+   * unknown one fails the pool rather than guessing.
+   */
+  private async scanV4Ticks(pool: Address, p: { tickSpacing: number | null; fee: number | null }, cov: { continuousThrough: number; generation: number }): Promise<{ done: number; rateLimited: boolean }> {
+    const cid = this.config.CHAIN_ID;
+    const client = this.getScanClient();
+    if (!client) return { done: 0, rateLimited: false };
+    const spacing = Number(p.tickSpacing) > 0 ? Number(p.tickSpacing) : 0;
+    if (!spacing) { await this.db.failPoolTickStatus(cid, pool, "v4 tick scan: tickSpacing unknown — the bitmap walk would read the wrong words").catch(() => undefined); return { done: 1, rateLimited: false }; }
+    try {
+      const head = Number(await client.getBlockNumber().catch(() => 0n));
+      if (!head) return { done: 0, rateLimited: false };
+      const B = Math.min(head - 3, cov.continuousThrough);
+      if (B <= 0) return { done: 0, rateLimited: false };
+      const read = await readTicksInWindow(client, { pool, kind: "v4-stateview", tickSpacing: spacing, block: B });
+      if (!read) { await this.db.noteTickBootstrapError(cid, pool, "v4 tick scan: StateView read failed").catch(() => undefined); return { done: 1, rateLimited: false }; }
+      // A snapshot SUMMARISES all prior history, so it REPLACES the pool's map rather than adding to it.
+      // Snapshot AT block B, and our continuous coverage already reaches B, so there are no deltas to replay.
+      const w = await this.db.replaceTickMapSnapshot(cid, pool, B, read.ticks, B, []);
+      if (!w.ok) { await this.db.failPoolTickStatus(cid, pool, `v4 tick scan: ${w.reason ?? "apply failed"}`).catch(() => undefined); return { done: 1, rateLimited: false }; }
+      await this.db.certifyPoolTickComplete(cid, pool, cov.generation, "v4-stateview");
+      this.logger.info({ pool: pool.slice(0, 12), ticks: read.ticks.length, words: read.words, block: B }, "v4 tick map recovered from StateView");
+      return { done: 1, rateLimited: false };
+    } catch (e) {
+      if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: 0, rateLimited: true }; }
+      await this.db.noteTickBootstrapError(cid, pool, `v4 tick scan: ${e instanceof Error ? e.message.slice(0, 90) : String(e).slice(0, 90)}`).catch(() => undefined);
+      return { done: 1, rateLimited: false };
+    }
+  }
+
   private async enrichTickStorageScan(): Promise<{ done: number; rateLimited: boolean }> {
     const client = this.getScanClient();
     if (!client) return { done: 0, rateLimited: false };
@@ -546,8 +584,12 @@ export class RegistryEnricher {
     if (!batch.length) return { done: 0, rateLimited: false };
     const p = batch[0];
     const pool = p.pool.toLowerCase() as Address;
-    if (pool.length !== 42) return { done: 0, rateLimited: false };   // V4 poolId — not storage-scannable here
     if (!p.token0 || !p.token1) { await this.db.noteTickBootstrapError(cid, pool, "storage scan: tokens unknown").catch(() => undefined); return { done: 0, rateLimited: false }; }
+    // V4 has no pool CONTRACT to scan — its state lives inside the singleton PoolManager and is read through
+    // StateView. That is exactly what the tick-source adapters were built and verified for, and never wired
+    // to: the recovery path simply returned here, so the 20,625 re-opened V4 maps had NO way back. Routing
+    // them to the adapter is what turns that from a permanent gap into ordinary work.
+    if (p.archetype === "v4") return await this.scanV4Ticks(pool, p, cov);
     const profile = tickStorageProfile(p.factory ?? undefined, { DEX_FACTORY: this.config.DEX_FACTORY, UNIV3_QUOTER: UNIV3_QUOTER_BASE });
     if (!profile?.quoter) { await this.db.failPoolTickStatus(cid, pool, "no known Quoter for fork → not storage-certifiable").catch(() => undefined); return { done: 1, rateLimited: false }; }
     const feePips = Number(p.fee) > 0 ? Number(p.fee) : 500;
