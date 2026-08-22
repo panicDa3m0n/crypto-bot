@@ -106,6 +106,27 @@ export class BlockIndexer {
     this.watchedWallets = s;
   }
 
+
+  /**
+   * Swallow a DB write failure WITHOUT making it invisible.
+   *
+   * These writes are deliberately non-fatal — one failed upsert must not kill a drain cycle. But
+   * `.catch(() => undefined)` also erases the evidence, and that is how half the defects in this system
+   * survived: a tier that never changed, an attempt counter that never incremented, a reschedule that did
+   * nothing. Failures are counted and reported on a throttle, so the pipeline still tolerates them while a
+   * persistent problem becomes something you can see rather than something you have to infer.
+   */
+  private writeFailures = 0;
+  private lastWriteFailAt = 0;
+  private readonly swallowWrite = (e: unknown): undefined => {
+    this.writeFailures += 1;
+    if (Date.now() - this.lastWriteFailAt > 60_000) {
+      this.lastWriteFailAt = Date.now();
+      this.logger.warn({ failures: this.writeFailures, last: e instanceof Error ? e.message.slice(0, 140) : String(e).slice(0, 140) }, "DB writes are failing and being swallowed — investigate");
+    }
+    return undefined;
+  };
+
   async start(): Promise<void> {
     if (!this.config.INDEXER_ENABLED) { this.logger.info("block-indexer disabled"); return; }
     const head = await this.head().catch(() => 0);
@@ -177,7 +198,7 @@ export class BlockIndexer {
       }
       if (best) priced.push({ token: T, priceUsd: best.price, confidence: best.conf, source: "indexer-backfill", block: best.block });
     }
-    if (priced.length) await this.db.upsertTokenPrices(cid, priced, { tauFastSec: this.config.VOL_TAU_FAST_SEC, tauSlowSec: this.config.VOL_TAU_SLOW_SEC }).catch(() => undefined);
+    if (priced.length) await this.db.upsertTokenPrices(cid, priced, { tauFastSec: this.config.VOL_TAU_FAST_SEC, tauSlowSec: this.config.VOL_TAU_SLOW_SEC }).catch(this.swallowWrite);
     return priced.length;
   }
 
@@ -198,13 +219,13 @@ export class BlockIndexer {
       const t0 = Date.now();
       const r = behind ? await this.catchUpParallel(this.cursor + 1, target) : await this.seqRange(this.cursor + 1, target);
       if (++this.ticks % 200 === 0) {
-        await this.db.pruneTokenStats(this.config.CHAIN_ID, 48).catch(() => undefined); // 48h retention for market-stat windows
-        if (this.config.DEBUG_KEEP_RAW_BLOCKS) await this.db.pruneRawBlocks(this.config.CHAIN_ID, this.config.INDEXER_RAW_RETENTION_HOURS).catch(() => undefined);
+        await this.db.pruneTokenStats(this.config.CHAIN_ID, 48).catch(this.swallowWrite); // 48h retention for market-stat windows
+        if (this.config.DEBUG_KEEP_RAW_BLOCKS) await this.db.pruneRawBlocks(this.config.CHAIN_ID, this.config.INDEXER_RAW_RETENTION_HOURS).catch(this.swallowWrite);
       }
       // Rolling raw-block buffer: trim to the last N blocks (~every 40 ticks so it stays near N, not unbounded).
-      if (this.config.INDEXER_RAW_BUFFER_BLOCKS > 0 && this.ticks % 40 === 0) await this.db.pruneRawBlocksKeepLast(this.config.CHAIN_ID, this.config.INDEXER_RAW_BUFFER_BLOCKS).catch(() => undefined);
+      if (this.config.INDEXER_RAW_BUFFER_BLOCKS > 0 && this.ticks % 40 === 0) await this.db.pruneRawBlocksKeepLast(this.config.CHAIN_ID, this.config.INDEXER_RAW_BUFFER_BLOCKS).catch(this.swallowWrite);
       // Rolling per-swap flow window: trim to the retain horizon (~every 20 ticks).
-      if (this.config.INDEXER_FLOW_ENABLED && this.ticks % 20 === 0) await this.db.pruneRecentSwaps(this.config.CHAIN_ID, this.config.INDEXER_FLOW_RETAIN_BLOCKS).catch(() => undefined);
+      if (this.config.INDEXER_FLOW_ENABLED && this.ticks % 20 === 0) await this.db.pruneRecentSwaps(this.config.CHAIN_ID, this.config.INDEXER_FLOW_RETAIN_BLOCKS).catch(this.swallowWrite);
       // Refresh the followed-wallet set (~every 20 ticks) so newly-followed smart-money starts being captured.
       if (this.ticks % 20 === 0) await this.refreshWatched();
       if (r.processed > 0) this.logger.info({ upTo: this.cursor, blocks: r.processed, swaps: r.swaps, discovered: r.discovered, lending: r.lending, ethUsd: this.ethUsd, ms: Date.now() - t0, lag: head - this.cursor, mode: behind ? "sync" : "live" }, "indexed blocks");
@@ -218,9 +239,9 @@ export class BlockIndexer {
   /** Persist the mirror's observable freshness for the read-side. WRITER = this indexer only. Does NOT
    * touch the cursor (indexer_state) — pure telemetry, never drives cold-start/resync. */
   private async writeChainStatus(): Promise<void> {
-    await this.db.upsertChainStatus({ chainId: this.config.CHAIN_ID, indexedBlock: this.cursor, networkHead: this.headBlock, synced: this.syncedFlag }).catch(() => undefined);
+    await this.db.upsertChainStatus({ chainId: this.config.CHAIN_ID, indexedBlock: this.cursor, networkHead: this.headBlock, synced: this.syncedFlag }).catch(this.swallowWrite);
     // Advance the continuous coverage watermark (Item 3) — the cursor moved contiguously this tick.
-    if (this.coverageStart >= 0) await this.db.upsertIndexerCoverage(this.config.CHAIN_ID, { coverageStart: this.coverageStart, continuousThrough: this.cursor, generation: this.coverageGeneration }).catch(() => undefined);
+    if (this.coverageStart >= 0) await this.db.upsertIndexerCoverage(this.config.CHAIN_ID, { coverageStart: this.coverageStart, continuousThrough: this.cursor, generation: this.coverageGeneration }).catch(this.swallowWrite);
   }
 
   /** Establish the current continuous-coverage segment at startup. Continue the prior segment on a normal
@@ -231,7 +252,7 @@ export class BlockIndexer {
     const prev = await this.db.getIndexerCoverage(cid).catch(() => null);
     if (stored != null && head - stored > this.config.INDEXER_MAX_RESYNC_GAP && this.cursor > stored + 1) {
       // JUMP: [stored+1, cursor-1] was never observed.
-      await this.db.recordIndexerGap(cid, stored + 1, this.cursor - 1, `cold-start jump (gap ${head - stored} > ${this.config.INDEXER_MAX_RESYNC_GAP})`).catch(() => undefined);
+      await this.db.recordIndexerGap(cid, stored + 1, this.cursor - 1, `cold-start jump (gap ${head - stored} > ${this.config.INDEXER_MAX_RESYNC_GAP})`).catch(this.swallowWrite);
       const invalidated = await this.db.invalidateTickCertification(cid, `indexer gap ${stored + 1}-${this.cursor - 1}`).catch(() => 0);
       this.coverageStart = this.cursor;
       this.coverageGeneration = (prev?.generation ?? 0) + 1;
@@ -241,7 +262,7 @@ export class BlockIndexer {
     } else {
       this.coverageStart = this.cursor; this.coverageGeneration = (prev?.generation ?? -1) + 1; // fresh (or pre-Item-3 data) → new segment from here
     }
-    await this.db.upsertIndexerCoverage(cid, { coverageStart: this.coverageStart, continuousThrough: this.cursor, generation: this.coverageGeneration }).catch(() => undefined);
+    await this.db.upsertIndexerCoverage(cid, { coverageStart: this.coverageStart, continuousThrough: this.cursor, generation: this.coverageGeneration }).catch(this.swallowWrite);
   }
 
   /** At head. Sets the live `synced` flag every time (Scarlet's per-cycle freshness gate). The FIRST time,
@@ -267,7 +288,7 @@ export class BlockIndexer {
       for (let b = from; b <= target; b++) {
         let logs = await this.blockReceiptsLogs(b);
         if (logs == null) logs = await this.getLogs(b, b, this.chain.indexer); // receipts RPC down → filtered (no stall)
-        if (this.config.INDEXER_RAW_BUFFER_BLOCKS > 0) await this.db.saveRawBlock(this.config.CHAIN_ID, b, logs).catch(() => undefined);
+        if (this.config.INDEXER_RAW_BUFFER_BLOCKS > 0) await this.db.saveRawBlock(this.config.CHAIN_ID, b, logs).catch(this.swallowWrite);
         const r = await this.applyRange(b, b, logs);
         processed += 1; swaps += r.swaps; discovered += r.discovered; lending += r.lending;
       }
@@ -343,7 +364,7 @@ export class BlockIndexer {
       swaps += r.swaps; discovered += r.discovered; lending += r.lending;
       this.cursor = b;
     }
-    await this.db.setIndexerCursor(this.config.CHAIN_ID, this.cursor).catch(() => undefined);
+    await this.db.setIndexerCursor(this.config.CHAIN_ID, this.cursor).catch(this.swallowWrite);
     // FRESHNESS AS IT HAPPENS, not once the tick ends. writeChainStatus used to run only in the tick's
     // `finally`, and a catch-up tick spans up to INDEXER_SYNC_MAX_CATCHUP blocks — so for the whole of it the
     // dashboard, the startup gate and the KG observer all read a value frozen minutes ago. Measured: the real
@@ -413,13 +434,13 @@ export class BlockIndexer {
       if (dynamicFee) meta.dynamicFee = true; else if (e.fee != null) meta.fee = e.fee;
       if (e.tickSpacing != null) meta.tickSpacing = e.tickSpacing;
       if (e.hooks) meta.hooks = e.hooks;
-      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.pool, kind: "pool", meta, source: "indexer", block }).catch(() => undefined);
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.pool, kind: "pool", meta, source: "indexer", block }).catch(this.swallowWrite);
       // Item 3: a CONCENTRATED pool created live (origin=created) has a COMPLETE tick map from birth — we
       // observe every Mint/Burn from creation. Certify it (invalidated later if a gap ever breaks continuity).
-      if (LIQUIDITY_INDEXED_ARCHETYPES.has(e.archetype)) await this.db.upsertPoolTickStatus(this.config.CHAIN_ID, e.pool, { status: "complete", source: "live_indexer", creationBlock: block, throughBlock: block, complete: true }).catch(() => undefined);
-      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t0, kind: "token", source: "indexer", block }).catch(() => undefined);
-      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t1, kind: "token", source: "indexer", block }).catch(() => undefined);
-      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.factory, kind: "dex", meta: { role: "factory", discoveredBy: "indexer" }, source: "indexer", block }).catch(() => undefined);
+      if (LIQUIDITY_INDEXED_ARCHETYPES.has(e.archetype)) await this.db.upsertPoolTickStatus(this.config.CHAIN_ID, e.pool, { status: "complete", source: "live_indexer", creationBlock: block, throughBlock: block, complete: true }).catch(this.swallowWrite);
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t0, kind: "token", source: "indexer", block }).catch(this.swallowWrite);
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t1, kind: "token", source: "indexer", block }).catch(this.swallowWrite);
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.factory, kind: "dex", meta: { role: "factory", discoveredBy: "indexer" }, source: "indexer", block }).catch(this.swallowWrite);
       discovered += 1;
     }
     if (discovered) this.onDiscovery?.(); // push: new bare token/pool entities → enricher drains now
@@ -453,7 +474,7 @@ export class BlockIndexer {
       if (pools.has(e.pool)) continue;
       if (e.kind === "swap_v3" && e.v4) continue; // a V4 poolId can't be enriched on-chain (no reverse lookup) → only discover V4 pools via Initialize
       const archetype = e.kind === "swap_v3" ? "v3" : e.archetype;
-      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.pool, kind: "pool", meta: { archetype, discoveredBy: "indexer", origin: "swap" }, source: "indexer", block }).catch(() => undefined);
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.pool, kind: "pool", meta: { archetype, discoveredBy: "indexer", origin: "swap" }, source: "indexer", block }).catch(this.swallowWrite);
       bareDiscovered += 1;
     }
     if (bareDiscovered) this.onDiscovery?.(); // push: bare pools discovered via swap → enricher drains now
@@ -570,7 +591,7 @@ export class BlockIndexer {
       if (this.config.INDEXER_FLOW_ENABLED && S >= this.config.INDEXER_FLOW_MIN_USD) flowRows.push({ pool: e.pool, wallet: e.to, valueUsd: S }); // per-swap flow (wallet = to)
     }
 
-    if (this.config.DEBUG_KEEP_RAW_BLOCKS && logs.length) await this.db.saveRawBlock(this.config.CHAIN_ID, block, logs).catch(() => undefined);
+    if (this.config.DEBUG_KEEP_RAW_BLOCKS && logs.length) await this.db.saveRawBlock(this.config.CHAIN_ID, block, logs).catch(this.swallowWrite);
     // Flush the router tally on its own slow beat. SINGLE-FLIGHT and time-gated on purpose: during catch-up
     // many blocks are processed concurrently, and a size-triggered flush would let each of them start its own
     // upsert on the same table, contending on the same rows. The size bound stays only as a memory valve.
@@ -610,13 +631,13 @@ export class BlockIndexer {
       if (loanToken && collateralToken && oracle && irm && lltv != null) {
         const m = { loanToken, collateralToken, oracle, irm, lltv };
         this.marketCache.set(id, m);
-        await this.db.upsertLendingMarket({ chainId: this.config.CHAIN_ID, protocol: "morpho", marketId: id, ...m }).catch(() => undefined);
+        await this.db.upsertLendingMarket({ chainId: this.config.CHAIN_ID, protocol: "morpho", marketId: id, ...m }).catch(this.swallowWrite);
       }
       return true;
     }
     if (t0 === MORPHO_LIQUIDATE) {
       const borrower = addrFromTopic(l.topics[3]); if (!borrower) return false;
-      await this.db.closeLendingPosition(this.config.CHAIN_ID, "morpho", id, borrower, "Liquidate event (indexer)").catch(() => undefined);
+      await this.db.closeLendingPosition(this.config.CHAIN_ID, "morpho", id, borrower, "Liquidate event (indexer)").catch(this.swallowWrite);
       return true;
     }
     // Borrow: onBehalf = topics[2] is the borrower. Debt just appeared → track it (tier 'pending';
@@ -627,7 +648,7 @@ export class BlockIndexer {
       chainId: this.config.CHAIN_ID, protocol: "morpho", marketId: id, borrower,
       collateralToken: m.collateralToken, loanToken: m.loanToken, lltv: Number(m.lltv) / 1e18,
       meta: { oracle: m.oracle, irm: m.irm, lltv: m.lltv.toString(), discoveredBy: "indexer" }
-    }).catch(() => undefined);
+    }).catch(this.swallowWrite);
     return true;
   }
 
@@ -643,7 +664,7 @@ export class BlockIndexer {
       const m = { loanToken: r[0].toLowerCase(), collateralToken: r[1].toLowerCase(), oracle: r[2].toLowerCase(), irm: r[3].toLowerCase(), lltv: r[4] };
       if (m.collateralToken === "0x0000000000000000000000000000000000000000") return null;
       this.marketCache.set(id, m);
-      await this.db.upsertLendingMarket({ chainId: this.config.CHAIN_ID, protocol: "morpho", marketId: id, ...m }).catch(() => undefined);
+      await this.db.upsertLendingMarket({ chainId: this.config.CHAIN_ID, protocol: "morpho", marketId: id, ...m }).catch(this.swallowWrite);
       return m;
     } catch (e) { this.logger.debug({ err: e, id }, "idToMarketParams bootstrap failed"); return null; }
   }

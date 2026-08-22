@@ -81,13 +81,34 @@ export class RegistryEnricher {
     private readonly reprice?: (tokens: string[]) => Promise<void> // backfill hook (indexer.repriceFromState)
   ) {}
 
+
+  /**
+   * Swallow a DB write failure WITHOUT making it invisible.
+   *
+   * These writes are deliberately non-fatal — one failed upsert must not kill a drain cycle. But
+   * `.catch(() => undefined)` also erases the evidence, and that is how half the defects in this system
+   * survived: a tier that never changed, an attempt counter that never incremented, a reschedule that did
+   * nothing. Failures are counted and reported on a throttle, so the pipeline still tolerates them while a
+   * persistent problem becomes something you can see rather than something you have to infer.
+   */
+  private writeFailures = 0;
+  private lastWriteFailAt = 0;
+  private readonly swallowWrite = (e: unknown): undefined => {
+    this.writeFailures += 1;
+    if (Date.now() - this.lastWriteFailAt > 60_000) {
+      this.lastWriteFailAt = Date.now();
+      this.logger.warn({ failures: this.writeFailures, last: e instanceof Error ? e.message.slice(0, 140) : String(e).slice(0, 140) }, "DB writes are failing and being swallowed — investigate");
+    }
+    return undefined;
+  };
+
   start(): void {
     this.logger.info({ lane: this.chain.enrichmentRpc }, "enrichment worker started (dedicated RPC)");
     // Give previously-burned entities another chance: an entity marked failed by a WRITE-SIDE fault (flaky
     // RPC) is a silent data hole downstream. Completeness is the goal, so failures are not permanent.
     void this.db.resetEnrichFailures(this.config.CHAIN_ID, "pool")
       .then((n) => { if (n) this.logger.info({ requeued: n }, "enrichment: returned previously-failed pools to the buffer"); })
-      .catch(() => undefined);
+      .catch(this.swallowWrite);
     this.schedule(FAST_MS);
   }
   stop(): void { if (this.timer) clearTimeout(this.timer); }
@@ -163,11 +184,11 @@ export class RegistryEnricher {
       const passes: Record<string, number> = {};
       for (const [k, v] of [["pool", pools.done], ["token", toks.done], ["factory", facs.done], ["factoryReverse", rev.done], ["protocolFee", pfee.done], ["symbol", syms.done], ["classify", cls.done], ["aeroStable", aero.done], ["dexIdentity", dex.done]] as const) if (v) passes[k] = v;
       if (did || rateLimited) {
-        await this.db.logEnrichmentCycle(this.config.CHAIN_ID, block, passes, rateLimited, rateLimited ? "RPC lane rate-limited — buffer waits and resumes" : undefined).catch(() => undefined);
+        await this.db.logEnrichmentCycle(this.config.CHAIN_ID, block, passes, rateLimited, rateLimited ? "RPC lane rate-limited — buffer waits and resumes" : undefined).catch(this.swallowWrite);
       } else {
         // Nothing advanced: say WHY, so "stuck" is distinguishable from "finished".
         const left = await this.db.countEnrichPending(this.config.CHAIN_ID).catch(() => 0);
-        if (left > 0) await this.db.logEnrichmentCycle(this.config.CHAIN_ID, block, {}, false, `${left} entità in coda ma nessun avanzamento — candidati non risolvibili o cap tentativi raggiunto`).catch(() => undefined);
+        if (left > 0) await this.db.logEnrichmentCycle(this.config.CHAIN_ID, block, {}, false, `${left} entità in coda ma nessun avanzamento — candidati non risolvibili o cap tentativi raggiunto`).catch(this.swallowWrite);
       }
       // Tick-map bootstrap (Item 3.2): P0 (demand-driven, KG-requested) runs ALWAYS so it's never starved;
       // P1–P3 (background historical) only when the fast queues are idle.
@@ -192,7 +213,7 @@ export class RegistryEnricher {
       if (Date.now() - this.lastGasAt > GAS_POLL_INTERVAL_MS) {
         this.lastGasAt = Date.now();
         const gp = await this.chain.primary.getGasPrice().catch(() => 0n);
-        if (gp > 0n) await this.db.upsertGasState(this.config.CHAIN_ID, gp).catch(() => undefined);
+        if (gp > 0n) await this.db.upsertGasState(this.config.CHAIN_ID, gp).catch(this.swallowWrite);
       }
       // Etherscan verified/proxy signal — only when the fast queue is idle and not more than once per interval.
       // Same reasoning: its own interval is the throttle, not the absence of other work.
@@ -303,16 +324,16 @@ export class RegistryEnricher {
         // is the goal; failing closed is only the net for when it genuinely is not there.
         const recovered = blocked.includes("fee") ? await this.recoverSlot0Fee(p.address, block) : false;
         if (!recovered) {
-          await this.db.mergeEntityMeta(this.config.CHAIN_ID, p.address, "pool", { enrichBlockedBy: blocked }).catch(() => undefined);
-          await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, p.address, "pool", block, MAX_ATTEMPTS).catch(() => undefined);
+          await this.db.mergeEntityMeta(this.config.CHAIN_ID, p.address, "pool", { enrichBlockedBy: blocked }).catch(this.swallowWrite);
+          await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, p.address, "pool", block, MAX_ATTEMPTS).catch(this.swallowWrite);
         }
       }
       // Count an attempt ONLY on a definitive answer (the call resolved and the data isn't there). After a
       // transport failure we leave the pool untouched so it is retried later instead of being burned.
-      if (!meta || !Object.keys(meta).length) { if (!transportFailed && !blocked?.length) await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, p.address, "pool", block, MAX_ATTEMPTS).catch(() => undefined); continue; }
-      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: p.address, kind: "pool", meta, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+      if (!meta || !Object.keys(meta).length) { if (!transportFailed && !blocked?.length) await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, p.address, "pool", block, MAX_ATTEMPTS).catch(this.swallowWrite); continue; }
+      await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: p.address, kind: "pool", meta, source: "enricher", block: block ?? undefined }).catch(this.swallowWrite);
       // Ensure the two tokens exist as entities so they enter the buffer for decimals enrichment next.
-      for (const f of ["token0", "token1"] as const) { const t = meta[f] as string | undefined; if (t) await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t, kind: "token", source: "enricher", block: block ?? undefined }).catch(() => undefined); }
+      for (const f of ["token0", "token1"] as const) { const t = meta[f] as string | undefined; if (t) await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: t, kind: "token", source: "enricher", block: block ?? undefined }).catch(this.swallowWrite); }
       done += 1;
     }
     return { done, rateLimited: false };
@@ -333,7 +354,7 @@ export class RegistryEnricher {
       const r = await this.bulkClient().readContract({ address: pool as Address, abi: SLOT0_WITH_FEE_ABI, functionName: "slot0" }) as readonly [bigint, number, number, boolean];
       const fee = Number(r?.[2]);
       if (!Number.isFinite(fee) || fee <= 0 || fee >= 1_000_000) return false;
-      await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "solidly-v3", fee, dynamicFee: true, feeSource: "slot0", enrichBlockedBy: null }).catch(() => undefined);
+      await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "solidly-v3", fee, dynamicFee: true, feeSource: "slot0", enrichBlockedBy: null }).catch(this.swallowWrite);
       this.logger.info({ pool: pool.slice(0, 12), fee }, "fee recovered from slot0 — pool reclassified solidly-v3");
       return true;
     } catch { return false; } // not this shape either → the caller records the refusal as before
@@ -374,15 +395,15 @@ export class RegistryEnricher {
       const decimals = dc != null && Number.isFinite(Number(dc)) && Number(dc) >= 0 && Number(dc) <= 36 ? Number(dc) : undefined;
       if (decimals != null) {
         // Writing decimals flips `enrich_pending` false automatically (generated) + advances updated_block.
-        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.address, kind: "token", decimals, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+        await this.db.upsertEntity({ chainId: this.config.CHAIN_ID, address: e.address, kind: "token", decimals, source: "enricher", block: block ?? undefined }).catch(this.swallowWrite);
         gotDecimals.push(e.address); done += 1;
       } else if (laneAlive) {
         // The transport is proven, so a non-answer is about THIS contract: count it, and let the cap apply.
-        await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, e.address, "token", block, MAX_ATTEMPTS).catch(() => undefined);
+        await this.db.bumpEnrichAttempt(this.config.CHAIN_ID, e.address, "token", block, MAX_ATTEMPTS).catch(this.swallowWrite);
       }
     }
     // Backfill USD price for the freshly-decimalled tokens from the stored pool_state (no RPC).
-    if (gotDecimals.length && this.reprice) await this.reprice(gotDecimals).catch(() => undefined);
+    if (gotDecimals.length && this.reprice) await this.reprice(gotDecimals).catch(this.swallowWrite);
     if (done) this.logger.info({ filled: done, of: need.length, backfilled: gotDecimals.length }, "token decimals enriched (batched)");
     return { done, rateLimited: false };
   }
@@ -435,11 +456,11 @@ export class RegistryEnricher {
       // The exact stable math needs a REAL fee — never a guessed one — so a pool whose fee did not answer is
       // left unmarked and retried, not written with a placeholder.
       if (r?.status !== "success") continue;
-      await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "aerodrome-stable", fee: Number(r.result as bigint) * 100, factory, stableChecked: block ?? 0 }).catch(() => undefined);
+      await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "aerodrome-stable", fee: Number(r.result as bigint) * 100, factory, stableChecked: block ?? 0 }).catch(this.swallowWrite);
       done += 1;
     }
     for (const pool of volatiles) {
-      await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "aerodrome", stableChecked: block ?? 0 }).catch(() => undefined);
+      await this.db.mergeEntityMeta(this.config.CHAIN_ID, pool, "pool", { archetype: "aerodrome", stableChecked: block ?? 0 }).catch(this.swallowWrite);
       done += 1;
     }
     if (unanswered.length) this.logger.debug({ unanswered: unanswered.length }, "aerodrome stable: pools left unmarked for retry");
@@ -481,7 +502,7 @@ export class RegistryEnricher {
     const p = batch[0];
     const pool = p.pool.toLowerCase() as Address;
     const isV4 = p.archetype === "v4"; // a poolId inside the singleton PoolManager, not a contract of its own
-    if (isV4 && !p.factory) { await this.db.noteTickBootstrapError(cid, pool, "V4 pool without its PoolManager (factory) — cannot filter its logs").catch(() => undefined); return { done: 0, rateLimited: false }; }
+    if (isV4 && !p.factory) { await this.db.noteTickBootstrapError(cid, pool, "V4 pool without its PoolManager (factory) — cannot filter its logs").catch(this.swallowWrite); return { done: 0, rateLimited: false }; }
     const hex = (n: number) => "0x" + n.toString(16);
     // Historical logs need archive depth the enrichment lane often lacks → cascade to primary/fallback.
     const lanes = [this.chain.enrichment, this.chain.primary, this.chain.fallback];
@@ -498,7 +519,7 @@ export class RegistryEnricher {
         const pm = (ent[0]?.meta ?? {}) as { token0?: string; token1?: string; fee?: unknown; factory?: string };
         const src = (p.origin === "created" && p.createdBlock != null) ? "pool_created" : "pool_created_log";
         creation = (p.origin === "created" && p.createdBlock != null) ? p.createdBlock : await this.locateCreationBlock(pool, pm, cov.continuousThrough);
-        if (creation == null) { await this.db.noteTickBootstrapError(cid, pool, "creation block not located (factory PoolCreated)").catch(() => undefined); return { done: 0, rateLimited: false }; }
+        if (creation == null) { await this.db.noteTickBootstrapError(cid, pool, "creation block not located (factory PoolCreated)").catch(this.swallowWrite); return { done: 0, rateLimited: false }; }
         await this.db.setPoolTickCreation(cid, pool, creation, src);
         status = await this.db.getPoolTickStatus(cid, pool);
       }
@@ -536,7 +557,7 @@ export class RegistryEnricher {
       return { done: chunks || 1, rateLimited: false };
     } catch (e) {
       if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: 0, rateLimited: true }; }
-      await this.db.failPoolTickStatus(cid, pool, e instanceof Error ? e.message : String(e)).catch(() => undefined);
+      await this.db.failPoolTickStatus(cid, pool, e instanceof Error ? e.message : String(e)).catch(this.swallowWrite);
       return { done: 0, rateLimited: false };
     }
   }
@@ -585,24 +606,24 @@ export class RegistryEnricher {
     const client = this.getScanClient();
     if (!client) return { done: 0, rateLimited: false };
     const spacing = Number(p.tickSpacing) > 0 ? Number(p.tickSpacing) : 0;
-    if (!spacing) { await this.db.failPoolTickStatus(cid, pool, "v4 tick scan: tickSpacing unknown — the bitmap walk would read the wrong words").catch(() => undefined); return { done: 1, rateLimited: false }; }
+    if (!spacing) { await this.db.failPoolTickStatus(cid, pool, "v4 tick scan: tickSpacing unknown — the bitmap walk would read the wrong words").catch(this.swallowWrite); return { done: 1, rateLimited: false }; }
     try {
       const head = Number(await client.getBlockNumber().catch(() => 0n));
       if (!head) return { done: 0, rateLimited: false };
       const B = Math.min(head - 3, cov.continuousThrough);
       if (B <= 0) return { done: 0, rateLimited: false };
       const read = await readTicksInWindow(client, { pool, kind: "v4-stateview", tickSpacing: spacing, block: B });
-      if (!read) { await this.db.noteTickBootstrapError(cid, pool, "v4 tick scan: StateView read failed").catch(() => undefined); return { done: 1, rateLimited: false }; }
+      if (!read) { await this.db.noteTickBootstrapError(cid, pool, "v4 tick scan: StateView read failed").catch(this.swallowWrite); return { done: 1, rateLimited: false }; }
       // A snapshot SUMMARISES all prior history, so it REPLACES the pool's map rather than adding to it.
       // Snapshot AT block B, and our continuous coverage already reaches B, so there are no deltas to replay.
       const w = await this.db.replaceTickMapSnapshot(cid, pool, B, read.ticks, B, []);
-      if (!w.ok) { await this.db.failPoolTickStatus(cid, pool, `v4 tick scan: ${w.reason ?? "apply failed"}`).catch(() => undefined); return { done: 1, rateLimited: false }; }
+      if (!w.ok) { await this.db.failPoolTickStatus(cid, pool, `v4 tick scan: ${w.reason ?? "apply failed"}`).catch(this.swallowWrite); return { done: 1, rateLimited: false }; }
       await this.db.certifyPoolTickComplete(cid, pool, cov.generation, "v4-stateview");
       this.logger.info({ pool: pool.slice(0, 12), ticks: read.ticks.length, words: read.words, block: B }, "v4 tick map recovered from StateView");
       return { done: 1, rateLimited: false };
     } catch (e) {
       if (isRateLimit(e)) { this.chain.laneError("enrichment", e); return { done: 0, rateLimited: true }; }
-      await this.db.noteTickBootstrapError(cid, pool, `v4 tick scan: ${e instanceof Error ? e.message.slice(0, 90) : String(e).slice(0, 90)}`).catch(() => undefined);
+      await this.db.noteTickBootstrapError(cid, pool, `v4 tick scan: ${e instanceof Error ? e.message.slice(0, 90) : String(e).slice(0, 90)}`).catch(this.swallowWrite);
       return { done: 1, rateLimited: false };
     }
   }
@@ -617,17 +638,17 @@ export class RegistryEnricher {
     if (!batch.length) return { done: 0, rateLimited: false };
     const p = batch[0];
     const pool = p.pool.toLowerCase() as Address;
-    if (!p.token0 || !p.token1) { await this.db.noteTickBootstrapError(cid, pool, "storage scan: tokens unknown").catch(() => undefined); return { done: 0, rateLimited: false }; }
+    if (!p.token0 || !p.token1) { await this.db.noteTickBootstrapError(cid, pool, "storage scan: tokens unknown").catch(this.swallowWrite); return { done: 0, rateLimited: false }; }
     // V4 has no pool CONTRACT to scan — its state lives inside the singleton PoolManager and is read through
     // StateView. That is exactly what the tick-source adapters were built and verified for, and never wired
     // to: the recovery path simply returned here, so the 20,625 re-opened V4 maps had NO way back. Routing
     // them to the adapter is what turns that from a permanent gap into ordinary work.
     if (p.archetype === "v4") return await this.scanV4Ticks(pool, p, cov);
     const profile = tickStorageProfile(p.factory ?? undefined, { DEX_FACTORY: this.config.DEX_FACTORY, UNIV3_QUOTER: UNIV3_QUOTER_BASE });
-    if (!profile?.quoter) { await this.db.failPoolTickStatus(cid, pool, "no known Quoter for fork → not storage-certifiable").catch(() => undefined); return { done: 1, rateLimited: false }; }
+    if (!profile?.quoter) { await this.db.failPoolTickStatus(cid, pool, "no known Quoter for fork → not storage-certifiable").catch(this.swallowWrite); return { done: 1, rateLimited: false }; }
     const feePips = Number(p.fee) > 0 ? Number(p.fee) : 500;
     const tickSpacing = tickSpacingFor(Number(p.tickSpacing), feePips) ?? 0;
-    if (!tickSpacing) { await this.db.failPoolTickStatus(cid, pool, "storage scan: tickSpacing unknown").catch(() => undefined); return { done: 1, rateLimited: false }; }
+    if (!tickSpacing) { await this.db.failPoolTickStatus(cid, pool, "storage scan: tickSpacing unknown").catch(this.swallowWrite); return { done: 1, rateLimited: false }; }
     try {
       const head = Number(await client.getBlockNumber().catch(() => 0n));
       if (!head) return { done: 0, rateLimited: false };
@@ -640,11 +661,11 @@ export class RegistryEnricher {
       if (!snap) {
         const { words } = bitmapWordRange(tickSpacing);
         const reason = words > 2000 ? `storage scan: word cost guard (${words} words @spacing ${tickSpacing})` : `storage scan: read/decode failed @spacing ${tickSpacing} (${words} words) — pool ABI or RPC`;
-        await this.db.noteTickBootstrapError(cid, pool, reason).catch(() => undefined);
+        await this.db.noteTickBootstrapError(cid, pool, reason).catch(this.swallowWrite);
         return { done: 1, rateLimited: false };
       }
       const v = await validateSnapshotVsQuoter(client, profile.quoter, snap, p.token0 as Address, p.token1 as Address, feePips, tickSpacing);
-      if (!v.validated) { await this.db.failPoolTickStatus(cid, pool, `storage snapshot did not reproduce Quoter (${v.detail})`).catch(() => undefined); return { done: 1, rateLimited: false }; }
+      if (!v.validated) { await this.db.failPoolTickStatus(cid, pool, `storage snapshot did not reproduce Quoter (${v.detail})`).catch(this.swallowWrite); return { done: 1, rateLimited: false }; }
       // Replay live Mint/Burn [B+1, cursor] so the authoritative snapshot is current with the indexer head.
       const cursor = (await this.db.getIndexerCursor(cid).catch(() => null)) ?? cov.continuousThrough;
       const replay: Array<{ tickLower: number; tickUpper: number; liquidityDelta: bigint }> = [];
@@ -655,7 +676,7 @@ export class RegistryEnricher {
         for (const l of logs ?? []) { const d = EVENT_DECODERS.get((l.topics[0] ?? "").toLowerCase())?.(l); if (d && d.kind === "liquidity_v3") replay.push({ tickLower: d.tickLower, tickUpper: d.tickUpper, liquidityDelta: d.liquidityDelta }); }
       }
       const r = await this.db.replaceTickMapSnapshot(cid, pool, B, snap.ticks, cursor, replay);
-      if (!r.ok) { await this.db.failPoolTickStatus(cid, pool, r.reason ?? "snapshot replace failed").catch(() => undefined); return { done: 1, rateLimited: false }; }
+      if (!r.ok) { await this.db.failPoolTickStatus(cid, pool, r.reason ?? "snapshot replace failed").catch(this.swallowWrite); return { done: 1, rateLimited: false }; }
       // RE-CHECK: coverage generation/start must still hold (the indexer may have reset mid-scan) before certify.
       const cov2 = await this.db.getIndexerCoverage(cid).catch(() => null);
       if (cov2 && cov2.generation === cov.generation && cov2.coverageStart === cov.coverageStart) {
@@ -665,7 +686,7 @@ export class RegistryEnricher {
       return { done: 1, rateLimited: false };
     } catch (e) {
       if (isRateLimit(e)) return { done: 0, rateLimited: true };
-      await this.db.failPoolTickStatus(cid, pool, e instanceof Error ? e.message : String(e)).catch(() => undefined);
+      await this.db.failPoolTickStatus(cid, pool, e instanceof Error ? e.message : String(e)).catch(this.swallowWrite);
       return { done: 0, rateLimited: false };
     }
   }
@@ -690,14 +711,14 @@ export class RegistryEnricher {
     for (let i = 0; i < batch.length; i++) {
       const p = batch[i];
       if (res[i]?.status === "success") {
-        await this.db.upsertEntity({ chainId: cid, address: p.address, kind: "pool", meta: { factory: String(res[i].result).toLowerCase() }, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+        await this.db.upsertEntity({ chainId: cid, address: p.address, kind: "pool", meta: { factory: String(res[i].result).toLowerCase() }, source: "enricher", block: block ?? undefined }).catch(this.swallowWrite);
         done++;
       } else {
         // Count the attempt (bounded) instead of excluding forever. Once the cap is hit the pool moves to the
         // REVERSE-LOOKUP pass — the datum is recoverable another way, so it is never simply dropped.
         const prev = await this.db.getEntity(cid, p.address).catch(() => []);
         const n = Number(((prev[0]?.meta ?? {}) as { factoryAttempts?: unknown }).factoryAttempts ?? 0) + 1;
-        await this.db.mergeEntityMeta(cid, p.address, "pool", { factoryAttempts: n }).catch(() => undefined);
+        await this.db.mergeEntityMeta(cid, p.address, "pool", { factoryAttempts: n }).catch(this.swallowWrite);
         unexposed++;
       }
     }
@@ -738,10 +759,10 @@ export class RegistryEnricher {
         const m = meta[hit];
         const patch: Record<string, unknown> = { factory: m.factory.toLowerCase(), factoryResolvedBy: "reverse-getPair" };
         if (m.stable !== undefined) patch.stableFlag = m.stable; // the factory also tells us the curve variant
-        await this.db.upsertEntity({ chainId: cid, address: p.address, kind: "pool", meta: patch, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+        await this.db.upsertEntity({ chainId: cid, address: p.address, kind: "pool", meta: patch, source: "enricher", block: block ?? undefined }).catch(this.swallowWrite);
         done++;
       } else {
-        await this.db.mergeEntityMeta(cid, p.address, "pool", { factoryResolvedBy: "none (no candidate factory claims it)" }).catch(() => undefined);
+        await this.db.mergeEntityMeta(cid, p.address, "pool", { factoryResolvedBy: "none (no candidate factory claims it)" }).catch(this.swallowWrite);
       }
     }
     return { done, rateLimited: false };
@@ -787,7 +808,7 @@ export class RegistryEnricher {
   private async deriveRouters(cid: number, block: number | null): Promise<number> {
     let n = 0;
     for (const c of await this.db.routerCandidates(cid).catch(() => [])) {
-      await this.db.upsertEntity({ chainId: cid, address: c.factory, kind: "dex", meta: { router: c.router, routerSource: `swap-sender: ${c.swaps} swaps on ${c.pools} pools, exclusivity ${(c.exclusivity * 100).toFixed(1)}%` }, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+      await this.db.upsertEntity({ chainId: cid, address: c.factory, kind: "dex", meta: { router: c.router, routerSource: `swap-sender: ${c.swaps} swaps on ${c.pools} pools, exclusivity ${(c.exclusivity * 100).toFixed(1)}%` }, source: "enricher", block: block ?? undefined }).catch(this.swallowWrite);
       this.logger.info({ factory: c.factory, router: c.router, swaps: c.swaps, pools: c.pools, exclusivity: Number(c.exclusivity.toFixed(3)) }, "router derived from swap senders");
       n += 1;
     }
@@ -837,12 +858,12 @@ export class RegistryEnricher {
         // BOUNDED best-effort: an unverified contract has no name to give, so asking again every cycle only
         // burns a rate-limited third-party API. Try a couple of times, then stop and keep the factory usable.
         if (!name && this.etherscan.available && f.nameAttempts < 2) {
-          name = (await this.etherscan.contractMeta(f.address).catch(() => undefined))?.contractName ?? undefined;
+          name = (await this.etherscan.contractMeta(f.address).catch(this.swallowWrite))?.contractName ?? undefined;
           if (!name) patch.nameAttempts = f.nameAttempts + 1;
         }
       }
       if (!Object.keys(patch).length && !name) continue;
-      await this.db.upsertEntity({ chainId: cid, address: f.address, kind: "dex", name, meta: patch, source: "enricher", block: block ?? undefined }).catch(() => undefined);
+      await this.db.upsertEntity({ chainId: cid, address: f.address, kind: "dex", name, meta: patch, source: "enricher", block: block ?? undefined }).catch(this.swallowWrite);
       done++;
       await this.pace();
     }
@@ -862,8 +883,8 @@ export class RegistryEnricher {
     let done = 0;
     for (let i = 0; i < batch.length; i++) {
       const v = res[i]?.status === "success" ? String(res[i].result).slice(0, 32) : null;
-      if (v && v !== "?") { await this.db.upsertEntity({ chainId: cid, address: batch[i], kind: "token", symbol: v, source: "enricher", block: block ?? undefined }).catch(() => undefined); done++; }
-      else await this.db.mergeEntityMeta(cid, batch[i], "token", { symbolAttempts: 1 }).catch(() => undefined);
+      if (v && v !== "?") { await this.db.upsertEntity({ chainId: cid, address: batch[i], kind: "token", symbol: v, source: "enricher", block: block ?? undefined }).catch(this.swallowWrite); done++; }
+      else await this.db.mergeEntityMeta(cid, batch[i], "token", { symbolAttempts: 1 }).catch(this.swallowWrite);
     }
     return { done, rateLimited: false };
   }
@@ -893,8 +914,8 @@ export class RegistryEnricher {
       else if (hasGlobal?.status === "success") archetype = "v3";                       // Algebra-family (concentrated)
       else if (stableRes?.status === "success") archetype = stableRes.result === true ? "aerodrome-stable" : "aerodrome";
       else if (hasReserves?.status === "success") archetype = "v2";
-      if (archetype) { await this.db.upsertEntity({ chainId: cid, address: batch[i].address, kind: "pool", meta: { archetype, archetypeSource: "abi-fingerprint" }, source: "enricher", block: block ?? undefined }).catch(() => undefined); done++; }
-      else await this.db.mergeEntityMeta(cid, batch[i].address, "pool", { classifyAttempts: 1 }).catch(() => undefined);
+      if (archetype) { await this.db.upsertEntity({ chainId: cid, address: batch[i].address, kind: "pool", meta: { archetype, archetypeSource: "abi-fingerprint" }, source: "enricher", block: block ?? undefined }).catch(this.swallowWrite); done++; }
+      else await this.db.mergeEntityMeta(cid, batch[i].address, "pool", { classifyAttempts: 1 }).catch(this.swallowWrite);
     }
     return { done, rateLimited: false };
   }
@@ -907,11 +928,11 @@ export class RegistryEnricher {
     if (!batch.length) return;
     let verified = 0, unverified = 0;
     for (const e of batch) {
-      const m = await this.etherscan.contractMeta(e.address).catch(() => undefined);
+      const m = await this.etherscan.contractMeta(e.address).catch(this.swallowWrite);
       const patch: Record<string, unknown> = m
         ? { verified: m.verified, contractName: m.contractName ?? null, isProxy: m.isProxy, implementation: m.implementation ?? null, verifiedCheckedAt: new Date().toISOString() }
         : { verifiedCheckedAt: new Date().toISOString(), metaError: true };
-      await this.db.mergeEntityMeta(this.config.CHAIN_ID, e.address, e.kind, patch).catch(() => undefined);
+      await this.db.mergeEntityMeta(this.config.CHAIN_ID, e.address, e.kind, patch).catch(this.swallowWrite);
       if (m?.verified) verified += 1; else if (m) unverified += 1;
       await new Promise((r) => setTimeout(r, 250)); // < 5 req/s (Etherscan free tier)
     }

@@ -69,6 +69,27 @@ export class PositionRegistry {
     private readonly wake: (key: string, reason: string) => void
   ) {}
 
+
+  /**
+   * Swallow a DB write failure WITHOUT making it invisible.
+   *
+   * These writes are deliberately non-fatal — one failed upsert must not kill a drain cycle. But
+   * `.catch(() => undefined)` also erases the evidence, and that is how half the defects in this system
+   * survived: a tier that never changed, an attempt counter that never incremented, a reschedule that did
+   * nothing. Failures are counted and reported on a throttle, so the pipeline still tolerates them while a
+   * persistent problem becomes something you can see rather than something you have to infer.
+   */
+  private writeFailures = 0;
+  private lastWriteFailAt = 0;
+  private readonly swallowWrite = (e: unknown): undefined => {
+    this.writeFailures += 1;
+    if (Date.now() - this.lastWriteFailAt > 60_000) {
+      this.lastWriteFailAt = Date.now();
+      this.logger.warn({ failures: this.writeFailures, last: e instanceof Error ? e.message.slice(0, 140) : String(e).slice(0, 140) }, "DB writes are failing and being swallowed — investigate");
+    }
+    return undefined;
+  };
+
   /**
    * OUR executable exit of a liquidation, decided in LOAN-TOKEN units — NO USD in the decision.
    * A Morpho liquidation seizes min(collateral, debt·LIF worth) and repays min(debt, collateral/LIF);
@@ -147,7 +168,7 @@ export class PositionRegistry {
           chainId: this.config.CHAIN_ID, protocol: "morpho", marketId: p.marketId, borrower: p.user,
           collateralToken: p.collateral.address, collateralSymbol: p.collateral.symbol, loanToken: p.loan.address, loanSymbol: p.loan.symbol, lltv: p.lltv,
           meta: { oracle: p.oracle, irm: p.irm, lltv: p.lltvRaw, collateralDecimals: p.collateral.decimals, collateralRaw: p.collateralRaw, debtRaw: p.debtRaw, loanDecimals: p.loan.decimals }
-        }).catch(() => undefined);
+        }).catch(this.swallowWrite);
         // PROXIMITY-GATED classification: the costly part is exitValue (an aggregator quote). Run the
         // full classify only for the near band (HF ≤ LIQ_EXIT_HF); the farther pipeline is stored as a
         // lightweight "candidate" (known + HF-tracked, no quote). Each enumerate re-bands by fresh HF,
@@ -191,7 +212,7 @@ export class PositionRegistry {
       eventKeys.add(`${marketId.toLowerCase()}:${borrower}`);
     }
     const missed = [...eventKeys].filter((k) => !enumerated.has(k));
-    await this.db.saveMarketSnapshot("liq", "event-crosscheck", { observedAt: new Date().toISOString(), source: "blockscout", borrowEvents: logs.length, activeBorrowers: eventKeys.size, apiPositions: apiCount, missedByApi: missed.length }).catch(() => undefined);
+    await this.db.saveMarketSnapshot("liq", "event-crosscheck", { observedAt: new Date().toISOString(), source: "blockscout", borrowEvents: logs.length, activeBorrowers: eventKeys.size, apiPositions: apiCount, missedByApi: missed.length }).catch(this.swallowWrite);
     if (apiCount === 0 && eventKeys.size > 0) this.logger.warn({ activeBorrowers: eventKeys.size }, "Morpho API returned 0 but Borrow events show live borrowers — API likely DOWN, not a quiet market");
     else if (missed.length > 0) this.logger.info({ missedByApi: missed.length, activeBorrowers: eventKeys.size }, "Morpho event cross-check: borrowers seen on-chain but absent from the API enumeration");
     else this.logger.debug({ activeBorrowers: eventKeys.size }, "Morpho event cross-check: API complete vs recent events");
@@ -206,7 +227,7 @@ export class PositionRegistry {
     const fromBlock = head > 0 ? Math.max(0, head - this.config.LIQ_EVENT_RANGE) : 0;
     const logs = await this.blockscout.contractLogs(this.config.MORPHO_CORE, { topic0: MORPHO_LIQUIDATE_TOPIC, fromBlock, toBlock: "latest" }).catch(() => null);
     if (!logs || !logs.length) return;
-    const organ = (await this.db.getOrgan("atomic-executor").catch(() => undefined))?.address?.toLowerCase();
+    const organ = (await this.db.getOrgan("atomic-executor").catch(this.swallowWrite))?.address?.toLowerCase();
     const ours = new Set([this.config.WALLET_ADDRESS?.toLowerCase(), organ].filter(Boolean) as string[]);
     let missed = 0, hit = 0;
     for (const l of logs) {
@@ -221,14 +242,14 @@ export class PositionRegistry {
       // unprofitable (low_collateral/blacklist), is NOT a miss — record only our HITs + true misses.
       // The position was LIQUIDATED — retire it so the monitor stops watching a taken prey. If it was
       // only partially liquidated (still active), the next enumerate re-classifies it (overrides closed).
-      if (pos) await this.db.closeLendingPosition(this.config.CHAIN_ID, "morpho", marketId, borrower, `liquidated ${isOurs ? "by us" : "by another bot"} (Liquidate event)`).catch(() => undefined);
+      if (pos) await this.db.closeLendingPosition(this.config.CHAIN_ID, "morpho", marketId, borrower, `liquidated ${isOurs ? "by us" : "by another bot"} (Liquidate event)`).catch(this.swallowWrite);
       const actionable = pos && (pos.tier === "watch" || pos.tier === "profitable");
       if (!isOurs && !actionable) continue; // not our prey → not a miss, skip
       await this.db.recordLiquidationEvent({
         chainId: this.config.CHAIN_ID, kind: isOurs ? "hit" : "missed", protocol: "morpho", marketId, borrower,
         collateralSymbol: pos?.collateralSymbol ?? undefined, loanSymbol: pos?.loanSymbol ?? undefined, debtUsd: pos?.debtUsd ?? undefined, profitUsd: pos?.profitUsd ?? undefined,
         txHash: l.txHash, liquidator, note: isOurs ? "liquidated by us" : "found-actionable prey lost to another liquidator", meta: { blockNumber: l.blockNumber, tier: pos?.tier }
-      }).catch(() => undefined);
+      }).catch(this.swallowWrite);
       if (isOurs) hit += 1; else missed += 1;
     }
     if (missed || hit) this.logger.info({ missed, hit, scanned: logs.length }, "liquidation events recorded (missed=lost to others, hit=ours)");
@@ -264,7 +285,7 @@ export class PositionRegistry {
     }
     await this.db.setLendingTier(this.config.CHAIN_ID, "morpho", p.marketId, p.user, {
       tier, reason, hf: p.healthFactor, debtUsd: p.debtUsd, collateralUsd: p.collateralUsd, exitUsd, profitUsd, nextCheckSec: this.nextCheckSec(tier, p.healthFactor)
-    }).catch(() => undefined);
+    }).catch(this.swallowWrite);
     if (tier === "watch" && p.healthFactor < 1) {
       this.wake(`liq:${p.user}:${p.marketId}`, `LIQUIDATABLE + profitable: ${p.collateral.symbol}/${p.loan.symbol} borrower ${p.user.slice(0, 10)}… HF ${p.healthFactor.toFixed(3)}, exit ${exitUsd != null ? "$" + exitUsd.toFixed(0) : "covers"} > debt $${p.debtUsd.toFixed(0)}. Arm/fire the flash-kill.`);
     }
@@ -283,7 +304,7 @@ export class PositionRegistry {
       : `bad debt — collateral $${p.collateralUsd.toFixed(0)} ≤ debt $${p.debtUsd.toFixed(0)} (Morpho oracle)`;
     await this.db.setLendingTier(this.config.CHAIN_ID, "morpho", p.marketId, p.user, {
       tier, reason, hf: p.healthFactor, debtUsd: p.debtUsd, collateralUsd: p.collateralUsd, exitUsd: null, profitUsd: null, nextCheckSec: this.nextCheckSec(tier, p.healthFactor)
-    }).catch(() => undefined);
+    }).catch(this.swallowWrite);
     return solid ? "candidate" : "baddebt";
   }
 
@@ -333,7 +354,7 @@ export class PositionRegistry {
       const borrowAssets = mt.tbs === 0n || borrowShares === 0n ? 0n : (borrowShares * mt.tba + mt.tbs - 1n) / mt.tbs;
       const lltvRaw = BigInt(String(meta.lltv ?? "0"));
       if (borrowAssets === 0n) { // no debt left → the position is closed, which is a FACT, not an omission
-        await this.db.setLendingTier(this.config.CHAIN_ID, "morpho", row.marketId, row.borrower, { tier: "closed", reason: "no borrow shares on chain — debt repaid", hf: null, debtUsd: 0, collateralUsd: null, exitUsd: null, profitUsd: null, nextCheckSec: 86_400 }).catch(() => undefined);
+        await this.db.setLendingTier(this.config.CHAIN_ID, "morpho", row.marketId, row.borrower, { tier: "closed", reason: "no borrow shares on chain — debt repaid", hf: null, debtUsd: 0, collateralUsd: null, exitUsd: null, profitUsd: null, nextCheckSec: 86_400 }).catch(this.swallowWrite);
         resolved++; continue;
       }
       // Morpho's own health test: maxBorrow = collateral · price / 1e36 · lltv / 1e18, HF = maxBorrow / debt.
@@ -343,7 +364,7 @@ export class PositionRegistry {
         this.usdOf(row.collateralToken, collateral, Number(meta.collateralDecimals ?? NaN)),
         this.usdOf(row.loanToken, borrowAssets, Number(meta.loanDecimals ?? NaN)),
       ]);
-      await this.db.mergeLendingMeta(this.config.CHAIN_ID, "morpho", row.marketId, row.borrower, { collateralRaw: collateral.toString(), debtRaw: borrowAssets.toString(), resolvedBy: "chain" }).catch(() => undefined);
+      await this.db.mergeLendingMeta(this.config.CHAIN_ID, "morpho", row.marketId, row.borrower, { collateralRaw: collateral.toString(), debtRaw: borrowAssets.toString(), resolvedBy: "chain" }).catch(this.swallowWrite);
       // Band it, but NEVER straight into `watch`: that is the ARMED tier the monitor fires on, and entry to it
       // requires a sized exit quote proving the liquidation actually profits. This pass establishes size and
       // health, not profitability — so the best it can claim is `candidate` (known, tracked, unarmed), exactly
@@ -354,7 +375,7 @@ export class PositionRegistry {
         tier, reason: `resolved on chain — HF ${Number.isFinite(hf) ? hf.toFixed(3) : "∞"}${solid ? " (size+health known; exit not yet quoted)" : " (collateral ≤ debt)"}`,
         hf: Number.isFinite(hf) ? hf : null, debtUsd: dUsd, collateralUsd: cUsd, exitUsd: null, profitUsd: null,
         nextCheckSec: this.nextCheckSec(tier, Number.isFinite(hf) ? hf : 99),
-      }).catch(() => undefined);
+      }).catch(this.swallowWrite);
       resolved++;
     }
     return resolved;
@@ -442,7 +463,7 @@ export class PositionRegistry {
         const reason = noExit ? `NO verifiable DEX exit — ${pos.collateralSymbol} not routable at seized size; can't confirm sellable`
           : !profitable ? `no liquidation profit — seized exit ${(Number(exit.amountOutRaw) / 10 ** loanDec).toFixed(2)} ${pos.loanSymbol} ≤ debt repaid ${(Number(exit.debtRepaidRaw) / 10 ** loanDec).toFixed(2)}`
           : `HF ${hf.toFixed(3)} — liq profit ${pu} (exit ${exit.source})`;
-        await this.db.setLendingTier(this.config.CHAIN_ID, pos.protocol, pos.marketId, pos.borrower, { tier, reason, hf, debtUsd: pos.debtUsd, collateralUsd: pos.collateralUsd, exitUsd, profitUsd, nextCheckSec: this.nextCheckSec(tier, hf) }).catch(() => undefined);
+        await this.db.setLendingTier(this.config.CHAIN_ID, pos.protocol, pos.marketId, pos.borrower, { tier, reason, hf, debtUsd: pos.debtUsd, collateralUsd: pos.collateralUsd, exitUsd, profitUsd, nextCheckSec: this.nextCheckSec(tier, hf) }).catch(this.swallowWrite);
         if (tier === "watch" && hf < 1 && profitable) this.wake(`liq:${pos.borrower}:${pos.marketId}`, `LIQUIDATABLE + profitable: ${pos.collateralSymbol}/${pos.loanSymbol} HF ${hf.toFixed(3)}, liq profit ${pu}. Fire the flash-kill.`);
       }
     } finally { this.ticking = false; }
@@ -461,7 +482,7 @@ export class PositionRegistry {
     const q = `query($c:[Int!],$hf:Float!,$ml:Boolean,$skip:Int){ marketPositions(first:100, skip:$skip, orderBy:HealthFactor, orderDirection:Asc, where:{chainId_in:$c, marketListed:$ml, healthFactor_lte:$hf}){ items { healthFactor user{address} market{ marketId lltv irmAddress oracle{address} collateralAsset{symbol address decimals} loanAsset{symbol address decimals} } state{ borrowAssets borrowAssetsUsd collateralUsd collateral } } } }`;
     const ml = this.config.LIQ_MARKET_LISTED_ONLY ? true : null; // null = don't filter; true = curated markets only (drops junk-market husks at the source)
     for (let skip = 0; skip < this.config.LIQ_ENUM_MAX_PAGES * 100; skip += 100) {
-      const j = await this.gql<{ marketPositions: { items: RawMPos[] } }>(q, { c: [this.config.CHAIN_ID], hf: this.config.LIQ_HF_CEIL, ml, skip }).catch(() => undefined);
+      const j = await this.gql<{ marketPositions: { items: RawMPos[] } }>(q, { c: [this.config.CHAIN_ID], hf: this.config.LIQ_HF_CEIL, ml, skip }).catch(this.swallowWrite);
       const items = j?.marketPositions?.items ?? [];
       for (const it of items) {
         const m = it.market; if (!m?.collateralAsset || !m.loanAsset) continue;
