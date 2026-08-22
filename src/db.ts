@@ -1756,6 +1756,25 @@ export class Database {
       [chainId, protocol, marketId, borrower.toLowerCase(), JSON.stringify(patch)]);
   }
 
+  /**
+   * RESCHEDULE ONLY — advance when a position is next looked at, without touching WHAT it is.
+   *
+   * `setLendingTier` demands a tier, so a caller that merely wanted to postpone a row had to hand back the
+   * tier it had READ, from a snapshot taken before the pass ran. That is a write-back of stale state: the
+   * resolver would promote 9,117 positions out of `pending`, and the very next loop of the same tick would
+   * write `pending` over them from its own stale copy. They were re-resolved for ever and never advanced.
+   *
+   * Rescheduling and classifying are different operations, so they are different methods now — a caller that
+   * has not decided a tier can no longer accidentally assert one.
+   */
+  async rescheduleLendingPosition(chainId: number, protocol: string, marketId: string, borrower: string, nextCheckSec: number): Promise<void> {
+    await this.pool.query(
+      `UPDATE lending_positions SET last_checked_at=NOW(), next_check_at=NOW() + ($5 || ' seconds')::interval, updated_at=NOW()
+       WHERE chain_id=$1 AND protocol=$2 AND market_id=$3 AND borrower=$4`,
+      [chainId, protocol, marketId, borrower.toLowerCase(), String(Math.round(nextCheckSec))]
+    );
+  }
+
   /** Positions due for a re-check (next_check_at reached), soonest first. */
   async dueLendingPositions(chainId: number, limit = 60): Promise<Array<LendingPosition>> {
     const r = await this.pool.query(`SELECT * FROM lending_positions WHERE chain_id=$1 AND tier<>'closed' AND next_check_at<=NOW() ORDER BY next_check_at ASC LIMIT $2`, [chainId, limit]);

@@ -445,8 +445,11 @@ export class PositionRegistry {
     } finally { this.ticking = false; }
   }
 
+  /** Postpone a position without re-asserting what it is. `tier` is READ here (it sets the cadence) and never
+   * written back — writing it would clobber a classification made since this batch's snapshot was taken. */
   private async reschedule(protocol: string, marketId: string, borrower: string, tier: string, hf: number): Promise<void> {
-    await this.db.setLendingTier(this.config.CHAIN_ID, protocol, marketId, borrower, { tier, nextCheckSec: this.nextCheckSec(tier, hf) }).catch(() => undefined);
+    await this.db.rescheduleLendingPosition(this.config.CHAIN_ID, protocol, marketId, borrower, this.nextCheckSec(tier, hf))
+      .catch((e) => this.logger.warn({ err: e, marketId, borrower }, "lending reschedule failed"));
   }
 
   // --- Morpho enumeration (paginated; maintains full state incl. old positions) ------------
