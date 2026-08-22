@@ -1,0 +1,40 @@
+# PREBUILT override — the code is compiled OFF this machine and mounted in.
+#
+# Why: the box has ONE cpu core, shared with several other projects. `tsc` inside the image build took
+# 10+ minutes there against ~25 seconds on a laptop, so every one-line fix cost a quarter of an hour and
+# the verify loop became unusable. Compilation is deterministic, so there is nothing gained by doing it
+# here. Deploy is now: build dist locally -> rsync -> restart. Seconds.
+#
+# node_modules still come from the IMAGE, so a change to package.json (a new dependency) is the one case
+# that still needs a real `docker compose build`. Everything else is a restart.
+#
+# Mounted read-only so a container cannot write over the deployed artefacts.
+services:
+  brain:
+    volumes:
+      - /opt/bera-bot/app/dist:/app/dist:ro
+      - /opt/bera-bot/app/src/prompts:/app/src/prompts:ro
+      - /opt/bera-bot/app/src/strategy:/app/src/strategy:ro
+      - /opt/bera-bot/app/networks:/app/networks:ro
+  observer:
+    volumes:
+      - /opt/bera-bot/app/dist:/app/dist:ro
+      - /opt/bera-bot/app/src/prompts:/app/src/prompts:ro
+      - /opt/bera-bot/app/src/strategy:/app/src/strategy:ro
+      - /opt/bera-bot/app/networks:/app/networks:ro
+  kg-observer:
+    # CPU CEILING — the urgency separation we enforce for RPC lanes, applied to the cpu.
+    #
+    # This box has ONE core. The observatory is a heavy analytical batch (full graph + hundreds of cycle
+    # sizings) and it took the whole core: measured at 378%, which pushed the per-block indexer back into
+    # de-sync (lag 710) and so stopped the very data the observatory reads. Analysis starving ingestion is
+    # backwards, and no amount of making the analysis faster fixes the ordering — a ceiling does.
+    #
+    # Half a core: the observatory gets slower, the indexer stays at head. That is the correct trade, because
+    # a stale mirror makes the observatory's output worthless anyway.
+    cpus: "0.5"
+    volumes:
+      - /opt/bera-bot/app/dist:/app/dist:ro
+      - /opt/bera-bot/app/src/prompts:/app/src/prompts:ro
+      - /opt/bera-bot/app/src/strategy:/app/src/strategy:ro
+      - /opt/bera-bot/app/networks:/app/networks:ro
