@@ -63,7 +63,31 @@ export interface V3PoolSim {
   tick?: number; // if absent, derived from sqrtPrice
   feePips: number; // e.g. 3000 = 0.30%
   tickSpacing?: number; // REQUIRED for exactness: the pool steps at tickBitmap WORD boundaries (see below).
-  ticks: Array<{ tick: number; liquidityNet: bigint }>; // initialized ticks (any order)
+  ticks: ReadonlyArray<{ tick: number; liquidityNet: bigint }>; // initialized ticks (any order); NEVER mutated
+}
+
+/**
+ * DERIVED TICK INDEX, computed once per tick array instead of once per quote.
+ *
+ * A pool's tick map is immutable for the life of the snapshot it came from, yet every call used to copy it,
+ * sort it (O(n log n)), build a Map of it and map it again — for a single quote. Sizing one cycle probes many
+ * amounts across several legs, so on a pool with a few thousand initialized ticks that rebuild dominated
+ * everything: one observatory cycle took 33 MINUTES, of which the database was 25 seconds.
+ *
+ * Keyed on the array's identity in a WeakMap, so a new snapshot (a new array) naturally gets a fresh index and
+ * nothing has to be invalidated by hand. Every field here is READ-ONLY inside the swap loop, which is what
+ * makes sharing it across calls safe.
+ */
+type TickIndex = { sorted: ReadonlyArray<{ tick: number; liquidityNet: bigint }>; netAt: Map<number, bigint>; ascTicks: number[] };
+const tickIndexCache = new WeakMap<object, TickIndex>();
+function tickIndexOf(ticks: ReadonlyArray<{ tick: number; liquidityNet: bigint }>): TickIndex {
+  const hit = tickIndexCache.get(ticks as object);
+  if (hit) return hit;
+  const sorted = [...ticks].sort((a, b) => a.tick - b.tick);
+  const netAt = new Map<number, bigint>(); for (const t of sorted) netAt.set(t.tick, t.liquidityNet);
+  const idx: TickIndex = { sorted, netAt, ascTicks: sorted.map((t) => t.tick) };
+  tickIndexCache.set(ticks as object, idx);
+  return idx;
 }
 
 // Fallback tickSpacing by fee tier (canonical Uniswap) — used only if the caller omits pool.tickSpacing; a
@@ -101,9 +125,7 @@ export interface V3SwapResult {
  */
 export function simulateExactInputStateful(pool: V3PoolSim, zeroForOne: boolean, amountIn: bigint): V3SwapResult | null {
   if (amountIn <= 0n || pool.sqrtPriceX96 <= 0n || pool.liquidity <= 0n) return null;
-  const sorted = [...pool.ticks].sort((a, b) => a.tick - b.tick);
-  const netAt = new Map<number, bigint>(); for (const t of sorted) netAt.set(t.tick, t.liquidityNet);
-  const ascTicks = sorted.map((t) => t.tick);
+  const { netAt, ascTicks } = tickIndexOf(pool.ticks);
 
   const tickSpacing = pool.tickSpacing && pool.tickSpacing > 0 ? pool.tickSpacing : (FEE_TO_SPACING[pool.feePips] ?? 1);
   let sqrtP = pool.sqrtPriceX96;

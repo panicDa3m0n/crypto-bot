@@ -99,7 +99,7 @@ export class V3PoolSim extends PoolSim {
 
   private sim(tokenIn: string, amountIn: bigint) {
     const zeroForOne = tokenIn.toLowerCase() === this.token0;
-    const r = simulateExactInputStateful({ sqrtPriceX96: this.sqrtPriceX96, liquidity: this.liquidity, tick: this.tick, feePips: this.feePpm > 0 ? this.feePpm : 3000, tickSpacing: this.tickSpacing, ticks: [...this.ticks] }, zeroForOne, amountIn);
+    const r = simulateExactInputStateful({ sqrtPriceX96: this.sqrtPriceX96, liquidity: this.liquidity, tick: this.tick, feePips: this.feePpm > 0 ? this.feePpm : 3000, tickSpacing: this.tickSpacing, ticks: this.ticks }, zeroForOne, amountIn);
     return r;
   }
 
