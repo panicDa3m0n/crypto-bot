@@ -65,6 +65,28 @@ export type ProtocolVerification = {
   details: Record<string, unknown>;
 };
 
+/**
+ * Make a chain-derived string SAFE to store.
+ *
+ * A token's name and symbol are attacker-controlled: anyone can deploy a contract whose name contains a NUL
+ * byte, a lone surrogate or malformed UTF-8. Postgres rejects those outright ("invalid byte sequence for
+ * encoding UTF8"), so the whole INSERT fails — and because these writes are deliberately non-fatal, the
+ * token was simply never stored, silently, for ever. It surfaced only once swallowed write failures started
+ * being counted: 20 of them within minutes.
+ *
+ * Strip rather than reject: the token exists and we want it in the registry: it is the name that is hostile,
+ * not the entity. Truncation bounds the damage from a deliberately enormous one.
+ */
+function safeText(v: string | null | undefined, max = 96): string | null {
+  if (v == null) return null;
+  const cleaned = v
+    .replace(/\u0000/g, "")                        // Postgres cannot store NUL in text or jsonb
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, "") // lone high surrogate
+    .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "") // lone low surrogate
+    .trim();
+  return cleaned.length ? cleaned.slice(0, max) : null;
+}
+
 export class Database {
   readonly pool: pg.Pool;
   /** Cache for the factory-coverage aggregate: it scans every pool row, so it must not run at dashboard
@@ -1084,8 +1106,8 @@ export class Database {
     // (a "?" is truthy and would clobber a good name). meta is MERGED, never clobbered.
     // block: the chain block this write reflects → created_block on first insert, updated_block on every
     // write (staleness = head − updated_block). Callers without a block (non-indexer) pass null → untouched.
-    const sym = e.symbol && e.symbol !== "?" ? e.symbol : null;
-    const nm = e.name && e.name !== "?" ? e.name : null;
+    const sym = safeText(e.symbol && e.symbol !== "?" ? e.symbol : null, 32);
+    const nm = safeText(e.name && e.name !== "?" ? e.name : null, 96);
     await this.pool.query(
       `INSERT INTO entities(chain_id, address, kind, symbol, name, decimals, meta, source, created_block, updated_block)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
@@ -1692,7 +1714,8 @@ export class Database {
 
   /** Merge a JSON patch into an entity's meta (verification enrichment, etc.). */
   async mergeEntityMeta(chainId: number, address: string, kind: string, patch: Record<string, unknown>): Promise<void> {
-    await this.pool.query(`UPDATE entities SET meta = meta || $4::jsonb WHERE chain_id=$1 AND address=$2 AND kind=$3`, [chainId, address.toLowerCase(), kind, JSON.stringify(patch)]);
+    // jsonParam, not raw stringify: it is the one place that strips what Postgres cannot store.
+    await this.pool.query(`UPDATE entities SET meta = meta || $4::jsonb WHERE chain_id=$1 AND address=$2 AND kind=$3`, [chainId, address.toLowerCase(), kind, jsonParam(patch)]);
   }
 
   // --- lending positions registry (all borrowers, tiered, adaptive polling) ---
