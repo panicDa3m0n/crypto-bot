@@ -20,6 +20,8 @@ const MORPHO_POS_ABI = parseAbi([
   "function market(bytes32 id) view returns (uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares, uint128 lastUpdate, uint128 fee)"
 ]);
 const ORACLE_PRICE_ABI = parseAbi(["function price() view returns (uint256)"]);
+// Below this share of spot value, an exit quote is suspicious enough to be re-read before it is believed.
+const EXIT_SANITY_RATIO = 0.85;
 const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11" as Address;
 
 // Per-cycle quote memo: the exit RATE of a (collateral,loan) pair is ~constant across a cycle's
@@ -129,11 +131,64 @@ export class PositionRegistry {
     }
     const res = await this.aggregator.quoteResult(collateralToken as `0x${string}`, loanToken as `0x${string}`, seizableRaw);
     if (res.status === "ok" && res.quote && res.quote.amountOut > 0n) {
+      // SANITY-CHECK THE QUOTE AGAINST WHAT WE ALREADY KNOW.
+      //
+      // A degraded quote sails through as "ok" and becomes a VERDICT: we recorded an exit implying $1.2208
+      // for cbXRP while our own fresh price feed, the collateral valuation and the aggregator itself all said
+      // $1.48. On that number we rejected a liquidation as unprofitable — and another liquidator took it for
+      // +$198. The three-way status already says a failed CALL must not be judged; a quote that contradicts
+      // our own data deserves the same treatment.
+      //
+      // Illiquidity is REAL though: some collateral genuinely sells far below its quoted price, and refusing
+      // to believe that would be the opposite error. So the discriminator is measurement, not a threshold —
+      // re-quote once, and only distrust the number if the second read disagrees with the first.
+      const verdict = await this.plausibleExit(collateralToken, loanToken, seizableRaw, res.quote.amountOut);
+      if (verdict === "unreliable") return { status: "error", amountOutRaw: 0n, debtRepaidRaw, source: "quote-inconsistent" };
       memo?.set(key, { seizableRef: seizableRaw, amountOutRef: res.quote.amountOut, status: "ok" });
       return { status: "ok", amountOutRaw: res.quote.amountOut, debtRepaidRaw, source: "aggregator" };
     }
     if (res.status !== "error") memo?.set(key, { seizableRef: seizableRaw, amountOutRef: 0n, status: "no-route" });
     return { status: res.status === "error" ? "error" : "no-route", amountOutRaw: 0n, debtRepaidRaw, source: "none" };
+  }
+
+
+  /**
+   * Is this exit quote consistent with what we already know? Returns "unreliable" only when a SECOND read
+   * disagrees with the first — a stable low number means the collateral really is illiquid, which is a fact
+   * we must keep believing.
+   */
+  private async plausibleExit(collateralToken: string, loanToken: string, seizableRaw: bigint, amountOut: bigint): Promise<"plausible" | "unreliable"> {
+    const [cPx, lPx] = await Promise.all([
+      this.oracle.usdPrice(collateralToken).catch(() => null),
+      this.oracle.usdPrice(loanToken).catch(() => null),
+    ]);
+    if (cPx == null || lPx == null || !(cPx > 0) || !(lPx > 0)) return "plausible"; // nothing to compare against
+    const cDec = await this.tokenDecimals(collateralToken), lDec = await this.tokenDecimals(loanToken);
+    if (cDec == null || lDec == null) return "plausible";
+    const soldUsd = (Number(seizableRaw) / 10 ** cDec) * cPx;
+    const gotUsd = (Number(amountOut) / 10 ** lDec) * lPx;
+    if (!(soldUsd > 0)) return "plausible";
+    const ratio = gotUsd / soldUsd;
+    if (ratio >= EXIT_SANITY_RATIO) return "plausible";
+    // Suspicious: ask again. A transient bad route will not reproduce; genuine illiquidity will.
+    const second = await this.aggregator.quoteResult(collateralToken as `0x${string}`, loanToken as `0x${string}`, seizableRaw);
+    if (second.status !== "ok" || !second.quote || second.quote.amountOut <= 0n) return "unreliable";
+    const gotUsd2 = (Number(second.quote.amountOut) / 10 ** lDec) * lPx;
+    const agree = Math.abs(gotUsd2 - gotUsd) / Math.max(gotUsd, 1) < 0.05;
+    if (!agree) {
+      this.logger.warn({ collateral: collateralToken.slice(0, 12), first: Math.round(gotUsd), second: Math.round(gotUsd2), expected: Math.round(soldUsd) },
+        "exit quotes disagree with each other — treating as UNKNOWN rather than judging the position unprofitable");
+      return "unreliable";
+    }
+    this.logger.debug({ collateral: collateralToken.slice(0, 12), ratio: Number(ratio.toFixed(3)) }, "exit well below spot but reproducible — real illiquidity");
+    return "plausible";
+  }
+
+  /** Token decimals from the registry (never guessed — an unknown one makes the comparison meaningless). */
+  private async tokenDecimals(token: string): Promise<number | null> {
+    const m = await this.db.tokenMeta(this.config.CHAIN_ID, [token.toLowerCase()]).catch(() => new Map());
+    const d = m.get(token.toLowerCase())?.decimals;
+    return typeof d === "number" ? d : null;
   }
 
   /** Loan-token raw → USD, for DISPLAY ONLY, using the loan decimals (from Morpho) and a cached
