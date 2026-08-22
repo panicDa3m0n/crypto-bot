@@ -37,6 +37,7 @@ const sanePrice = (p: number | null | undefined): p is number => p != null && Nu
 const CHUNK = 10;            // public getLogs range cap
 const ZERO_ADDR = "0x0000000000000000000000000000000000000000"; // V4 native-ETH currency sentinel → WETH
 const ANCHOR_TTL_MS = 30_000; // refresh ETH/USD at most this often
+const STATUS_WRITE_MIN_MS = 2_000; // freshness telemetry cadence during catch-up (bounded write amplification)
 const Q96 = 2n ** 96n;
 
 type RawRpc = { request: (a: { method: string; params: unknown }) => Promise<unknown> };
@@ -49,6 +50,7 @@ export class BlockIndexer {
   private ethUsd = 0;
   private ethUsdAt = 0;
   private ticks = 0;
+  private lastStatusAt = 0;
   private timer?: NodeJS.Timeout;
   private unwatch?: () => void;
   private headBlock = 0;       // latest network head seen (for the token_stats freshness guard)
@@ -334,7 +336,24 @@ export class BlockIndexer {
       this.cursor = b;
     }
     await this.db.setIndexerCursor(this.config.CHAIN_ID, this.cursor).catch(() => undefined);
+    // FRESHNESS AS IT HAPPENS, not once the tick ends. writeChainStatus used to run only in the tick's
+    // `finally`, and a catch-up tick spans up to INDEXER_SYNC_MAX_CATCHUP blocks — so for the whole of it the
+    // dashboard, the startup gate and the KG observer all read a value frozen minutes ago. Measured: the real
+    // cursor was 720 blocks and 14 minutes ahead of what chain_status reported, which read "DE-SYNC 1896 blk"
+    // while the indexer was in fact gaining on the chain. Throttled, so a chunky catch-up cannot turn this
+    // into write amplification.
+    await this.maybeWriteChainStatus();
+    // Reaching head must also be OBSERVABLE mid-tick: the gate that starts every downstream service waits on
+    // it, and making it wait for a 2,000-block tick to finish delays the whole system for no reason.
+    if (this.headBlock - this.cursor <= this.config.INDEXER_RESYNC_LAG) await this.markSynced();
     return { swaps, discovered, lending };
+  }
+
+  /** Freshness telemetry, rate-limited. Safe to call from inside a catch-up loop. */
+  private async maybeWriteChainStatus(): Promise<void> {
+    if (Date.now() - this.lastStatusAt < STATUS_WRITE_MIN_MS) return;
+    this.lastStatusAt = Date.now();
+    await this.writeChainStatus();
   }
 
   private async processBlock(block: number, logs: RawLog[]): Promise<{ swaps: number; discovered: number; lending: number }> {
