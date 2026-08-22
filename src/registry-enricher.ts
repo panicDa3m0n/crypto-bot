@@ -16,6 +16,7 @@ const GAS_POLL_INTERVAL_MS = 20_000;     // DB-first gas: write-side poller cade
 const DEX_IDENTITY_INTERVAL_MS = 120_000; // factory identity barely changes; its queries are heavy (full pool aggregate)
 const T0_IDLE_PROBE_MS = 10_000;        // T0 queues empty → probe rarely; while they have work the probe runs every cycle
 const T0_BUSY_PROBE_MS = 1_000;         // while T0 has work, re-probe often — but never once per 400ms drain tick
+const TICK_BOOTSTRAP_INTERVAL_MS = 5_000; // background tick reconstruction: its OWN beat, never the leftovers
 const PROTO_FEE_INTERVAL_MS = 30_000;   // the protocol-fee pass owns an expensive DISTINCT-ON; bound its cadence
 
 const POOL_META_ABI = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)", "function factory() view returns (address)", "function tickSpacing() view returns (int24)"]);
@@ -56,6 +57,7 @@ export class RegistryEnricher {
   private lastGasAt = 0;
   private lastDexIdentityAt = 0;
   private lastProbeAt = 0;
+  private lastTickBootstrapAt = 0;
   private lastProtoFeeAt = 0;
   private t0Busy = true;   // assume work at boot so the first cycle probes before deciding
   private q = { poolFactory: true, factoryReverse: false, classify: false, aeroStable: false, protocolFee: true, dexIdentity: true };
@@ -132,14 +134,21 @@ export class RegistryEnricher {
       if (this.q.protocolFee && Date.now() - this.lastProtoFeeAt > PROTO_FEE_INTERVAL_MS) { this.lastProtoFeeAt = Date.now(); pfee = await this.enrichProtocolFees(block); }
       const dex = this.q.dexIdentity ? await this.enrichDexIdentity(block) : idle; // additionally self-throttled
       const t0Done = facs.done + rev.done + cls.done + pfee.done + dex.done;
+      void t0Done; // recorded for the cycle log; it must NOT decide whether the other tiers run (see below)
       // dexIdentity is deliberately NOT part of `t0Busy`: a factory whose name is genuinely unobtainable keeps
       // that signal true forever, and a permanently-true "busy" would pin the probe at the hot cadence.
       this.t0Busy = this.q.poolFactory || this.q.factoryReverse || this.q.classify || this.q.protocolFee;
-      // T1/T2 yield to a busy T0 — bounded, because the T0 queues are attempt-capped and small by construction.
-      const pools = t0Done ? idle : await this.enrichPools(block);
-      const toks = t0Done ? idle : await this.enrichTokens(block);
-      const syms = t0Done ? idle : await this.enrichSymbols(block);
-      const aero = !t0Done && this.q.aeroStable ? await this.enrichAeroStable(block) : idle;
+      // PRIORITY IS ORDER, NOT EXCLUSION. These used to be skipped entirely whenever T0 had done anything,
+      // on the assumption that the T0 queues are "attempt-capped and small by construction". That assumption
+      // is false while the indexer runs: it writes new bare pools continuously, so T0 always has a trickle and
+      // T1/T2 only ran on alternate cycles. Tokens then drained at ~12 per 90s, leaving 2,188 in the resync
+      // set — and the startup gate waits for that set to empty, so a scheduling heuristic was holding the whole
+      // system down. Running T0 FIRST already gives high-leverage work its head start; every pass is bounded
+      // by its own batch size, so there is no budget to protect by starving the others.
+      const pools = await this.enrichPools(block);
+      const toks = await this.enrichTokens(block);
+      const syms = await this.enrichSymbols(block);
+      const aero = this.q.aeroStable ? await this.enrichAeroStable(block) : idle;
       did = pools.done + toks.done + facs.done + aero.done + rev.done + pfee.done + syms.done + cls.done + dex.done;
       rateLimited = pools.rateLimited || toks.rateLimited || facs.rateLimited || aero.rateLimited || rev.rateLimited || pfee.rateLimited || syms.rateLimited || cls.rateLimited || dex.rateLimited;
       // ACTIVITY LOG: record only cycles that did work or hit a limit — an idle tick is not news, but a cycle
@@ -156,7 +165,14 @@ export class RegistryEnricher {
       // Tick-map bootstrap (Item 3.2): P0 (demand-driven, KG-requested) runs ALWAYS so it's never starved;
       // P1–P3 (background historical) only when the fast queues are idle.
       const tb0 = await this.enrichTickBootstrap(0); did += tb0.done; rateLimited = rateLimited || tb0.rateLimited;
-      if (!did) { const tb = await this.enrichTickBootstrap(3); did += tb.done; rateLimited = rateLimited || tb.rateLimited; }
+      // BACKGROUND tick reconstruction (P1–P3). Gating it on "nothing else did work" starved it completely:
+      // the foreground queues almost always advance something, so the pass that must rebuild the 20,625
+      // re-opened V4 maps and the 884 failed V3 ones would simply never run. Background work needs its own
+      // cadence, not the leftovers of a busy cycle — the same idiom the storage scan above already uses.
+      if (Date.now() - this.lastTickBootstrapAt > TICK_BOOTSTRAP_INTERVAL_MS) {
+        this.lastTickBootstrapAt = Date.now();
+        const tb = await this.enrichTickBootstrap(3); did += tb.done; rateLimited = rateLimited || tb.rateLimited;
+      }
       // Storage-scan certification (Item 3.4b/c/d) — recovery for the FINITE set of pools the historical-log
       // bootstrap gave up on (status=failed). Runs on its OWN reliable lane (Pinax), disjoint from the bootstrap
       // lane, so it is decoupled from the bootstrap queue (no starvation behind P0/P3) and bounded solely by the
@@ -172,7 +188,8 @@ export class RegistryEnricher {
         if (gp > 0n) await this.db.upsertGasState(this.config.CHAIN_ID, gp).catch(() => undefined);
       }
       // Etherscan verified/proxy signal — only when the fast queue is idle and not more than once per interval.
-      if (!did && this.etherscan.available && Date.now() - this.lastVerifiedAt > this.config.ENRICH_INTERVAL_MS) { await this.enrichVerified(); this.lastVerifiedAt = Date.now(); }
+      // Same reasoning: its own interval is the throttle, not the absence of other work.
+      if (this.etherscan.available && Date.now() - this.lastVerifiedAt > this.config.ENRICH_INTERVAL_MS) { await this.enrichVerified(); this.lastVerifiedAt = Date.now(); }
     } finally {
       this.running = false;
       this.schedule(rateLimited ? BACKOFF_MS : did ? FAST_MS : this.config.ENRICH_INTERVAL_MS);
