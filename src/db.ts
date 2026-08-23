@@ -2865,6 +2865,56 @@ export class Database {
     return out;
   }
 
+  /**
+   * Lending positions as GRAPH NODES: everything still alive, with the size and market parameters the
+   * valuation needs. Closed and blacklisted rows are excluded because they cannot become opportunities;
+   * everything else is a node whose profit the graph re-derives whenever its inputs move.
+   */
+  async liquidationGraphNodes(chainId: number): Promise<Array<{ protocol: string; marketId: string; borrower: string; collateralToken: string | null; loanToken: string | null; collateralRaw: string | null; debtRaw: string | null; lltv: number | null; oracle: string | null; hf: number | null; tier: string }>> {
+    const r = await this.pool.query<{ protocol: string; market_id: string; borrower: string; collateral_token: string | null; loan_token: string | null; coll_raw: string | null; debt_raw: string | null; lltv: string | null; oracle: string | null; hf: string | null; tier: string }>(
+      `SELECT protocol, market_id, borrower, collateral_token, loan_token,
+              meta->>'collateralRaw' coll_raw, meta->>'debtRaw' debt_raw, lltv::text, meta->>'oracle' oracle,
+              hf::text, tier
+       FROM lending_positions
+       WHERE chain_id=$1 AND tier NOT IN ('closed','blacklist')
+         AND (meta->>'collateralRaw') IS NOT NULL AND (meta->>'debtRaw') IS NOT NULL`, [chainId]);
+    return r.rows.map((x) => ({ protocol: x.protocol, marketId: x.market_id, borrower: x.borrower,
+      collateralToken: x.collateral_token, loanToken: x.loan_token, collateralRaw: x.coll_raw, debtRaw: x.debt_raw,
+      lltv: x.lltv != null ? Number(x.lltv) : null, oracle: x.oracle, hf: x.hf != null ? Number(x.hf) : null, tier: x.tier }));
+  }
+
+  /**
+   * CHANGE FEED — what a block actually changed.
+   *
+   * The system's governing rule is that a block is the only event: whatever it touches is recomputed, whatever
+   * it does not is still valid and is reused. The signal for that has been in the DB all along and nobody read
+   * it, so the read-side reloaded everything every cycle: measured, 17 pools change per block out of 25,390
+   * loaded — 1,500x more data than moved.
+   *
+   * `pool_state.block_number` is written by the indexer at the moment a pool's state changes, so "greater than
+   * the block I last saw" is exactly the set of pools I must recompute. Same for token_prices.block_number.
+   */
+  async poolsChangedSince(chainId: number, sinceBlock: number, archetypes: string[]): Promise<Array<{ address: string; meta: unknown; r0: bigint | null; r1: bigint | null; sqrtPrice: bigint | null; liquidity: bigint | null; feePpm: number | null; block: number; ageMs: number | null }>> {
+    const r = await this.pool.query<{ address: string; meta: unknown; r0: string | null; r1: string | null; sp: string | null; liq: string | null; fee_ppm: number | null; bn: string | null; age_ms: string | null }>(
+      `SELECT e.address, e.meta, ps.r0::text r0, ps.r1::text r1, ps.sqrt_price::text sp, ps.liquidity::text liq, ps.fee_ppm, ps.block_number::text bn,
+              (EXTRACT(EPOCH FROM (NOW()-ps.updated_at))*1000)::bigint::text AS age_ms
+       FROM pool_state ps JOIN entities e ON e.chain_id=ps.chain_id AND e.address=ps.pool AND e.kind='pool'
+       WHERE ps.chain_id=$1 AND ps.block_number > $2 AND e.meta->>'archetype' = ANY($3::text[])`,
+      [chainId, sinceBlock, archetypes]);
+    const b = (v: string | null) => (v == null ? null : BigInt(v.split(".")[0]));
+    return r.rows.map((x) => ({ address: x.address, meta: x.meta, r0: b(x.r0), r1: b(x.r1), sqrtPrice: b(x.sp), liquidity: b(x.liq), feePpm: x.fee_ppm ?? null, block: x.bn ? Number(x.bn) : 0, ageMs: x.age_ms ? Number(x.age_ms) : null }));
+  }
+
+  /** Tokens whose SPOT price was recomputed after `sinceBlock` — the indexer reprices exactly the tokens whose
+   * pools moved, so this is the price half of the same change feed. */
+  async tokensRepricedSince(chainId: number, sinceBlock: number): Promise<Map<string, number>> {
+    const r = await this.pool.query<{ token: string; price_usd: number }>(
+      `SELECT token, price_usd FROM token_prices WHERE chain_id=$1 AND block_number > $2 AND price_usd > 0`, [chainId, sinceBlock]);
+    const out = new Map<string, number>();
+    for (const x of r.rows) out.set(x.token.toLowerCase(), x.price_usd);
+    return out;
+  }
+
   /** FULL-GRAPH LOADER source (Item 4.1): every pool of the given archetypes with its latest mirrored state,
    * in ONE query (entities ⨝ pool_state) — no per-token sampling, no archetype exclusion. length(address)=42
    * drops V4 bytes32 poolIds (separate path). State may be null (a bare pool not yet priced) — the caller

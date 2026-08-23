@@ -273,6 +273,22 @@ export class PriceOracle {
     // Without a specific block, serve from a short TTL cache so system-wide tokenPrice() calls
     // don't re-read pools on every invocation.
     if (atBlock == null) { const c = this.usdCache.get(t); if (c && Date.now() - c.at < 15_000) return c.usd || null; }
+    // ONE PLACE FOR THE SPOT PRICE. `token_prices` is written by the indexer for exactly the tokens whose
+    // pools moved in the block it just processed — that IS the price, recomputed at the only moment it can
+    // change. Recomputing it here from the same pools produced a SECOND answer to the same question, drifting
+    // from the first, and every consumer had to guess which one to trust.
+    //
+    // A pinned read (atBlock set) is a different question — "what was true at block N" — and still walks the
+    // pools, because a historical answer cannot come from a table that only holds the latest.
+    if (atBlock == null) {
+      const row = (await this.db.getTokenPrices(this.config.CHAIN_ID, [t]).catch(() => new Map())).get(t);
+      const usd = row?.priceUsd ?? null;
+      if (usd != null && usd > 0) { this.usdCache.set(t, { usd, at: Date.now() }); return usd; }
+      // Absent or zero is a real answer too: the indexer has never been able to anchor this token. Falling
+      // through to a local recomputation here is what created the second source, so we do not.
+      this.usdCache.set(t, { usd: 0, at: Date.now() });
+      return null;
+    }
     const refs = (await this.registryPools(t)).map((p) => this.toRef(p)).filter((r) => r.token0 && r.token1);
     if (!refs.length) { if (atBlock == null) this.usdCache.set(t, { usd: 0, at: Date.now() }); return null; }
     let wethUsdCache: number | null | undefined;

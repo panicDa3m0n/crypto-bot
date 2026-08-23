@@ -13,7 +13,8 @@ import { createLogger } from "../logger.js";
 import { Database } from "../db.js";
 import { BerachainClients } from "../chain.js";
 import { LocalRouter } from "../router/router.js";
-import { loadLiquidityGraph } from "../kg/graph-loader.js";
+import { refreshLiquidityGraph, type LiquidityGraph } from "../kg/graph-loader.js";
+import { loadLiquidationNodes, dirtyLiquidationNodes } from "../kg/liquidation-nodes.js";
 import { runObservatory } from "../kg/observatory.js";
 import { buildSurfaceContext } from "../kg/path-surface.js";
 import { runSurfaces } from "../kg/surface-observer.js";
@@ -56,6 +57,11 @@ async function main() {
   logger.info({ blockDriven: true, preflightK: PREFLIGHT_K, staleBlocks: STALE_PREFLIGHT_BLOCKS, executor: kg ?? "none" }, "KG observer started (READ-ONLY + shadow preflight; NO broadcast)");
 
   let lastBlock = 0, wasStandby = false;
+  // The graph is a LONG-LIVED MIRROR, not a per-cycle snapshot. Rebuilding it every cycle was the single
+  // largest contradiction of the system's rule: 17 pools move per block, 25,390 were reloaded.
+  let graph: LiquidityGraph | null = null;
+  let liqNodes: Awaited<ReturnType<typeof loadLiquidationNodes>> = [];
+  let liqNodesAt = 0;
   for (;;) {
     try {
       // SINGLE-INSTANCE lease heartbeat: only the current lease owner processes blocks.
@@ -69,7 +75,15 @@ async function main() {
       if (!cs?.synced || head <= lastBlock) { await sleep(POLL_MS); continue; } // block-driven: only on advance
       lastBlock = head;
       const t0 = Date.now();
-      const g = await loadLiquidityGraph(db, cid);
+      // Patch what the block changed; reuse the rest. The delta is the whole point: it is what turns
+      // "recompute everything, always" into "recompute what can possibly have changed".
+      const { graph: g, delta } = await refreshLiquidityGraph(db, cid, graph);
+      graph = g;
+      // Lending positions are nodes of this same graph. Their SET changes slowly (a new borrower, a closed
+      // position), so it is reloaded on a slow beat; their VALUE changes with every block, which is what the
+      // dirty set below drives.
+      if (!liqNodes.length || Date.now() - liqNodesAt > 120_000) { liqNodes = await loadLiquidationNodes(db, cid).catch(() => liqNodes); liqNodesAt = Date.now(); }
+      const dirtyLiq = dirtyLiquidationNodes(liqNodes, g, { pools: delta.dirtyPools, tokens: delta.dirtyTokens });
       // Yield the moment the mirror goes stale. A cycle takes minutes; if the indexer falls behind meanwhile,
       // every remaining number describes a world that no longer exists — and on a single core this work is
       // competing with the very catch-up it depends on. Cheap DB read, checked between candidates.
@@ -77,7 +91,7 @@ async function main() {
       let stale = false;
       const staleTimer = setInterval(() => { void staleSince().then((v) => { stale = v; }); }, 5_000);
       let candidates: Awaited<ReturnType<typeof runObservatory>>["candidates"], stats: Awaited<ReturnType<typeof runObservatory>>["stats"];
-      try { ({ candidates, stats } = await runObservatory(db, config, g, { minGrossBps: MIN_GROSS_BPS, abort: () => stale }, capability)); }
+      try { ({ candidates, stats } = await runObservatory(db, config, g, { minGrossBps: MIN_GROSS_BPS, abort: () => stale, dirty: delta.full ? undefined : { pools: delta.dirtyPools, tokens: delta.dirtyTokens } }, capability)); }
       finally { clearInterval(staleTimer); }
       if (stats.aborted) {
         logger.warn({ block: head, sized: stats.sized }, "observatory cycle ABORTED — mirror went stale mid-cycle; yielding the cpu to the indexer");
@@ -124,7 +138,7 @@ async function main() {
 
       const dt = Date.now() - t0;
       await db.recordObserverRun({ chainId: cid, block: head, durationMs: dt, poolsPriced: g.stats.poolsPriced, multiVenuePairs: stats.multiVenuePairs, sized: stats.sized, economic: stats.economic, economicallyPositive: stats.economicallyPositive, routeEncodable: stats.routeEncodable, executable: stats.executable, preflightAttempted: attempted, preflightPass: pass, detectors: stats.detectors, stats: { unsupportedForks: stats.unsupportedForks, blockedByTicks: stats.blockedByTicks } }).catch(() => undefined);
-      logger.info({ block: head, dt, sized: stats.sized, economicallyPositive: stats.economicallyPositive, executable: stats.executable, preflight: `${pass}/${attempted}`, reused, surfaces: `${surf.pairRuns}pair/${surf.exitRuns}exit/${surf.signals}sig/${surf.skipped}skip`, outcomes }, "observer cycle");
+      logger.info({ block: head, dt, mode: delta.full ? "full" : "delta", dirtyPools: delta.dirtyPools.size, poolsTotal: g.pools.size, reusedBranches: stats.skippedUnchanged ?? 0, dirtyPositions: dirtyLiq.length, positions: liqNodes.length, sized: stats.sized, economicallyPositive: stats.economicallyPositive, executable: stats.executable, preflight: `${pass}/${attempted}`, reused, surfaces: `${surf.pairRuns}pair/${surf.exitRuns}exit/${surf.signals}sig/${surf.skipped}skip`, outcomes }, "observer cycle");
     } catch (e) { logger.error({ err: e instanceof Error ? e.message : String(e) }, "observer cycle failed"); }
     await sleep(POLL_MS);
   }

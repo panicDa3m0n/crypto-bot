@@ -36,6 +36,9 @@ export interface LiquidityGraph {
   pools: Map<string, PoolState>;    // poolId → full DB-only state (dec0/dec1/tickCoverage/freshness set)
   adjacency: Map<string, string[]>; // token → [poolId] edges touching it
   decimals: Map<string, number>;    // token → decimals (DB, fail-closed; ABSENT when unknown, never defaulted)
+  /** token → USD spot, from the ONE place that holds it (token_prices, written by the indexer for exactly the
+   * tokens whose pools moved). ABSENT when the indexer has never anchored the token — never defaulted. */
+  prices: Map<string, number>;
   head: number;                     // indexer indexed block (mirror head)
   lag: number;                      // blocks behind network head (999_999 if de-synced)
   synced: boolean;
@@ -65,6 +68,12 @@ export async function loadLiquidityGraph(db: Database, cid: number, opts: LoadOp
   // from its protocol. Resolving it HERE is what lets every consumer stop falling back to a guessed 0.30%.
   const protoFees = await db.protocolFees(cid).catch(() => new Map<string, number>());
   const decMeta = await db.tokenMeta(cid, [...tokens]).catch(() => new Map());
+  // The spot price comes from the single source, in ONE batch. The observatory used to derive ETH/USD by
+  // scanning every pool in the graph for a WETH/USDC pair and taking the max quote — a second answer to a
+  // question the DB already answers, for two tokens only, at the cost of a full-graph scan per cycle.
+  const priceRows = await db.getTokenPrices(cid, [...tokens]).catch(() => new Map());
+  const prices = new Map<string, number>();
+  for (const [t, row] of priceRows) if (row?.priceUsd != null && row.priceUsd > 0) prices.set(t.toLowerCase(), row.priceUsd);
   const decimals = new Map<string, number>();
   for (const [t, meta] of decMeta) if (meta.decimals != null) decimals.set(t.toLowerCase(), meta.decimals);
   const scale = (t: string): bigint | undefined => { const d = decimals.get(t); return d != null ? 10n ** BigInt(d) : undefined; };
@@ -119,7 +128,7 @@ export async function loadLiquidityGraph(db: Database, cid: number, opts: LoadOp
   const modelable = [...pools.values()].filter((p) => MODELABLE.has(p.archetype)).length;
 
   return {
-    pools, adjacency, decimals, head, lag, synced,
+    pools, adjacency, decimals, prices, head, lag, synced,
     stats: {
       poolsTotal: pools.size, poolsPriced, modelable, unmodeled: pools.size - modelable,
       tokens: adjacency.size, edges: pools.size, byArchetype,
@@ -129,3 +138,63 @@ export async function loadLiquidityGraph(db: Database, cid: number, opts: LoadOp
 }
 
 interface PoolMeta { token0?: string; token1?: string; archetype?: string; fee?: unknown; factory?: string; tickSpacing?: unknown; dynamicFee?: boolean }
+
+/** What a block changed, and everything that therefore has to be recomputed. */
+export interface GraphDelta {
+  /** Pools whose state moved since the graph was last refreshed. */
+  dirtyPools: Set<string>;
+  /** Tokens whose spot price was recomputed, or that sit on a dirty pool. */
+  dirtyTokens: Set<string>;
+  /** Block the graph is now current to. */
+  head: number;
+  /** True when the graph was rebuilt wholesale rather than patched (first run, or a coverage break). */
+  full: boolean;
+}
+
+/**
+ * REFRESH BY DIFFERENCE. The governing rule is that a block is the only event: what it touched is recomputed,
+ * what it did not is still valid and is reused. Reloading the whole graph every cycle contradicted that at the
+ * worst possible ratio — 17 pools move per block against 25,390 reloaded.
+ *
+ * Patches the pools the indexer has written since `graph.head`, refreshes the spot prices that moved with them,
+ * and returns the DELTA so the caller can recompute branches instead of everything. The graph object is
+ * mutated in place: it is a long-lived mirror, not a per-cycle snapshot.
+ *
+ * Falls back to a full load when there is nothing to patch onto (first cycle) or when the mirror is further
+ * behind than a patch can honestly express — a rebuild is the correct answer to "I do not know what changed".
+ */
+export async function refreshLiquidityGraph(db: Database, cid: number, graph: LiquidityGraph | null, opts: LoadOpts & { maxPatchBlocks?: number } = {}): Promise<{ graph: LiquidityGraph; delta: GraphDelta }> {
+  const cs = await db.getChainStatus(cid).catch(() => null);
+  const head = cs?.indexedBlock ?? 0;
+  const gap = graph ? head - graph.head : Infinity;
+  // A very large gap means patching would be more work than rebuilding AND the price map would be widely
+  // stale; rebuild rather than pretend the delta is small.
+  if (!graph || gap < 0 || gap > (opts.maxPatchBlocks ?? 5_000)) {
+    const g = await loadLiquidityGraph(db, cid, opts);
+    return { graph: g, delta: { dirtyPools: new Set(g.pools.keys()), dirtyTokens: new Set(g.adjacency.keys()), head: g.head, full: true } };
+  }
+
+  const changed = await db.poolsChangedSince(cid, graph.head, GRAPH_ARCHETYPES).catch(() => []);
+  const dirtyPools = new Set<string>(), dirtyTokens = new Set<string>();
+  for (const row of changed) {
+    const address = row.address.toLowerCase();
+    const prev = graph.pools.get(address);
+    if (!prev) continue; // a pool the graph has never seen: it enters on the next full load, with its metadata
+    // Only STATE moves block to block. Identity (tokens, fee, decimals, tickSpacing) is metadata the enricher
+    // owns and does not change per block, so patching state alone keeps the mirror correct and cheap.
+    prev.r0 = row.r0; prev.r1 = row.r1;
+    prev.sqrtPriceX96 = row.sqrtPrice; prev.liquidity = row.liquidity;
+    if (row.feePpm != null && row.feePpm > 0) prev.feePpm = row.feePpm; // V4: the fee is per-swap state
+    prev.block = row.block; prev.ageMs = row.ageMs ?? undefined;
+    dirtyPools.add(address);
+    dirtyTokens.add(prev.token0); dirtyTokens.add(prev.token1);
+  }
+  // Prices move with the pools that produced them; a token can also be repriced by a backfill.
+  const repriced = await db.tokensRepricedSince(cid, graph.head).catch(() => new Map<string, number>());
+  for (const [t, usd] of repriced) { graph.prices.set(t, usd); dirtyTokens.add(t); }
+
+  graph.head = head;
+  graph.lag = cs && cs.synced ? cs.lag : 999_999;
+  graph.synced = !!cs?.synced;
+  return { graph, delta: { dirtyPools, dirtyTokens, head, full: false } };
+}

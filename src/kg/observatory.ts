@@ -31,7 +31,8 @@ export interface Candidate {
   fingerprint: string;          // hash(route pools + their state blocks + amountIn + minProfit) — preflight dedup
 }
 export interface ObserveStats {
-  aborted?: boolean;               // the cycle was cut short (mirror went stale); its numbers are partial
+  aborted?: boolean;
+  skippedUnchanged?: number;       // branches whose pools all sat still — reused, not recomputed               // the cycle was cut short (mirror went stale); its numbers are partial
   detectors: Record<string, number>; sized: number; economic: number;
   economicallyPositive: number;    // economic edge (net > threshold) before encodability
   routeEncodable: number;          // of those, we can build calldata for the whole route
@@ -44,7 +45,17 @@ export interface ObserveStats {
 }
 
 export interface ObserveOpts { minGrossBps?: number; cycleLimit?: number; gasMaxAgeMs?: number;
-  /** Return true to stop the cycle early (see runObservatory). */ abort?: () => boolean }
+  /** Return true to stop the cycle early (see runObservatory). */ abort?: () => boolean;
+  /**
+   * What the last block changed. When given, a branch is only RE-PRICED if it touches this set — a pool that
+   * did not move produces the same numbers it produced last cycle, so recomputing it is pure cost.
+   *
+   * Detection still runs over the whole graph: a cycle through a changed pool is made of other, unchanged
+   * pools, so restricting the SEARCH would hide real opportunities. It is the sizing that is expensive
+   * (tens of simulations per candidate) and that is what the dirty set gates.
+   */
+  dirty?: { pools: Set<string>; tokens: Set<string> };
+}
 
 /** capability: DB-only own-execution capability of a pool (null = unsupported fork / unenriched). Injected so
  * the observatory stays decoupled from LocalRouter yet can fold encodability into the gate. */
@@ -72,8 +83,10 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
   };
 
   // ── valuation refs (DB-first) ──
-  let ethUsd = 0;
-  for (const p of graph.pools.values()) { const set = new Set([p.token0, p.token1]); if (!(set.has(weth) && set.has(usdc))) continue; const s = await simFor(p.address); if (!s) continue; const q = s.quote(weth, 10n ** 18n); if (q) ethUsd = Math.max(ethUsd, Number(q.amountOut) / 1e6); }
+  // ONE source for spot value. This used to scan all 25,390 pools for a WETH/USDC pair and take max(quote):
+  // a duplicate of a number the DB already holds, obtained by the most expensive means available, and biased
+  // by construction (max over pools favours whichever is deepest OR stalest).
+  const ethUsd = graph.prices.get(weth) ?? 0;
   const gas = await db.getGasState(cid).catch(() => null);
   const gasStale = !gas || gas.ageMs > gasMaxAgeMs;
   const gasPriceWei = gas?.gasPriceWei ?? 0n;
@@ -88,7 +101,9 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
   const ctx: GateContext = {
     flashFundable: new Set([weth, usdc]),
     gasPriceWei, ethUsd,
-    numeraireUsd: (t) => t === usdc ? 1 : t === weth ? ethUsd : null,
+    // Every token the indexer has anchored is now valuable, not just the two hardcoded ones — which is what
+    // limited every cycle's numeraire to WETH or USDC.
+    numeraireUsd: (t) => t === usdc ? 1 : (graph.prices.get(t.toLowerCase()) ?? null),
     decimalsOf: (t) => t === weth ? 18 : t === usdc ? 6 : (graph.decimals.get(t) ?? null),
     minNetUsd: 0.01, safetyUsd: 0.005, flashFeeBps: 0,
     execMinProfitBps: 7000, lag: graph.lag, maxLagBlocks: 3,
@@ -165,8 +180,11 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
   // ── DETECTOR 1: spatial/cyclic arb (negative cycles on the FULL modelable graph) ──
   const modelablePriced = [...graph.pools.values()].filter((p) => MODELABLE.has(p.archetype) && ((p.r0 != null && p.r1 != null && p.r0 > 0n && p.r1 > 0n) || (p.sqrtPriceX96 != null && p.liquidity != null && p.liquidity > 0n)));
   const cycles = findNegativeCycles(modelablePriced, { minGrossBps, limit: opts.cycleLimit ?? 300 });
+  let skippedUnchanged = 0;
   for (const c0 of cycles) {
     if (opts.abort?.()) { aborted = true; break; }
+    // A cycle whose every pool is unchanged prices exactly as it did last cycle.
+    if (opts.dirty && !c0.edges.some((e) => opts.dirty!.pools.has(e.pool.toLowerCase()))) { skippedUnchanged++; continue; }
     const c = rotate(c0, [weth, usdc]);
     const sims = new Map<string, PoolSim>(); let ok = true;
     for (const e of c.edges) { const s = await simFor(e.pool); if (!s) { ok = false; break; } sims.set(s.poolId, s); }
@@ -179,6 +197,7 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
   const multiVenue = [...byPair.entries()].filter(([, v]) => v.length >= 2);
   for (const [pairKey, poolIds] of multiVenue) {
     if (opts.abort?.()) { aborted = true; break; }
+    if (opts.dirty && !poolIds.some((id) => opts.dirty!.pools.has(id.toLowerCase()))) { skippedUnchanged++; continue; }
     const [t0, t1] = pairKey.split("|");
     // marginal spot per venue (small probe in each direction), then best-buy / best-sell venues.
     const probe0 = (graph.decimals.has(t0) ? 10n ** BigInt(graph.decimals.get(t0)!) : 10n ** 18n) / 1000n || 1n;
@@ -209,7 +228,7 @@ export async function runObservatory(db: Database, config: Config, graph: Liquid
   return {
     candidates,
     stats: {
-      aborted,
+      aborted, skippedUnchanged,
       detectors, sized, economic, economicallyPositive, routeEncodable: routeEncodableN, executable,
       gasPriceWei: gasPriceWei.toString(), gasAgeMs: gas?.ageMs ?? null, gasStale, ethUsd, multiVenuePairs: multiVenue.length,
       unsupportedForks: top(unsupported, (v) => v.peakUsd).map(([factory, v]) => ({ factory, candidates: v.candidates, peakUsd: v.peakUsd })),
