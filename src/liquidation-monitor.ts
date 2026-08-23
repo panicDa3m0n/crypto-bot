@@ -89,14 +89,15 @@ export class LiquidationMonitor {
       // watches everything and fires at nothing — and it did exactly that for hours, reporting
       // `nearestHf: null` in a heartbeat that otherwise looked healthy while a profitable liquidation was
       // taken by someone else. A component that cannot do its job must say so, not log an INFO line.
-      const prices = await this.chain.precisionRead((c) => c.multicall({ contracts: oracles.map((o) => ({ address: o as Address, abi: ORACLE_ABI, functionName: "price" as const })), allowFailure: true, multicallAddress: MULTICALL3 }), "morpho-oracle-prices")
-        .catch((err) => { this.logger.error({ err, oracles: oracles.length }, "liquidation monitor: ORACLE PRICE READ FAILED — cannot evaluate any position this tick"); return [] as Array<{ status: string; result?: unknown }>; });
+      const { results: prices, laneFailed } = await this.chain.bulkRead(
+        oracles.map((o) => ({ address: o as Address, abi: ORACLE_ABI, functionName: "price" as const })), { label: "morpho-oracle-prices" }
+      ).catch((err) => { this.logger.error({ err, oracles: oracles.length }, "liquidation monitor: ORACLE PRICE READ FAILED — cannot evaluate any position this tick"); return { results: [] as Array<{ status: string; result?: unknown }>, laneFailed: true }; });
       const priceByOracle = new Map<string, bigint>();
       oracles.forEach((o, i) => { const r = prices[i]; if (r?.status === "success" && typeof r.result === "bigint") priceByOracle.set(o, r.result); });
       // BLINDNESS IS AN ALARM, not a statistic. Watching N positions while able to price none of them is
       // indistinguishable, in the heartbeat, from watching N positions that are all far from liquidation.
       if (watched.length && !priceByOracle.size) {
-        this.logger.error({ watched: watched.length, oracles: oracles.length, sample: oracles.slice(0, 3) },
+        this.logger.error({ watched: watched.length, oracles: oracles.length, laneFailed, sample: oracles.slice(0, 3) },
           "liquidation monitor is BLIND — zero of its oracles returned a price; no liquidation can be detected");
       }
 
@@ -113,7 +114,7 @@ export class LiquidationMonitor {
           ...near.map((w) => ({ address: morpho, abi: MORPHO_ABI, functionName: "position" as const, args: [w.marketId as `0x${string}`, w.borrower as Address] })),
           ...nearMarkets.map((mid) => ({ address: morpho, abi: MORPHO_ABI, functionName: "market" as const, args: [mid as `0x${string}`] }))
         ];
-        const res = await this.chain.precisionRead((c) => c.multicall({ contracts, allowFailure: true, multicallAddress: MULTICALL3 }), "morpho-near-size").catch(() => [] as Array<{ status: string; result?: unknown }>);
+        const { results: res } = await this.chain.bulkRead(contracts, { label: "morpho-near-size" }).catch(() => ({ results: [] as Array<{ status: string; result?: unknown }>, laneFailed: true }));
         const totals = new Map<string, { tba: bigint; tbs: bigint }>();
         nearMarkets.forEach((mid, i) => { const r = res[near.length + i]; if (r?.status === "success" && Array.isArray(r.result)) totals.set(mid, { tba: (r.result as bigint[])[2], tbs: (r.result as bigint[])[3] }); });
         near.forEach((w, i) => {

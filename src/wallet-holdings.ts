@@ -124,9 +124,12 @@ export class WalletHoldings {
    * indexer's drpc free-tier tipped over). One multicall = one eth_call, so a read lane handles it fine. */
   private async multicallBalances(owner: string, tokens: string[]): Promise<Array<{ status: string; result?: unknown }>> {
     const contracts = tokens.map((t) => ({ address: t as Address, abi: ERC20_BAL, functionName: "balanceOf" as const, args: [owner as Address] }));
+    // The lane cascade below only ever advanced on a THROW — but a lane that answers a wide multicall with
+    // all-failures throws nothing, so the cascade never ran and every balance silently kept its prior value.
+    // bulkRead settles that question (bisect, then positive control) before the next lane is even considered.
     for (const client of [this.chain.precision, this.chain.primary, this.chain.fallback]) {
-      try { return await client.multicall({ contracts, allowFailure: true, multicallAddress: MULTICALL3 }) as Array<{ status: string; result?: unknown }>; }
-      catch { /* lane down/limited → next */ }
+      const { results, laneFailed } = await this.chain.bulkRead(contracts, { label: "wallet-balances", client }).catch(() => ({ results: [] as Array<{ status: string; result?: unknown }>, laneFailed: true }));
+      if (!laneFailed && results.some((r) => r?.status === "success")) return results;
     }
     return [];
   }

@@ -386,8 +386,10 @@ export class PositionRegistry {
       ...markets.map((id) => ({ address: morpho, abi: MORPHO_POS_ABI, functionName: "market" as const, args: [id as `0x${string}`] })),
       ...oracles.map((o) => ({ address: o as Address, abi: ORACLE_PRICE_ABI, functionName: "price" as const })),
     ];
-    const res = await this.chain.primary.multicall({ contracts, allowFailure: true, multicallAddress: MULTICALL3 })
-      .catch(() => [] as Array<{ status: string; result?: unknown }>);
+    // Governed batch: this read is wide (positions + markets + oracles) and an all-empty answer must be read
+    // as "we could not ask", never as "these positions are gone" — see chain.bulkRead.
+    const { results: res } = await this.chain.bulkRead(contracts, { label: "morpho-resolve-pending", client: this.chain.primary })
+      .catch(() => ({ results: [] as Array<{ status: string; result?: unknown }>, laneFailed: true }));
     if (!res.length) return 0;
     const totals = new Map<string, { tba: bigint; tbs: bigint }>();
     markets.forEach((id, i) => { const r = res[rows.length + i]; if (r?.status === "success" && Array.isArray(r.result)) totals.set(id, { tba: (r.result as bigint[])[2], tbs: (r.result as bigint[])[3] }); });

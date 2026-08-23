@@ -35,6 +35,14 @@ function chainFrom(config: Config) {
   });
 }
 
+/** Multicall3 — same address on every chain we run on. `getBlockNumber` is the POSITIVE CONTROL: a call that
+ * cannot revert, so a failure to answer it is proof about the LANE and never about the contracts being read. */
+export const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11" as const;
+const MULTICALL3_PROBE_ABI = parseAbi(["function getBlockNumber() view returns (uint256)"]);
+
+/** Any of our read lanes, seen only through the two calls a batched read needs. */
+type ReadClient = Pick<PublicClient, "multicall" | "readContract">;
+
 const erc20Abi = parseAbi([
   "function balanceOf(address) view returns (uint256)",
   "function allowance(address,address) view returns (uint256)",
@@ -75,6 +83,8 @@ export class BerachainClients {
   // several pools) can't trip the RPC's rate-limit in the first place. Excess reads queue.
   private readonly PRECISION_CONCURRENCY = 6;
   private readonly PRECISION_MIN_INTERVAL_MS = 70; // pace dispatch starts (~14/s ceiling) under public-RPC limits
+  /** Widest multicall a lane has been PROVEN to answer, learned by bisection the first time one caps out. */
+  private readonly bulkWidth = new Map<string, number>();
   private precisionActive = 0;
   private precisionNextAt = 0;
   private readonly precisionQueue: Array<() => void> = [];
@@ -156,6 +166,86 @@ export class BerachainClients {
         this.logger?.warn({ label, err: errMsg(err), from: this.precisionRpc, to: this.fallbackRpc }, "precision RPC rate-limited/errored → rerouting to fallback");
         return await fn(this.fallback);
       }
+    } finally {
+      this.releasePrecisionSlot();
+    }
+  }
+
+  /**
+   * BATCHED READS, governed and self-diagnosing — the one way the system reads many contracts at once.
+   *
+   * `multicall({ allowFailure: true })` has a defect that costs money: it converts a TRANSPORT failure into
+   * N per-call `status: "failure"` entries and returns normally. Nothing throws, so `precisionRead`'s reroute
+   * never fires and the caller reads "these N contracts have no answer" when the truth is "we could not ask".
+   * That is not hypothetical: the precision lane silently caps out above ~8 calls per multicall, so the
+   * liquidation monitor's 14-oracle read returned 0/14 on EVERY tick and the monitor sat blind for hours
+   * while positions it was already tracking were liquidated by someone else.
+   *
+   * So this never assumes. When a whole chunk comes back empty, it asks which of the two worlds it is in:
+   *   • more than one call in the chunk → BISECT. A provider width cap makes the halves succeed; genuine
+   *     reverts fail at every width. The answer costs one extra round trip and is conclusive.
+   *   • a single call still failing → POSITIVE CONTROL (`Multicall3.getBlockNumber()`, which cannot revert).
+   *     It answers ⇒ the lane is alive and the failure is the contract's real verdict. It doesn't ⇒ the lane
+   *     is at fault, we reroute to the fallback, and no contract is judged.
+   *
+   * The proven width is remembered per lane, so a capped provider costs the probe once and not per tick.
+   * `laneFailed` is the caller's signal that the read never happened — it must never be read as "no data".
+   */
+  async bulkRead(
+    contracts: readonly unknown[],
+    opts: { label?: string; blockNumber?: bigint; client?: ReadClient } = {}
+  ): Promise<{ results: Array<{ status: string; result?: unknown }>; laneFailed: boolean }> {
+    const label = opts.label ?? "bulk";
+    if (!contracts.length) return { results: [], laneFailed: false };
+    await this.acquirePrecisionSlot();
+    try {
+      const client: ReadClient = opts.client ?? (this.precision as ReadClient);
+      const laneUrl = client === (this.precision as ReadClient) ? this.precisionRpc : client === (this.primary as ReadClient) ? this.primaryRpc : this.fallbackRpc;
+      const results = new Array<{ status: string; result?: unknown }>(contracts.length);
+      let laneFailed = false;
+
+      // Read one slice, returning null when the lane — not the contracts — is what failed.
+      const readSlice = async (c: ReadClient, slice: readonly unknown[]): Promise<Array<{ status: string; result?: unknown }> | null> => {
+        try {
+          return await c.multicall({ contracts: slice as never, allowFailure: true, multicallAddress: MULTICALL3_ADDRESS, ...(opts.blockNumber != null ? { blockNumber: opts.blockNumber } : {}) }) as Array<{ status: string; result?: unknown }>;
+        } catch (err) {
+          if (isTransientOrRateLimit(err)) this.noteRateLimit("bulk", laneUrl);
+          return null;
+        }
+      };
+
+      // Resolve a range, halving on an all-empty answer until the width question is settled.
+      const resolve = async (c: ReadClient, from: number, to: number): Promise<void> => {
+        const slice = contracts.slice(from, to);
+        const r = await readSlice(c, slice);
+        if (r && r.some((x) => x?.status === "success")) { for (let i = 0; i < slice.length; i++) results[from + i] = r[i]; return; }
+        if (slice.length > 1) {
+          // Nothing came back. A width cap and a batch of genuine reverts are indistinguishable here — so split.
+          const half = Math.floor(slice.length / 2);
+          const mid = from + half;
+          // Learn the cap in ONE step, not one call at a time: the halves we are about to try ARE the next
+          // candidate width, so remember that instead of `length - 1` (which would re-probe on every tick).
+          const before = this.bulkWidth.get(laneUrl) ?? Number.MAX_SAFE_INTEGER;
+          if (half < before) { this.bulkWidth.set(laneUrl, half); this.logger?.warn({ label, lane: redactRpc(laneUrl), width: half }, "bulk read: lane cannot answer this width → narrowing"); }
+          await resolve(c, from, mid);
+          await resolve(c, mid, to);
+          return;
+        }
+        // One call, still nothing. Ask the control question.
+        const alive = await c.readContract({ address: MULTICALL3_ADDRESS, abi: MULTICALL3_PROBE_ABI, functionName: "getBlockNumber" }).then(() => true).catch(() => false);
+        if (alive) { results[from] = r?.[0] ?? { status: "failure" }; return; } // the chain refused: a real verdict
+        if (c !== (this.fallback as ReadClient)) {
+          this.logger?.warn({ label, from: redactRpc(laneUrl), to: redactRpc(this.fallbackRpc) }, "bulk read: lane proven down by positive control → rerouting to fallback");
+          await resolve(this.fallback as ReadClient, from, to);
+          return;
+        }
+        laneFailed = true;
+        results[from] = { status: "failure" };
+      };
+
+      const width = Math.max(1, Math.min(contracts.length, this.bulkWidth.get(laneUrl) ?? contracts.length));
+      for (let i = 0; i < contracts.length; i += width) await resolve(client, i, Math.min(i + width, contracts.length));
+      return { results, laneFailed };
     } finally {
       this.releasePrecisionSlot();
     }
