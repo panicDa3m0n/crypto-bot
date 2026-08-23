@@ -191,6 +191,16 @@ async function main() {
         await new Promise<void>((r) => setTimeout(r, 1000));
       }
     };
+    // THE ONE EXCEPTION TO THE GATE. Every acting service waits for a fresh mirror, because acting on
+    // partial data is worse than not acting. The liquidation monitor is the exception, and deliberately so:
+    // it takes NO decision from the mirror. The oracle price, the position size and the health factor are
+    // all read live from the chain each tick (and re-read at the cross), and the on-chain `require` is the
+    // real safety boundary. The DB supplies only the CANDIDATE LIST — which moves slowly, in hours, not
+    // blocks. A stale candidate list costs us a position we haven't discovered yet; a closed gate costs us
+    // every position we already know about. During catch-up after a deploy the second is the larger loss,
+    // and it is not hypothetical: the gate is shut for minutes on every restart, and liquidations are
+    // arity-1 — each one is profit on its own and cannot wait for a graph to converge.
+    if (config.EXECUTION_ENABLED && config.LIQ_MONITOR_ENABLED) liquidationMonitor.start();
     logger.info("waiting for indexer head + enrichment resync before starting acting services…");
     await blockIndexer.ready;
     await waitResyncDrained();
@@ -208,8 +218,7 @@ async function main() {
     // Liquidation engines — act on OTHERS' positions from the fresh DB + on-chain HF (need the organ above).
     if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED) autoflash.start();
     if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED && config.AUTOARM_ENABLED) autoArm.start();
-    // On-chain HF monitor: watches ALL near-threshold positions (no cap), fires fresh at the cross.
-    if (config.EXECUTION_ENABLED && config.LIQ_MONITOR_ENABLED) liquidationMonitor.start();
+    // (The on-chain HF monitor already started ABOVE, ahead of the gate — see the exception there.)
     // Scarlet's managed intents (smart-money follows + programmed SL/TP/partials) + trading + arb + registry.
     if (config.SCARLET_AGENT_ENABLED) followService.start();
     if (config.SCARLET_AGENT_ENABLED && config.EXECUTION_ENABLED) positionManager.start();

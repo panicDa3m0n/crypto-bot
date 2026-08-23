@@ -86,6 +86,28 @@ describe("bulkRead separates a dead lane from a refusing contract", () => {
   });
 });
 
+describe("the liquidation monitor is the one service that does not wait for the mirror", () => {
+  const src = readFileSync("src/index.ts", "utf8");
+  const gate = src.indexOf("await blockIndexer.ready");
+  const monitorStart = src.indexOf("liquidationMonitor.start()");
+
+  it("starts BEFORE the sync gate", () => {
+    // It takes no decision from the DB — oracle price, size and HF are read live from the chain every tick
+    // and the on-chain require is the real boundary. The gate is shut for minutes after every restart, and
+    // a liquidation is arity-1: it cannot wait for a graph to converge.
+    expect(monitorStart).toBeGreaterThan(0);
+    expect(gate).toBeGreaterThan(0);
+    expect(monitorStart).toBeLessThan(gate);
+  });
+
+  it("is still the ONLY service ahead of the gate", () => {
+    const before = src.slice(0, gate);
+    for (const acting of ["autoflash.start()", "autoArm.start()", "positionManager.start()", "arbEngine.start()", "followService.start()"]) {
+      expect(before).not.toContain(acting);
+    }
+  });
+});
+
 describe("the money paths do not call multicall directly any more", () => {
   // The monitor, the position resolver and the wallet all read wide batches whose all-empty answer is
   // indistinguishable from real data unless it goes through bulkRead.

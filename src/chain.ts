@@ -243,8 +243,18 @@ export class BerachainClients {
         results[from] = { status: "failure" };
       };
 
+      // Chunks go out CONCURRENTLY. A narrow lane turns one read into many, and running them one after the
+      // other put 14.5 SECONDS between a block arriving and the monitor knowing what it contained — on a
+      // 2-second chain, that is several blocks of blindness bought to fix blindness. Latency here is the
+      // product, so the only thing the width should cost is bandwidth, not time.
       const width = Math.max(1, Math.min(contracts.length, this.bulkWidth.get(laneUrl) ?? contracts.length));
-      for (let i = 0; i < contracts.length; i += width) await resolve(client, i, Math.min(i + width, contracts.length));
+      const ranges: Array<[number, number]> = [];
+      for (let i = 0; i < contracts.length; i += width) ranges.push([i, Math.min(i + width, contracts.length)]);
+      const LANES_IN_FLIGHT = 8;
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(LANES_IN_FLIGHT, ranges.length) }, async () => {
+        for (let k = next++; k < ranges.length; k = next++) await resolve(client, ranges[k][0], ranges[k][1]);
+      }));
       return { results, laneFailed };
     } finally {
       this.releasePrecisionSlot();
