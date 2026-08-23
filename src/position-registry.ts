@@ -388,7 +388,7 @@ export class PositionRegistry {
     ];
     // Governed batch: this read is wide (positions + markets + oracles) and an all-empty answer must be read
     // as "we could not ask", never as "these positions are gone" — see chain.bulkRead.
-    const { results: res } = await this.chain.bulkRead(contracts, { label: "morpho-resolve-pending", client: this.chain.primary })
+    const { results: res } = await this.chain.bulkRead(contracts, { label: "morpho-resolve-pending" })
       .catch(() => ({ results: [] as Array<{ status: string; result?: unknown }>, laneFailed: true }));
     if (!res.length) return 0;
     const totals = new Map<string, { tba: bigint; tbs: bigint }>();

@@ -28,6 +28,11 @@ const schema = z.object({
   // reroutes to when its reference RPC rate-limits (429) or errors. Both default from the profile.
   PRECISION_RPC_HTTP_URL: z.string().url().optional(),
   FALLBACK_RPC_HTTP_URL: z.string().url().optional(),
+  /** BULK lane: every batched multicall goes here. Measured on Base with the liquidation monitor's own
+   * reads (14 oracles, 250 Morpho positions): nodies 0/14 and 0/250, base.org 14/14 but 60/250, blastapi
+   * 250/250 in 197ms. A lane that cannot take a batch turns one read into forty and cost the monitor 42
+   * SECONDS per tick on a 2-second chain — so batches get a lane chosen for exactly that. */
+  BULK_RPC_HTTP_URL: z.string().url().optional(),
   // DEDICATED execution lane: used ONLY to broadcast real transactions (position buys/sells,
   // liquidations, arb) so it stays free + fresh when we need to fire — never contended by the
   // read firehose. Point it at a dedicated (ideally paid) endpoint; defaults to the fallback RPC.
@@ -445,6 +450,7 @@ function applyNetwork(input: Record<string, string | undefined>, net: Network): 
   set("HEADS_RPC_WS_URL", net.rpc.ws);
   set("PRECISION_RPC_HTTP_URL", net.rpc.precision ?? net.rpc.secondary);
   set("FALLBACK_RPC_HTTP_URL", net.rpc.fallback ?? net.rpc.primary);
+  set("BULK_RPC_HTTP_URL", net.rpc.bulk ?? net.rpc.fallback ?? net.rpc.primary);
   set("EXECUTION_RPC_HTTP_URL", net.rpc.execution ?? net.rpc.fallback ?? net.rpc.primary);
   set("EXPLORER_NAME", net.explorer.name);
   set("EXPLORER_URL", net.explorer.url);

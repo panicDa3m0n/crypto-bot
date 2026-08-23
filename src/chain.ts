@@ -61,6 +61,9 @@ export class BerachainClients {
   readonly precision;
   /** The single RPC any lane reroutes to when its reference RPC rate-limits (429) or errors. */
   readonly fallback;
+  /** BULK lane: batched multicalls only. Chosen for one property the precision lane does not have —
+   * the ability to answer a wide batch in one call. See BULK_RPC_HTTP_URL for the measurements. */
+  readonly bulk;
   readonly heads?: PublicClient<WebSocketTransport, ReturnType<typeof chainFrom>>;
   readonly wallet;
   /** EXECUTION read lane — a PUBLIC client on the SAME RPC the signer broadcasts through. The WHOLE tx
@@ -75,6 +78,7 @@ export class BerachainClients {
   readonly secondaryRpc: string;
   readonly precisionRpc: string;
   readonly fallbackRpc: string;
+  readonly bulkRpc: string;
   readonly executionRpc: string;
   private readonly rl = new Map<string, { n: number; at: number }>();
   private readonly priceCache = new Map<string, number>();
@@ -99,6 +103,7 @@ export class BerachainClients {
     this.secondaryRpc = config.SECONDARY_RPC_HTTP_URL;
     this.precisionRpc = config.PRECISION_RPC_HTTP_URL ?? config.SECONDARY_RPC_HTTP_URL;
     this.fallbackRpc = config.FALLBACK_RPC_HTTP_URL ?? config.PRIMARY_RPC_HTTP_URL;
+    this.bulkRpc = config.BULK_RPC_HTTP_URL ?? this.fallbackRpc;
     this.executionRpc = config.EXECUTION_RPC_HTTP_URL ?? this.fallbackRpc;
     this.indexerRpc = config.INDEXER_RPC_HTTP_URL;
     this.enrichmentRpc = config.ENRICHMENT_RPC_HTTP_URL;
@@ -116,6 +121,7 @@ export class BerachainClients {
     this.secondary = createPublicClient({ chain, transport: http(config.SECONDARY_RPC_HTTP_URL, { timeout: 12_000, retryCount: 1 }) });
     this.precision = createPublicClient({ chain, transport: http(this.precisionRpc, { timeout: 12_000, retryCount: 0, batch: true }) });
     this.fallback = createPublicClient({ chain, transport: http(this.fallbackRpc, { timeout: 12_000, retryCount: 1, batch: true }) });
+    this.bulk = this.bulkRpc === this.fallbackRpc ? this.fallback : createPublicClient({ chain, transport: http(this.bulkRpc, { timeout: 12_000, retryCount: 1, batch: true }) });
     this.heads = config.HEADS_RPC_WS_URL ? createPublicClient({ chain, transport: webSocket(config.HEADS_RPC_WS_URL, { retryCount: 2, retryDelay: 1_000 }) }) : undefined;
     const account = config.WALLET_PRIVATE_KEY ? privateKeyToAccount(config.WALLET_PRIVATE_KEY as Hex) : undefined;
     if (account && config.WALLET_ADDRESS && account.address.toLowerCase() !== config.WALLET_ADDRESS.toLowerCase()) {
@@ -129,7 +135,18 @@ export class BerachainClients {
     this.exec = createPublicClient({ chain, transport: http(this.executionRpc, { timeout: 12_000, retryCount: 1 }) });
     // TRACEABILITY: one authoritative line mapping every purpose → its endpoint, so we always know which
     // RPC is used for what (and can swap any via env). Grep "RPC lanes" to audit.
-    this.logger?.info({ indexer: redactRpc(this.indexerRpc), enrichment: redactRpc(this.enrichmentRpc), tools: redactRpc(this.toolsRpc), execution: redactRpc(this.executionRpc), primary: redactRpc(this.primaryRpc), secondary: redactRpc(this.secondaryRpc), precision: redactRpc(this.precisionRpc), fallback: redactRpc(this.fallbackRpc), dedicatedExecution: this.executionRpc !== this.primaryRpc, dedicatedIndexer: this.indexerRpc !== this.primaryRpc, toolsSharingIndexerLane: this.toolsRpc === this.indexerRpc }, "RPC lanes");
+    this.logger?.info({ indexer: redactRpc(this.indexerRpc), enrichment: redactRpc(this.enrichmentRpc), tools: redactRpc(this.toolsRpc), execution: redactRpc(this.executionRpc), primary: redactRpc(this.primaryRpc), secondary: redactRpc(this.secondaryRpc), precision: redactRpc(this.precisionRpc), bulk: redactRpc(this.bulkRpc), fallback: redactRpc(this.fallbackRpc), dedicatedExecution: this.executionRpc !== this.primaryRpc, dedicatedIndexer: this.indexerRpc !== this.primaryRpc, toolsSharingIndexerLane: this.toolsRpc === this.indexerRpc }, "RPC lanes");
+  }
+
+  /** Which endpoint a read client actually talks to — so a lane is never anonymous in a log or a metric. */
+  private urlOf(c: unknown): string {
+    if (c === (this.bulk as unknown)) return this.bulkRpc;
+    if (c === (this.precision as unknown)) return this.precisionRpc;
+    if (c === (this.primary as unknown)) return this.primaryRpc;
+    if (c === (this.fallback as unknown)) return this.fallbackRpc;
+    if (c === (this.enrichment as unknown)) return this.enrichmentRpc;
+    if (c === (this.secondary as unknown)) return this.secondaryRpc;
+    return "unknown-lane";
   }
 
   /** Log an RPC lane failure AT THE MOMENT it happens (rule: no status polling — surface KO on error).
@@ -199,9 +216,10 @@ export class BerachainClients {
     if (!contracts.length) return { results: [], laneFailed: false };
     await this.acquirePrecisionSlot();
     try {
-      const client: ReadClient = opts.client ?? (this.precision as ReadClient);
-      const laneUrl = client === (this.precision as ReadClient) ? this.precisionRpc : client === (this.primary as ReadClient) ? this.primaryRpc : this.fallbackRpc;
+      const client: ReadClient = opts.client ?? (this.bulk as ReadClient);
+      const laneUrl = this.urlOf(client);
       const results = new Array<{ status: string; result?: unknown }>(contracts.length);
+      const tried = new Set<ReadClient>();
       let laneFailed = false;
 
       // Read one slice, returning null when the lane — not the contracts — is what failed.
@@ -234,9 +252,13 @@ export class BerachainClients {
         // One call, still nothing. Ask the control question.
         const alive = await c.readContract({ address: MULTICALL3_ADDRESS, abi: MULTICALL3_PROBE_ABI, functionName: "getBlockNumber" }).then(() => true).catch(() => false);
         if (alive) { results[from] = r?.[0] ?? { status: "failure" }; return; } // the chain refused: a real verdict
-        if (c !== (this.fallback as ReadClient)) {
-          this.logger?.warn({ label, from: redactRpc(laneUrl), to: redactRpc(this.fallbackRpc) }, "bulk read: lane proven down by positive control → rerouting to fallback");
-          await resolve(this.fallback as ReadClient, from, to);
+        // The lane is down. Reroute to the first DIFFERENT lane — the bulk lane defaults to the fallback
+        // endpoint, so rerouting "to the fallback" would have meant rerouting to the lane that just failed.
+        const alt = [this.fallback, this.primary, this.secondary].map((x) => x as ReadClient).find((x) => x !== c && !tried.has(x));
+        if (alt) {
+          tried.add(c);
+          this.logger?.warn({ label, from: redactRpc(laneUrl), to: redactRpc(this.urlOf(alt)) }, "bulk read: lane proven down by positive control → rerouting");
+          await resolve(alt, from, to);
           return;
         }
         laneFailed = true;

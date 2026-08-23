@@ -127,7 +127,7 @@ export class WalletHoldings {
     // The lane cascade below only ever advanced on a THROW — but a lane that answers a wide multicall with
     // all-failures throws nothing, so the cascade never ran and every balance silently kept its prior value.
     // bulkRead settles that question (bisect, then positive control) before the next lane is even considered.
-    for (const client of [this.chain.precision, this.chain.primary, this.chain.fallback]) {
+    for (const client of [this.chain.bulk, this.chain.primary, this.chain.fallback]) {
       const { results, laneFailed } = await this.chain.bulkRead(contracts, { label: "wallet-balances", client }).catch(() => ({ results: [] as Array<{ status: string; result?: unknown }>, laneFailed: true }));
       if (!laneFailed && results.some((r) => r?.status === "success")) return results;
     }

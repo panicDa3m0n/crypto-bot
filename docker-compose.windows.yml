@@ -1,0 +1,42 @@
+# WINDOWS / dedicated-machine override. Use together with docker-compose.yml:
+#
+#   docker compose -p bera-bot -f docker-compose.yml -f docker-compose.windows.yml up -d --build
+#
+# What this override deliberately does NOT carry over from the VPS:
+#
+#   • no `cpu_shares`, no `cpus` ceiling. Those weights existed because the VPS had ONE core shared with three
+#     other projects, so the block indexer — the starting point everything else reads from — won the cpu by
+#     luck. On a dedicated machine there is nothing to arbitrate; adding the weights back would only invent a
+#     scarcity that isn't there. If the indexer ever falls behind here, the cause is the RPC, not the cpu.
+#
+#   • no bind-mounted `dist/`. Compiling off-box existed because `tsc` took 10+ minutes on that single core
+#     against ~6 seconds on a laptop. A dedicated machine can build its own image, which is simpler and
+#     reproducible: one `--build` and the running code is provably the code in git.
+#
+# Secrets are read from ./secrets/ next to this file — the same three files the VPS held in
+# /opt/bera-bot/secrets/. They are NEVER baked into the image and never appear in the environment.
+services:
+  brain:
+    ports:
+      - "8899:8899"
+    environment:
+      WALLET_PRIVATE_KEY_FILE: /run/secrets/wallet_private_key
+      MINIMAX_API_KEY_FILE: /run/secrets/minimax_api_key
+      ETHERSCAN_API_KEY_FILE: /run/secrets/etherscan_api_key
+    secrets:
+      - wallet_private_key
+      - minimax_api_key
+      - etherscan_api_key
+  observer:
+    environment:
+      ETHERSCAN_API_KEY_FILE: /run/secrets/etherscan_api_key
+    secrets:
+      - etherscan_api_key
+
+secrets:
+  wallet_private_key:
+    file: ./secrets/wallet_private_key
+  minimax_api_key:
+    file: ./secrets/minimax_api_key
+  etherscan_api_key:
+    file: ./secrets/etherscan_api_key
