@@ -106,6 +106,39 @@ Watch it close the gap:
 docker compose -p bera-bot logs -f brain | grep -E "block-indexer|chain_status|liquidation monitor heartbeat"
 ```
 
+## 5b. Finish the liquidation recovery (this is why the new machine matters)
+
+`demoteStaleActionable` used to archive any position the Morpho API stopped naming, without asking the chain.
+10,712 positions were closed that way; asked directly, **10,560 of them are still borrowing**. The code no
+longer does this, but the rows are still archived and every reader excludes `tier='closed'`, so they are
+invisible until restored.
+
+The recovery was started on the VPS and left partway through — 10,560 UPDATEs on one shared core is exactly
+the kind of work that box is bad at. **The script is idempotent**: it only touches
+`tier='closed' AND reason LIKE '%aged out%'`, so whatever it already did stays done and re-running completes
+the rest. Run it here, where it takes seconds:
+
+```bash
+# dry first — it prints how many are still borrowing and writes nothing
+docker compose -p bera-bot -f docker-compose.yml -f docker-compose.windows.yml \
+  run --rm --no-deps brain node dist/scripts/liq-recover.js
+# then apply
+docker compose -p bera-bot -f docker-compose.yml -f docker-compose.windows.yml \
+  run --rm --no-deps brain node dist/scripts/liq-recover.js --apply
+```
+
+Restored positions return as `pending`, not to an actionable tier: what we hold for them is stale, and the
+tick's `resolvePending` reads their real size and health from the chain and classifies them. Expect the
+`pending` count to climb to ~10.5k and then drain — 40 per tick, so give it time and watch it fall:
+
+```sql
+SELECT tier, count(*) FROM lending_positions WHERE chain_id=8453 GROUP BY 1 ORDER BY 2 DESC;
+```
+
+While that backlog drains it will saturate the tick's 60-per-cycle budget, delaying profit re-verification of
+the `watch` tier. Detection is unaffected — the liquidation monitor reads `watch`/`profitable` straight from
+the chain every block and does not depend on the tick.
+
 ## 6. Stop the VPS — but only after the new one is proven
 
 Both instances running at once is not merely wasteful, it is **dangerous**: two liquidation monitors sharing
