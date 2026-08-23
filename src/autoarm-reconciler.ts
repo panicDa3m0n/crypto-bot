@@ -6,6 +6,7 @@ import type { Database } from "./db.js";
 import type { MonadSignals, AtRiskPosition } from "./monad-signals.js";
 import type { Primitives } from "./primitives.js";
 import type { Aggregator } from "./aggregator.js";
+import { liquidationIncentiveFactor } from "./morpho.js";
 
 /**
  * The safety net over the liquidation surface. Every reconcile it looks at the
@@ -23,7 +24,6 @@ const FACTORY_ABI = parseAbi(["function getPool(address,address,uint24) view ret
 const POOL_ABI = parseAbi(["function liquidity() view returns (uint128)"]);
 const ZERO = "0x0000000000000000000000000000000000000000";
 const AUTO_PREFIX = "auto";
-const LIQUIDATION_CURSOR = 0.3; // Morpho Blue constant used to derive the incentive factor
 
 export class AutoArmReconciler {
   private timer?: NodeJS.Timeout;
@@ -143,7 +143,7 @@ export class AutoArmReconciler {
     const { borrowAssets, collateral } = await this.primitives.readMorphoPosition(p.marketId as `0x${string}`, p.user as Address);
     if (borrowAssets <= 0n || collateral <= 0n || p.collateralUsd <= 0) return undefined;
     const lltv = Number(BigInt(mp.lltv)) / 1e18;                       // e.g. 0.86
-    const lif = 1 / (1 - LIQUIDATION_CURSOR * (1 - lltv));             // Morpho liquidation incentive factor
+    const lif = liquidationIncentiveFactor(lltv);                      // Morpho liquidation incentive factor
     const currentLtv = Math.min(1, p.debtUsd / p.collateralUsd);       // debt value / collateral value
     const seizeFraction = Math.min(0.98, currentLtv * lif) * 0.95;     // fraction of collateral to seize, conservatively
     const seizedAssets = collateral * BigInt(Math.max(1, Math.floor(seizeFraction * 1_000_000))) / 1_000_000n;

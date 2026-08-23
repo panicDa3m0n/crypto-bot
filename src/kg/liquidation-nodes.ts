@@ -1,5 +1,6 @@
 import type { Database } from "../db.js";
 import type { LiquidityGraph } from "./graph-loader.js";
+import { liquidationIncentiveFactor } from "../morpho.js";
 
 /**
  * LENDING POSITIONS AS FIRST-CLASS KG NODES.
@@ -87,9 +88,7 @@ export function dirtyLiquidationNodes(nodes: LiquidationNode[], graph: Liquidity
  * Morpho's liquidation incentive: LIF = min(1.15, 1/(1 − 0.3·(1−LLTV))). The seized slice is worth LIF times
  * the debt repaid — that premium IS the profit, before the cost of selling it.
  */
-export function liquidationIncentive(lltv: number): number {
-  return lltv > 0 && lltv < 1 ? Math.min(1.15, 1 / (1 - 0.3 * (1 - lltv))) : 1.05;
-}
+export function liquidationIncentive(lltv: number): number { return liquidationIncentiveFactor(lltv); }
 
 /**
  * The collateral a liquidator may seize and the debt it repays, in RAW units, using the protocol's own

@@ -5,6 +5,7 @@ import type { BerachainClients } from "./chain.js";
 import type { Database } from "./db.js";
 import type { Primitives } from "./primitives.js";
 import type { Aggregator } from "./aggregator.js";
+import { liquidationIncentiveFactor, liquidationPriceX36 } from "./morpho.js";
 
 /**
  * LiquidationMonitor — the fast lane. It watches EVERY actionable position (no cap) by computing HF
@@ -22,8 +23,6 @@ const MORPHO_ABI = parseAbi([
   "function position(bytes32 id, address user) view returns (uint256 supplyShares, uint128 borrowShares, uint128 collateral)"
 ]);
 const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
-const LIQUIDATION_CURSOR = 0.3;
-const Q = 10n ** 54n;
 const HEARTBEAT_MS = 60_000; // throttle for the "alive + nearest-to-cross" observability line
 
 export class LiquidationMonitor {
@@ -78,7 +77,7 @@ export class LiquidationMonitor {
         const debtRaw = BigInt(String(m.debtRaw ?? "0"));
         const lltvRaw = BigInt(String(m.lltv ?? "0"));
         if (!oracle || oracle === "0x" || collateralRaw <= 0n || debtRaw <= 0n || lltvRaw <= 0n || !r.loanToken || !r.collateralToken) continue;
-        const liqPrice = (debtRaw * Q) / (collateralRaw * lltvRaw); // oracle price (1e36) at HF=1
+        const liqPrice = liquidationPriceX36(debtRaw, collateralRaw, lltvRaw); // oracle price (1e36) at HF=1
         watched.push({ key: `${r.borrower.toLowerCase()}:${r.marketId.toLowerCase()}`, borrower: r.borrower, marketId: r.marketId, oracle, liqPrice, collateral: r.collateralSymbol ?? "?", loan: r.loanSymbol ?? "?", loanToken: r.loanToken, collateralToken: r.collateralToken, irm: String(m.irm ?? "0x0000000000000000000000000000000000000000"), lltvRaw: String(m.lltv ?? "0"), collateralUsd: r.collateralUsd ?? 0, debtUsd: r.debtUsd ?? 0, profitUsd: r.profitUsd });
       }
       if (!watched.length) return;
@@ -122,7 +121,7 @@ export class LiquidationMonitor {
           if (r?.status !== "success" || !Array.isArray(r.result) || !mt) return; // read failed → keep the stale liq_price
           const borrowShares = (r.result as bigint[])[1]; const collateral = (r.result as bigint[])[2];
           const borrowAssets = mt.tbs === 0n || borrowShares === 0n ? 0n : (borrowShares * mt.tba + mt.tbs - 1n) / mt.tbs;
-          w.liqPrice = collateral > 0n && borrowAssets > 0n ? (borrowAssets * Q) / (collateral * BigInt(w.lltvRaw)) : 0n; // fresh; 0 = empty → never crosses
+          w.liqPrice = liquidationPriceX36(borrowAssets, collateral, BigInt(w.lltvRaw)); // fresh; 0 = empty → never crosses
         });
       }
 
@@ -177,7 +176,7 @@ export class LiquidationMonitor {
         return;
       }
       const lltv = Number(BigInt(w.lltvRaw)) / 1e18;
-      const lif = 1 / (1 - LIQUIDATION_CURSOR * (1 - lltv));
+      const lif = liquidationIncentiveFactor(lltv);
       const seizeFraction = Math.min(0.98, Math.min(1, w.debtUsd / w.collateralUsd) * lif) * 0.95;
       const seizedAssets = collateral * BigInt(Math.max(1, Math.floor(seizeFraction * 1_000_000))) / 1_000_000n;
       if (seizedAssets <= 0n) { await recordFail("zero seize"); return; }

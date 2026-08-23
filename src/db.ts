@@ -1876,6 +1876,19 @@ export class Database {
     );
   }
 
+  /** One position, WHATEVER its tier — `closed` included.
+   *
+   * Every other reader deliberately excludes `closed`, which is right for deciding what to watch and wrong
+   * for deciding what we lost: a liquidation on a position we had archived looked, to the miss detector, like
+   * a liquidation of someone we had never heard of. That is how the counter said 3 while the chain said 83. */
+  async lendingPositionAnyTier(chainId: number, protocol: string, marketId: string, borrower: string): Promise<LendingPosition | undefined> {
+    const r = await this.pool.query(
+      `SELECT * FROM lending_positions WHERE chain_id=$1 AND protocol=$2 AND lower(market_id)=lower($3) AND lower(borrower)=lower($4) LIMIT 1`,
+      [chainId, protocol, marketId, borrower]
+    );
+    return r.rows.length ? rowToLendingPosition(r.rows[0]) : undefined;
+  }
+
   /** Retire a position from the actionable set — liquidated (by anyone) or emptied. It stops being
    * watched/monitored (listLendingPositions/dueLendingPositions exclude tier='closed'). */
   async closeLendingPosition(chainId: number, protocol: string, marketId: string, borrower: string, reason: string): Promise<void> {
@@ -1890,14 +1903,61 @@ export class Database {
    * enumerate(s) no longer returned — their market fell out of scope (e.g. unlisted) or they left the
    * enumeration window. Retiring them stops the monitor from watching frozen, stale positions. Returns
    * how many were retired. Never touches freshly-seen rows (enumerated_at is bumped only by enumerate). */
-  async demoteStaleActionable(chainId: number, olderThanSec: number): Promise<number> {
+  /**
+   * Positions the last enumerate(s) did not name — CANDIDATES for retirement, not a verdict.
+   *
+   * This used to be a single UPDATE that set tier='closed' outright. It was wrong in the most expensive way
+   * available: the Morpho API not returning a position is a fact about the API, and we were reading it as a
+   * fact about the debt. 10,712 positions were archived that way, 320 of them profitable by our own last
+   * computation, and eleven were liquidated by someone else inside 72 hours while we had them filed as gone.
+   *
+   * The chain is what knows whether a debt exists. So this only ASKS, and the caller confirms on-chain
+   * before anything terminal happens.
+   */
+  async staleActionableCandidates(chainId: number, olderThanSec: number, limit = 200): Promise<Array<LendingPosition>> {
     const r = await this.pool.query(
-      `UPDATE lending_positions SET tier='closed', reason='aged out — not seen by enumerate (market out of scope)', next_check_at=NOW() + interval '1 hour', updated_at=NOW()
-       WHERE chain_id=$1 AND tier IN ('watch','profitable','candidate')
-         AND (enumerated_at IS NULL OR enumerated_at < NOW() - ($2 || ' seconds')::interval)`,
-      [chainId, String(Math.round(olderThanSec))]
+      `SELECT * FROM lending_positions
+        WHERE chain_id=$1 AND tier IN ('watch','profitable','candidate')
+          AND (enumerated_at IS NULL OR enumerated_at < NOW() - ($2 || ' seconds')::interval)
+        ORDER BY debt_usd DESC NULLS LAST LIMIT $3`,
+      [chainId, String(Math.round(olderThanSec)), limit]
     );
-    return r.rowCount ?? 0;
+    return r.rows.map(rowToLendingPosition);
+  }
+
+  /** The positions archived by the old blind ageing rule — the ones `liq-recover` re-examines. */
+  async positionsArchivedOnApiSilence(chainId: number): Promise<Array<LendingPosition>> {
+    const r = await this.pool.query(
+      `SELECT * FROM lending_positions WHERE chain_id=$1 AND tier='closed' AND reason LIKE '%aged out%' ORDER BY debt_usd DESC NULLS LAST`,
+      [chainId]
+    );
+    return r.rows.map(rowToLendingPosition);
+  }
+
+  /** Put an archived-but-living position back, as `pending` with its CHAIN-read size. Not into an actionable
+   * tier: what we still hold for it is stale, and `pending` is exactly the state meaning "known, unjudged" —
+   * resolvePending then reads its health and classifies it. */
+  async reopenLendingPosition(chainId: number, protocol: string, marketId: string, borrower: string, collateralRaw: string, borrowSharesRaw: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE lending_positions
+          SET tier='pending', reason='restored — archived on API silence, still borrowing on-chain',
+              meta = COALESCE(meta,'{}'::jsonb) || jsonb_build_object('collateralRaw',$5::text,'borrowShares',$6::text),
+              next_check_at = NOW(), updated_at = NOW()
+        WHERE chain_id=$1 AND protocol=$2 AND lower(market_id)=lower($3) AND lower(borrower)=lower($4) AND tier='closed'`,
+      [chainId, protocol, marketId, borrower, collateralRaw, borrowSharesRaw]
+    );
+  }
+
+  /** Keep an un-enumerated position in the actionable set, recording that the API stopped naming it.
+   * It stays watched — only the chain may retire it. */
+  async markUnenumerated(chainId: number, protocol: string, marketId: string, borrower: string, nextCheckSec: number): Promise<void> {
+    await this.pool.query(
+      `UPDATE lending_positions
+          SET reason = CASE WHEN reason LIKE '%[API silente]%' THEN reason ELSE COALESCE(reason,'') || ' [API silente — confermata viva on-chain]' END,
+              next_check_at = NOW() + ($5 || ' seconds')::interval, updated_at = NOW()
+        WHERE chain_id=$1 AND protocol=$2 AND lower(market_id)=lower($3) AND lower(borrower)=lower($4)`,
+      [chainId, protocol, marketId, borrower, String(Math.round(nextCheckSec))]
+    );
   }
 
   async lendingTierCounts(chainId: number): Promise<Record<string, number>> {

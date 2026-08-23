@@ -6,6 +6,7 @@ import type { Database } from "./db.js";
 import type { PriceOracle } from "./price-oracle.js";
 import type { Aggregator } from "./aggregator.js";
 import type { Blockscout } from "./blockscout.js";
+import { liquidationIncentiveFactor } from "./morpho.js";
 
 // Morpho Blue Borrow(bytes32 indexed id, address caller, address indexed onBehalf, address indexed receiver, ...):
 // topic1 = marketId, topic2 = borrower (onBehalf). The keyless event-discovery path.
@@ -235,13 +236,53 @@ export class PositionRegistry {
       // Age out orphans: actionable positions this (and the prior ~1.5) enumerate no longer returned —
       // their market left scope (e.g. no longer marketListed). Otherwise they'd freeze in watch/profitable
       // and the monitor would keep reading them. Threshold = 2.5× the enumerate interval (tolerates a miss).
-      const aged = await this.db.demoteStaleActionable(this.config.CHAIN_ID, (this.config.LIQ_ENUM_INTERVAL_MS / 1000) * 2.5).catch(() => 0);
+      const aged = await this.retireConfirmedEmpty((this.config.LIQ_ENUM_INTERVAL_MS / 1000) * 2.5).catch((e) => { this.logger.warn({ err: e }, "stale-actionable confirmation failed — nothing retired (correct: never retire on an unread)"); return 0; });
       const counts = await this.db.lendingTierCounts(this.config.CHAIN_ID).catch(() => ({}));
       this.logger.info({ scanned, aged, fetched: all.length, classify, tiers: counts }, "position registry enumerated");
       if ((classify.quoteError ?? 0) > scanned * 0.2 && scanned > 20) this.logger.warn({ quoteError: classify.quoteError, scanned }, "HIGH exit-quote failure rate — aggregator likely rate-limited; classify incomplete this cycle (positions kept prior tier)");
       await this.crossCheckViaEvents(enumerated, all.length).catch((e) => this.logger.debug({ err: e }, "morpho event cross-check failed"));
       await this.scanLiquidations().catch((e) => this.logger.debug({ err: e }, "liquidation event scan failed"));
     } finally { this.enumerating = false; }
+  }
+
+  /**
+   * Retire ONLY the positions the CHAIN says are empty.
+   *
+   * The Morpho API is a discovery source. It is not, and has never been, an authority on whether a debt
+   * exists — it filters by `marketListed`, by a health-factor ceiling and by pagination, so a live position
+   * can leave the result set for half a dozen reasons that have nothing to do with the borrower repaying.
+   * We nonetheless treated its silence as proof and archived 10,712 positions on it.
+   *
+   * So the question goes where the answer lives: one batched `position()` read on the bulk lane. Empty
+   * (no borrow shares) → genuinely gone, retire it. Still borrowing → it stays exactly where it was, and we
+   * record that the API stopped naming it, which is a fact worth having about the API. A read that FAILS
+   * retires nothing — an unread must never be stronger evidence than an unanswered API.
+   */
+  private async retireConfirmedEmpty(olderThanSec: number): Promise<number> {
+    const morpho = this.config.MORPHO_CORE as Address | undefined;
+    const stale = await this.db.staleActionableCandidates(this.config.CHAIN_ID, olderThanSec).catch(() => []);
+    if (!stale.length) return 0;
+    if (!morpho) { this.logger.warn({ stale: stale.length }, "cannot confirm stale positions on-chain (no MORPHO_CORE) — keeping them ALL rather than archiving unread"); return 0; }
+    const { results, laneFailed } = await this.chain.bulkRead(
+      stale.map((p) => ({ address: morpho, abi: MORPHO_POS_ABI, functionName: "position" as const, args: [p.marketId as `0x${string}`, p.borrower as Address] })),
+      { label: "morpho-confirm-stale" }
+    );
+    if (laneFailed) { this.logger.warn({ stale: stale.length }, "stale-position confirmation could not read the chain — nothing retired"); return 0; }
+    let retired = 0, alive = 0, unread = 0;
+    for (let i = 0; i < stale.length; i++) {
+      const p = stale[i], r = results[i];
+      if (r?.status !== "success" || !Array.isArray(r.result)) { unread += 1; continue; } // unknown ⇒ untouched
+      const borrowShares = (r.result as bigint[])[1];
+      if (borrowShares === 0n) {
+        await this.db.closeLendingPosition(this.config.CHAIN_ID, p.protocol, p.marketId, p.borrower, "debt repaid — confirmed empty on-chain").catch(this.swallowWrite);
+        retired += 1;
+      } else {
+        await this.db.markUnenumerated(this.config.CHAIN_ID, p.protocol, p.marketId, p.borrower, this.nextCheckSec(p.tier, p.hf ?? 1.05)).catch(this.swallowWrite);
+        alive += 1;
+      }
+    }
+    if (alive || unread) this.logger.info({ retired, aliveButUnenumerated: alive, unread, checked: stale.length }, "stale-position confirmation: the API stopped naming these, the chain says otherwise");
+    return retired;
   }
 
   /**
@@ -285,29 +326,48 @@ export class PositionRegistry {
     const organ = (await this.db.getOrgan("atomic-executor").catch(this.swallowWrite))?.address?.toLowerCase();
     const ours = new Set([this.config.WALLET_ADDRESS?.toLowerCase(), organ].filter(Boolean) as string[]);
     let missed = 0, hit = 0;
+    const byCause: Record<string, number> = {}; // WHY each one got away — the number that was missing
     for (const l of logs) {
       if ((l.topics[0] ?? "").toLowerCase() !== MORPHO_LIQUIDATE_TOPIC || l.topics.length < 4) continue;
       const marketId = (l.topics[1] ?? "").toLowerCase();
       const liquidator = ("0x" + (l.topics[2] ?? "").slice(-40)).toLowerCase();
       const borrower = ("0x" + (l.topics[3] ?? "").slice(-40)).toLowerCase();
       const isOurs = ours.has(liquidator);
-      const pos = (await this.db.listLendingPositions(this.config.CHAIN_ID, { limit: 300 }).catch(() => [])).find((p) => p.marketId.toLowerCase() === marketId && p.borrower.toLowerCase() === borrower);
-      // A "miss" is a prey WE FOUND AS ACTIONABLE (watch/profitable — we WANTED it) that another bot
-      // took when it crossed. A liquidation of a position we never tracked, or that we'd judged
-      // unprofitable (low_collateral/blacklist), is NOT a miss — record only our HITs + true misses.
+      // ANY tier, `closed` included, and looked up directly instead of scanning the actionable list once per
+      // log. The old lookup could not see an archived position, so a liquidation of one we had wrongly closed
+      // was indistinguishable from a liquidation of a stranger — and both were silently dropped.
+      const pos = await this.db.lendingPositionAnyTier(this.config.CHAIN_ID, "morpho", marketId, borrower).catch(() => undefined);
       // The position was LIQUIDATED — retire it so the monitor stops watching a taken prey. If it was
       // only partially liquidated (still active), the next enumerate re-classifies it (overrides closed).
       if (pos) await this.db.closeLendingPosition(this.config.CHAIN_ID, "morpho", marketId, borrower, `liquidated ${isOurs ? "by us" : "by another bot"} (Liquidate event)`).catch(this.swallowWrite);
-      const actionable = pos && (pos.tier === "watch" || pos.tier === "profitable");
-      if (!isOurs && !actionable) continue; // not our prey → not a miss, skip
+      // RECORD EVERY LIQUIDATION, and let the DATA say what kind of loss it was.
+      //
+      // This used to record a miss only for prey we held in watch/profitable, on the reasoning that anything
+      // else was not "ours to lose". That reasoning is what made every OTHER failure mode invisible: a
+      // position we archived on a silent API, one we discarded on a single bad quote, one we never
+      // discovered — all indistinguishable from a liquidation that was none of our business. Measured over
+      // 72h: the chain performed 83 Morpho liquidations and this counter reported 3.
+      //
+      // A liquidation we did not take is a lost opportunity until proven otherwise, so it is recorded with
+      // the reason we did not act. `lostBecause` is the analysis that was missing.
+      const tier = pos?.tier ?? null;
+      const lostBecause = isOurs ? null
+        : !pos ? "never-discovered"
+        : tier === "watch" || tier === "profitable" ? "watched-but-lost"
+        : tier === "closed" && /aged out/.test(pos.reason ?? "") ? "archived-on-api-silence"
+        : tier === "low_collateral" ? "judged-unprofitable"
+        : tier === "blacklist" ? "judged-scam"
+        : tier === "candidate" ? "not-yet-quoted"
+        : `tier:${tier}`;
       await this.db.recordLiquidationEvent({
         chainId: this.config.CHAIN_ID, kind: isOurs ? "hit" : "missed", protocol: "morpho", marketId, borrower,
         collateralSymbol: pos?.collateralSymbol ?? undefined, loanSymbol: pos?.loanSymbol ?? undefined, debtUsd: pos?.debtUsd ?? undefined, profitUsd: pos?.profitUsd ?? undefined,
-        txHash: l.txHash, liquidator, note: isOurs ? "liquidated by us" : "found-actionable prey lost to another liquidator", meta: { blockNumber: l.blockNumber, tier: pos?.tier }
+        txHash: l.txHash, liquidator, note: isOurs ? "liquidated by us" : `lost to another liquidator — ${lostBecause}`,
+        meta: { blockNumber: l.blockNumber, tier, lostBecause, exitUsd: pos?.exitUsd ?? null, reasonAtLoss: (pos?.reason ?? "").slice(0, 160) }
       }).catch(this.swallowWrite);
-      if (isOurs) hit += 1; else missed += 1;
+      if (isOurs) hit += 1; else { missed += 1; byCause[lostBecause!] = (byCause[lostBecause!] ?? 0) + 1; }
     }
-    if (missed || hit) this.logger.info({ missed, hit, scanned: logs.length }, "liquidation events recorded (missed=lost to others, hit=ours)");
+    if (missed || hit) this.logger.info({ missed, hit, scanned: logs.length, byCause }, "liquidation events recorded (missed=lost to others, hit=ours)");
   }
 
   /** Classify a position: scam → bad-debt (cheap, Morpho oracle) → for the survivors near the
@@ -447,8 +507,7 @@ export class PositionRegistry {
     return (Number(raw) / 10 ** decimals) * px;
   }
 
-  /** Morpho liquidation incentive factor from LLTV: LIF = min(1.15, 1/(1 − 0.3·(1−LLTV))). */
-  private lif(lltv: number): number { return lltv > 0 && lltv < 1 ? Math.min(1.15, 1 / (1 - 0.3 * (1 - lltv))) : 1.05; }
+  private lif(lltv: number): number { return liquidationIncentiveFactor(lltv); }
 
   /** Adaptive re-check interval: watch fast; profitable rarer the safer; parked slow. */
   private nextCheckSec(tier: string, hf: number): number {

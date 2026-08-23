@@ -321,7 +321,10 @@ export class Primitives {
     ]);
     // The primary RPC is often rate-limited by the rest of the system; fall back to the secondary
     // so liquidation arming never starves on a shared-RPC hiccup.
-    const [m, p] = await read(this.chain.primary).catch(() => read(this.chain.secondary));
+    // The fallback used to be `secondary` (1rpc.io), which answers "Requested resource not found" — 16 fire
+    // attempts died there before even reading the position. The bulk lane is the one we have MEASURED to
+    // answer Morpho reads; a fire path must not fall back onto an endpoint nothing verified.
+    const [m, p] = await read(this.chain.primary).catch(() => read(this.chain.bulk as typeof this.chain.primary));
     const totalBorrowAssets = m[2]; const totalBorrowShares = m[3];
     const borrowShares = p[1]; const collateral = p[2];
     const borrowAssets = totalBorrowShares === 0n || borrowShares === 0n ? 0n : (borrowShares * totalBorrowAssets + totalBorrowShares - 1n) / totalBorrowShares;
